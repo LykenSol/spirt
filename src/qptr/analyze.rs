@@ -806,7 +806,7 @@ impl<'a> InferUsage<'a> {
                         DeclDef::Imported(_) => continue,
                     };
 
-                    for (v, usage) in usage_or_err_attrs_to_attach {
+                    for (v, mut usage) in usage_or_err_attrs_to_attach {
                         let attrs = match v {
                             Value::Const(_) => unreachable!(),
                             Value::ControlRegionInput { region, input_idx } => {
@@ -825,8 +825,49 @@ impl<'a> InferUsage<'a> {
                                     &mut control_node_def.outputs[output_idx as usize].attrs
                                 }
                             }
-                            Value::DataInstOutput(data_inst) => {
-                                &mut func_def_body.at_mut(data_inst).def().attrs
+                            Value::DataInstOutput { inst, output_idx } => {
+                                let data_inst_def = func_def_body.at_mut(inst).def();
+
+                                // HACK(eddyb) `DataInstOutput { output_idx: !0, .. }`
+                                // may be used to attach errors to a whole `DataInst`.
+                                if output_idx == !0 {
+                                    assert!(usage.is_err());
+                                } else if !(output_idx == 0
+                                    && self.cx[data_inst_def.form].output_types.len() == 1)
+                                {
+                                    // HACK(eddyb) there are no legal multiple-output
+                                    // instructions, where one of the outputs is a
+                                    // pointer, and there are no per-output attributes,
+                                    // so guard against misunderstandings here.
+                                    usage = Err(AnalysisError(match usage {
+                                        Ok(usage) => {
+                                            let attr: AttrSet = self.cx.intern(AttrSetDef {
+                                                attrs: [Attr::QPtr(QPtrAttr::Usage(OrdAssertEq(
+                                                    usage,
+                                                )))]
+                                                .into(),
+                                            });
+                                            Diag::bug([
+                                                format!(
+                                                    "cannot attach attribute to \
+                                                     output #{output_idx} of \
+                                                     multi-output instruction:\n"
+                                                )
+                                                .into(),
+                                                attr.into(),
+                                            ])
+                                        }
+                                        Err(AnalysisError(mut diag)) => {
+                                            diag.message.insert(
+                                                0,
+                                                format!("output #{output_idx}: ").into(),
+                                            );
+                                            diag
+                                        }
+                                    }));
+                                }
+
+                                &mut data_inst_def.attrs
                             }
                         };
                         match usage {
@@ -892,7 +933,8 @@ impl<'a> InferUsage<'a> {
             }
         };
 
-        let mut data_inst_output_usages: FxHashMap<_, Option<_>> = FxHashMap::default();
+        let mut data_inst_to_per_output_usage: FxHashMap<_, SmallVec<[Option<_>; 2]>> =
+            FxHashMap::default();
         let mut control_node_to_per_output_usage: FxHashMap<_, SmallVec<[Option<_>; 2]>> =
             FxHashMap::default();
 
@@ -900,7 +942,10 @@ impl<'a> InferUsage<'a> {
         let mut generate_usage = |this: &mut Self,
                                   usage_or_err_attrs_to_attach: &mut Vec<_>,
                                   fallback_diagnosis_target,
-                                  data_inst_output_usages: &mut FxHashMap<DataInst, Option<_>>,
+                                  data_inst_to_per_output_usage: &mut FxHashMap<
+            DataInst,
+            SmallVec<[Option<_>; 2]>,
+        >,
                                   control_node_to_per_output_usage: &mut FxHashMap<
             ControlNode,
             SmallVec<[Option<_>; 2]>,
@@ -966,8 +1011,13 @@ impl<'a> InferUsage<'a> {
                     }
                     &mut slots[i]
                 }
-                Value::DataInstOutput(ptr_inst) => {
-                    data_inst_output_usages.entry(ptr_inst).or_default()
+                Value::DataInstOutput { inst: ptr_inst, output_idx } => {
+                    let i = output_idx as usize;
+                    let slots = data_inst_to_per_output_usage.entry(ptr_inst).or_default();
+                    if i >= slots.len() {
+                        slots.extend((slots.len()..=i).map(|_| None));
+                    }
+                    &mut slots[i]
                 }
             };
             *slot = Some(match slot.take() {
@@ -1011,7 +1061,7 @@ impl<'a> InferUsage<'a> {
                         this,
                         &mut usage_or_err_attrs_to_attach,
                         Value::ControlNodeOutput { control_node, output_idx: !0 },
-                        &mut data_inst_output_usages,
+                        &mut data_inst_to_per_output_usage,
                         &mut control_node_to_per_output_usage,
                         ptr,
                         new_usage,
@@ -1066,21 +1116,40 @@ impl<'a> InferUsage<'a> {
                 let data_inst = func_at_inst.position;
                 let data_inst_def = func_at_inst.def();
                 let data_inst_form_def = &cx[data_inst_def.form];
-                let output_usage = data_inst_output_usages.remove(&data_inst).flatten();
+
+                let mut per_output_usage =
+                    data_inst_to_per_output_usage.remove(&data_inst).unwrap_or_default();
+
+                // HACK(eddyb) this may be a bit wasteful, but it avoids
+                // complicating acessing `per_output_usage` below, and
+                // most instructions should only have at most two outputs.
+                {
+                    let expected = data_inst_form_def.output_types.len();
+                    if per_output_usage.len() < expected {
+                        per_output_usage.extend((per_output_usage.len()..expected).map(|_| None));
+                    }
+                }
 
                 // Always attach attributes to `qptr`-producing instructions,
                 // on top of propagating them from uses to definitions.
-                if let Some(usage) = &output_usage {
-                    usage_or_err_attrs_to_attach
-                        .push((Value::DataInstOutput(data_inst), Clone::clone(usage)));
+                for (i, usage) in per_output_usage.iter().enumerate() {
+                    if let Some(usage) = usage {
+                        usage_or_err_attrs_to_attach.push((
+                            Value::DataInstOutput {
+                                inst: data_inst,
+                                output_idx: i.try_into().unwrap(),
+                            },
+                            Clone::clone(usage),
+                        ));
+                    }
                 }
 
                 let mut generate_usage = |this: &mut Self, ptr: Value, new_usage| {
                     generate_usage(
                         this,
                         &mut usage_or_err_attrs_to_attach,
-                        Value::DataInstOutput(data_inst),
-                        &mut data_inst_output_usages,
+                        Value::DataInstOutput { inst: data_inst, output_idx: !0 },
+                        &mut data_inst_to_per_output_usage,
                         &mut control_node_to_per_output_usage,
                         ptr,
                         new_usage,
@@ -1094,10 +1163,12 @@ impl<'a> InferUsage<'a> {
                         // with the inherent size/align (given by `_mem_layout`)?
                     }
                     DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
+                        assert_eq!(per_output_usage.len(), 1);
                         generate_usage(
                             self,
                             data_inst_def.inputs[0],
-                            output_usage
+                            per_output_usage[0]
+                                .take()
                                 .unwrap_or_else(|| {
                                     Err(AnalysisError(Diag::bug([
                                         "HandleArrayIndex: unknown element".into(),
@@ -1112,10 +1183,12 @@ impl<'a> InferUsage<'a> {
                         );
                     }
                     DataInstKind::QPtr(QPtrOp::BufferData) => {
+                        assert_eq!(per_output_usage.len(), 1);
                         generate_usage(
                             self,
                             data_inst_def.inputs[0],
-                            output_usage
+                            per_output_usage[0]
+                                .take()
                                 .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
                                 .and_then(|usage| {
                                     let usage = match usage {
@@ -1164,10 +1237,11 @@ impl<'a> InferUsage<'a> {
                         );
                     }
                     &DataInstKind::QPtr(QPtrOp::Offset(offset)) => {
+                        assert_eq!(per_output_usage.len(), 1);
                         generate_usage(
                             self,
                             data_inst_def.inputs[0],
-                            output_usage
+                            per_output_usage[0].take()
                                 .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
                                 .and_then(|usage| {
                                     let usage = match usage {
@@ -1206,10 +1280,11 @@ impl<'a> InferUsage<'a> {
                         );
                     }
                     DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
+                        assert_eq!(per_output_usage.len(), 1);
                         generate_usage(
                             self,
                             data_inst_def.inputs[0],
-                            output_usage
+                            per_output_usage[0].take()
                                 .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
                                 .and_then(|usage| {
                                     let usage = match usage {
@@ -1264,9 +1339,7 @@ impl<'a> InferUsage<'a> {
                         op @ (QPtrOp::Load { offset } | QPtrOp::Store { offset }),
                     ) => {
                         let (op_name, access_type) = match op {
-                            QPtrOp::Load { .. } => {
-                                ("Load", data_inst_form_def.output_type.unwrap())
-                            }
+                            QPtrOp::Load { .. } => ("Load", data_inst_form_def.output_types[0]),
                             QPtrOp::Store { .. } => {
                                 ("Store", func_at_inst.at(data_inst_def.inputs[1]).type_of(&cx))
                             }
@@ -1341,7 +1414,7 @@ impl<'a> InferUsage<'a> {
                         );
                     }
 
-                    DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
+                    DataInstKind::SpvInst(..) | DataInstKind::SpvExtInst { .. } => {
                         for attr in &cx[data_inst_def.attrs].attrs {
                             if let Attr::QPtr(QPtrAttr::ToSpvPtrInput { input_idx, pointee }) =
                                 *attr
@@ -1366,7 +1439,8 @@ impl<'a> InferUsage<'a> {
                                                         // since it would conflict with our
                                                         // own `Block`-annotated wrapper.
                                                         shapes::Handle::Buffer(..) => {
-                                                            return Err(AnalysisError(Diag::bug(["ToSpvPtrInput: whole Buffer ambiguous (handle vs buffer data)".into()])
+                                                            return Err(AnalysisError(
+                                                                Diag::bug(["ToSpvPtrInput: whole Buffer ambiguous (handle vs buffer data)".into()])
                                                             ));
                                                         }
                                                     };
@@ -1379,7 +1453,8 @@ impl<'a> InferUsage<'a> {
                                                 // a generated type that matches the
                                                 // desired `pointee` type.
                                                 TypeLayout::HandleArray(..) => {
-                                                    Err(AnalysisError(Diag::bug(["ToSpvPtrInput: whole handle array unrepresentable".into()])
+                                                    Err(AnalysisError(
+                                                        Diag::bug(["ToSpvPtrInput: whole handle array unrepresentable".into()])
                                                     ))
                                                 }
                                                 TypeLayout::Concrete(concrete) => {
@@ -1400,7 +1475,8 @@ impl<'a> InferUsage<'a> {
 
         // HACK(eddyb) this should never happen, unless the IR is malformed or
         // the traversal order is subtly incorrect, but it's important to catch.
-        if !data_inst_output_usages.is_empty() || !control_node_to_per_output_usage.is_empty() {
+        if !data_inst_to_per_output_usage.is_empty() || !control_node_to_per_output_usage.is_empty()
+        {
             let mut attach_as_err = |v, usage: Option<Result<_, _>>| {
                 let diag = match usage.transpose() {
                     Ok(usage) => Diag::bug([
@@ -1423,8 +1499,19 @@ impl<'a> InferUsage<'a> {
                     &ControlNodeKind::Block { insts } => {
                         for func_at_inst in func_def_body.at(insts) {
                             let data_inst = func_at_inst.position;
-                            if let Some(usage) = data_inst_output_usages.remove(&data_inst) {
-                                attach_as_err(Value::DataInstOutput(data_inst), usage);
+                            for (i, usage) in data_inst_to_per_output_usage
+                                .remove(&data_inst)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .enumerate()
+                            {
+                                attach_as_err(
+                                    Value::DataInstOutput {
+                                        inst: data_inst,
+                                        output_idx: i.try_into().unwrap(),
+                                    },
+                                    usage,
+                                );
                             }
                         }
                     }
@@ -1450,7 +1537,7 @@ impl<'a> InferUsage<'a> {
             // FIXME(eddyb) if this fails, the IR (or visiting) is really broken,
             // but there's no way to properly signal this by e.g. attaching
             // diagnostic attributes to the function itself.
-            assert_eq!(data_inst_output_usages.len(), 0);
+            assert_eq!(data_inst_to_per_output_usage.len(), 0);
             assert_eq!(control_node_to_per_output_usage.len(), 0);
         }
 
