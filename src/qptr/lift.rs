@@ -163,7 +163,7 @@ impl<'a> LiftToSpvPtrs<'a> {
     // FIXME(eddyb) deduplicate with `qptr::lower`.
     fn as_spv_ptr_type(&self, ty: Type) -> Option<(AddrSpace, Type)> {
         match &self.cx[ty].kind {
-            TypeKind::SpvInst { spv_inst, type_and_const_inputs }
+            TypeKind::SpvInst { spv_inst, type_and_const_inputs, .. }
                 if spv_inst.opcode == self.wk.OpTypePointer =>
             {
                 let sc = match spv_inst.imms[..] {
@@ -187,13 +187,16 @@ impl<'a> LiftToSpvPtrs<'a> {
             AddrSpace::Handles => unreachable!(),
             AddrSpace::SpvStorageClass(storage_class) => storage_class,
         };
-        self.cx.intern(TypeKind::SpvInst {
-            spv_inst: spv::Inst {
+        self.cx.intern(
+            spv::Inst {
                 opcode: wk.OpTypePointer,
                 imms: [spv::Imm::Short(wk.StorageClass, storage_class)].into_iter().collect(),
-            },
-            type_and_const_inputs: [TypeOrConst::Type(pointee_type)].into_iter().collect(),
-        })
+            }
+            .into_canonical_type_with(
+                &self.cx,
+                [TypeOrConst::Type(pointee_type)].into_iter().collect(),
+            ),
+        )
     }
 
     fn pointee_type_for_usage(&self, usage: &QPtrUsage) -> Result<Type, LiftError> {
@@ -286,9 +289,9 @@ impl<'a> LiftToSpvPtrs<'a> {
 
         Ok(self.cx.intern(TypeDef {
             attrs: stride_attrs.unwrap_or_default(),
-            kind: TypeKind::SpvInst {
-                spv_inst: spv_opcode.into(),
-                type_and_const_inputs: [
+            kind: spv::Inst::from(spv_opcode).into_canonical_type_with(
+                &self.cx,
+                [
                     Some(TypeOrConst::Type(element_type)),
                     fixed_len.map(|len| {
                         TypeOrConst::Const(self.cx.intern(scalar::Const::from_u32(len)))
@@ -297,7 +300,7 @@ impl<'a> LiftToSpvPtrs<'a> {
                 .into_iter()
                 .flatten()
                 .collect(),
-            },
+            ),
         }))
     }
 
@@ -329,7 +332,8 @@ impl<'a> LiftToSpvPtrs<'a> {
         attrs.attrs.extend(extra_attrs);
         Ok(self.cx.intern(TypeDef {
             attrs: self.cx.intern(attrs),
-            kind: TypeKind::SpvInst { spv_inst: wk.OpTypeStruct.into(), type_and_const_inputs },
+            kind: spv::Inst::from(wk.OpTypeStruct)
+                .into_canonical_type_with(&self.cx, type_and_const_inputs),
         }))
     }
 
@@ -458,10 +462,13 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 let pointee_type = self.lifter.pointee_type_for_usage(output_qptr_usage)?;
 
                 let mut data_inst_def = data_inst_def.clone();
-                data_inst_def.kind = DataInstKind::SpvInst(spv::Inst {
-                    opcode: wk.OpVariable,
-                    imms: [spv::Imm::Short(wk.StorageClass, wk.Function)].into_iter().collect(),
-                });
+                data_inst_def.kind = DataInstKind::SpvInst(
+                    spv::Inst {
+                        opcode: wk.OpVariable,
+                        imms: [spv::Imm::Short(wk.StorageClass, wk.Function)].into_iter().collect(),
+                    },
+                    spv::InstLowering::default(),
+                );
                 data_inst_def.outputs[0].attrs =
                     self.lifter.strip_qptr_usage_attr(data_inst_def.outputs[0].attrs);
                 data_inst_def.outputs[0].ty =
@@ -489,7 +496,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 };
 
                 let mut data_inst_def = data_inst_def.clone();
-                data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
+                data_inst_def.kind =
+                    DataInstKind::SpvInst(wk.OpAccessChain.into(), spv::InstLowering::default());
                 data_inst_def.outputs[0].attrs =
                     self.lifter.strip_qptr_usage_attr(data_inst_def.outputs[0].attrs);
                 data_inst_def.outputs[0].ty = self.lifter.spv_ptr_type(addr_space, handle_type);
@@ -551,10 +559,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 };
 
                 DataInstDef {
-                    kind: DataInstKind::SpvInst(spv::Inst {
-                        opcode: wk.OpArrayLength,
-                        imms: [spv::Imm::Short(wk.LiteralInteger, field_idx)].into_iter().collect(),
-                    }),
+                    kind: DataInstKind::SpvInst(
+                        spv::Inst {
+                            opcode: wk.OpArrayLength,
+                            imms: [spv::Imm::Short(wk.LiteralInteger, field_idx)]
+                                .into_iter()
+                                .collect(),
+                        },
+                        spv::InstLowering::default(),
+                    ),
                     ..data_inst_def.clone()
                 }
             }
@@ -669,7 +682,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 }
 
                 let mut data_inst_def = data_inst_def;
-                data_inst_def.kind = DataInstKind::SpvInst(wk.OpAccessChain.into());
+                data_inst_def.kind =
+                    DataInstKind::SpvInst(wk.OpAccessChain.into(), spv::InstLowering::default());
                 data_inst_def.inputs = [array_ptr, array_index].into_iter().collect();
                 data_inst_def.outputs[0].attrs =
                     self.lifter.strip_qptr_usage_attr(data_inst_def.outputs[0].attrs);
@@ -730,13 +744,16 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     }
                 }
 
-                data_inst_def.kind = DataInstKind::SpvInst(spv_opcode.into());
+                data_inst_def.kind =
+                    DataInstKind::SpvInst(spv_opcode.into(), spv::InstLowering::default());
                 data_inst_def.inputs[0] = adjusted_ptr;
 
                 data_inst_def
             }
 
-            DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
+            DataInstKind::SpvInst(_, lowering) | DataInstKind::SpvExtInst { lowering, .. } => {
+                let lowering_disaggregated_output = lowering.disaggregated_output;
+
                 let mut changed_data_inst_def = None;
 
                 for attr in &cx[data_inst_def.attrs].attrs {
@@ -808,6 +825,9 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                             data_inst_def.inputs[input_idx] = adjusted_ptr;
                         }
                         QPtrAttr::FromSpvPtrOutput { addr_space, pointee } => {
+                            assert!(lowering_disaggregated_output.is_none());
+
+                            assert_eq!(data_inst_def.outputs.len(), 1);
                             data_inst_def.outputs[0].ty =
                                 self.lifter.spv_ptr_type(addr_space.0, pointee.0);
                         }
@@ -852,7 +872,10 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 Value::NodeOutput {
                     node: insert_aux_data_inst(self, func, DataInstDef {
                         attrs: Default::default(),
-                        kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
+                        kind: DataInstKind::SpvInst(
+                            wk.OpAccessChain.into(),
+                            spv::InstLowering::default(),
+                        ),
                         inputs: access_chain_inputs,
                         child_regions: [].into_iter().collect(),
                         outputs: [NodeOutputDecl {

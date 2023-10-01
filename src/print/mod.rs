@@ -526,7 +526,7 @@ impl<'a> Visitor<'a> for Plan<'a> {
             let wk = &spv::spec::Spec::get().well_known;
 
             match &self.cx[gv_decl.type_of_ptr_to].kind {
-                TypeKind::SpvInst { spv_inst, type_and_const_inputs }
+                TypeKind::SpvInst { spv_inst, type_and_const_inputs, .. }
                     if spv_inst.opcode == wk.OpTypePointer =>
                 {
                     match type_and_const_inputs[..] {
@@ -2401,15 +2401,16 @@ impl Print for TypeDef {
                 // FIXME(eddyb) should this be shortened to `qtr`?
                 TypeKind::QPtr => printer.declarative_keyword_style().apply("qptr").into(),
 
-                TypeKind::SpvInst { spv_inst, type_and_const_inputs } => printer.pretty_spv_inst(
-                    printer.spv_op_style(),
-                    spv_inst.opcode,
-                    &spv_inst.imms,
-                    type_and_const_inputs.iter().map(|&ty_or_ct| match ty_or_ct {
-                        TypeOrConst::Type(ty) => ty.print(printer),
-                        TypeOrConst::Const(ct) => ct.print(printer),
-                    }),
-                ),
+                TypeKind::SpvInst { spv_inst, type_and_const_inputs, .. } => printer
+                    .pretty_spv_inst(
+                        printer.spv_op_style(),
+                        spv_inst.opcode,
+                        &spv_inst.imms,
+                        type_and_const_inputs.iter().map(|&ty_or_ct| match ty_or_ct {
+                            TypeOrConst::Type(ty) => ty.print(printer),
+                            TypeOrConst::Const(ct) => ct.print(printer),
+                        }),
+                    ),
                 TypeKind::SpvStringLiteralForExtInst => pretty::Fragment::new([
                     printer.error_style().apply("type_of").into(),
                     "(".into(),
@@ -2671,7 +2672,7 @@ impl Print for GlobalVarDecl {
                     printer.pretty_type_ascription_suffix(ty)
                 }
             },
-            TypeKind::SpvInst { spv_inst, type_and_const_inputs }
+            TypeKind::SpvInst { spv_inst, type_and_const_inputs, .. }
                 if spv_inst.opcode == wk.OpTypePointer =>
             {
                 match type_and_const_inputs[..] {
@@ -2727,7 +2728,19 @@ impl Print for AddrSpace {
 impl Print for FuncDecl {
     type Output = AttrsAndDef;
     fn print(&self, printer: &Printer<'_>) -> AttrsAndDef {
-        let Self { attrs, ret_type, params, def } = self;
+        let Self { attrs, ret_types, params, def } = self;
+
+        let sig_ret = if !ret_types.is_empty() {
+            let mut ret_types = ret_types.iter().map(|ty| ty.print(printer));
+            let ret_type = if ret_types.len() == 1 {
+                ret_types.next().unwrap()
+            } else {
+                pretty::join_comma_sep("(", ret_types, ")")
+            };
+            pretty::Fragment::new([" -> ".into(), ret_type])
+        } else {
+            pretty::Fragment::default()
+        };
 
         let sig = pretty::Fragment::new([
             pretty::join_comma_sep(
@@ -2745,8 +2758,7 @@ impl Print for FuncDecl {
                 }),
                 ")",
             ),
-            " -> ".into(),
-            ret_type.print(printer),
+            sig_ret,
         ]);
 
         let def_without_name = match def {
@@ -3005,7 +3017,7 @@ impl Print for FuncAt<'_, Node> {
             DataInstKind::Scalar(_)
             | DataInstKind::Vector(_)
             | DataInstKind::QPtr(_)
-            | DataInstKind::SpvInst(_)
+            | DataInstKind::SpvInst(..)
             | DataInstKind::SpvExtInst { .. } => {
                 // FIXME(eddyb) `outputs_header` is wastefully built even in
                 // this case (though ideally the logic would just be shared).
@@ -3047,6 +3059,21 @@ impl Print for NodeOutputDecl {
     }
 }
 
+impl Print for spv::ReaggregatedIdOperand<'_, Value> {
+    type Output = pretty::Fragment;
+    fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
+        match *self {
+            Self::Direct(v) => v.print(printer),
+            // FIXME(eddyb) should this be recursive? it's not on the
+            // output side, and we largely don't care about nesting.
+            Self::Aggregate { ty, leaves } => pretty::Fragment::new([
+                pretty::join_comma_sep("(", leaves.iter().map(|v| v.print(printer)), ")"),
+                printer.pretty_type_ascription_suffix(ty),
+            ]),
+        }
+    }
+}
+
 impl FuncAt<'_, DataInst> {
     fn print_data_inst(&self, printer: &Printer<'_>) -> pretty::Fragment {
         let DataInstDef { attrs, kind, inputs, child_regions, outputs } = self.def();
@@ -3055,18 +3082,29 @@ impl FuncAt<'_, DataInst> {
 
         let attrs = attrs.print(printer);
 
-        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-        let output_type = if !outputs.is_empty() {
-            assert_eq!(outputs.len(), 1);
-            Some(outputs[0].ty)
-        } else {
-            None
-        };
+        // NOTE(eddyb) the LHS types and the ascryption type don't have to line up,
+        // all the edge cases (likely only single-leaf aggregates) are handled
+        // by comparing the types being printed (and showing both if not redundant).
+        let mut show_outputs_lhs = !outputs.is_empty();
+        let output_uses_for_lhs = outputs.iter().enumerate().map(|(output_idx, _output)| {
+            Use::NodeOutput { node: self.position, output_idx: output_idx.try_into().unwrap() }
+        });
 
-        let mut output_use_to_print_as_lhs =
-            output_type.map(|_| Use::NodeOutput { node: self.position, output_idx: 0 });
+        let mut output_type_for_ascription_suffix = match kind {
+            NodeKind::FuncCall { .. }
+            | NodeKind::Select(_)
+            | NodeKind::Loop { .. }
+            | NodeKind::ExitInvocation(_) => unreachable!(),
 
-        let mut output_type_to_print = output_type;
+            DataInstKind::Scalar(_) | DataInstKind::Vector(_) | DataInstKind::QPtr(_) => None,
+            DataInstKind::SpvInst(_, lowering) | DataInstKind::SpvExtInst { lowering, .. } => {
+                lowering.disaggregated_output
+            }
+        }
+        .or_else(|| match outputs[..] {
+            [o] => Some(o.ty),
+            _ => None,
+        });
 
         // FIXME(eddyb) should this be a method on `scalar::Op` instead?
         let print_scalar = |op: scalar::Op| {
@@ -3080,7 +3118,7 @@ impl FuncAt<'_, DataInst> {
             ])
         };
 
-        let def_without_type = match kind {
+        let def_without_types = match kind {
             NodeKind::FuncCall { .. }
             | NodeKind::Select(_)
             | NodeKind::Loop { .. }
@@ -3272,38 +3310,44 @@ impl FuncAt<'_, DataInst> {
                 ])
             }
 
-            DataInstKind::SpvInst(inst) => printer.pretty_spv_inst(
+            DataInstKind::SpvInst(inst, lowering) => printer.pretty_spv_inst(
                 printer.spv_op_style(),
                 inst.opcode,
                 &inst.imms,
-                inputs.iter().map(|v| v.print(printer)),
+                lowering.reaggreate_inputs(inputs).map(|o| o.print(printer)),
             ),
-            &DataInstKind::SpvExtInst { ext_set, inst } => {
+            DataInstKind::SpvExtInst { ext_set, inst, lowering } => {
                 let spv_spec = spv::spec::Spec::get();
                 let wk = &spv_spec.well_known;
+
+                // HACK(eddyb) prevent accidentally using non-reaggregated `inputs`.
+                let inputs = lowering.reaggreate_inputs(inputs);
 
                 // HACK(eddyb) hide `OpTypeVoid` types, as they're effectively
                 // the default, and not meaningful *even if* the resulting
                 // value is "used" in a kind of "untyped token" way.
-                output_type_to_print = output_type_to_print.filter(|&ty| {
-                    let is_void = match &printer.cx[ty].kind {
-                        TypeKind::SpvInst { spv_inst, .. } => spv_inst.opcode == wk.OpTypeVoid,
-                        _ => false,
-                    };
-                    !is_void
-                });
+                output_type_for_ascription_suffix =
+                    output_type_for_ascription_suffix.filter(|&ty| {
+                        let is_void = match &printer.cx[ty].kind {
+                            TypeKind::SpvInst { spv_inst, .. } => spv_inst.opcode == wk.OpTypeVoid,
+                            _ => false,
+                        };
+                        !is_void
+                    });
                 // HACK(eddyb) only keep around untyped outputs if they're used.
-                if output_type_to_print.is_none() {
-                    output_use_to_print_as_lhs = output_use_to_print_as_lhs.filter(|output_use| {
+                if output_type_for_ascription_suffix.is_none() {
+                    show_outputs_lhs = show_outputs_lhs && {
+                        assert_eq!(outputs.len(), 1);
+                        let output_use = output_uses_for_lhs.clone().next().unwrap();
                         printer
                             .use_styles
-                            .get(output_use)
+                            .get(&output_use)
                             .is_some_and(|style| !matches!(style, UseStyle::Inline))
-                    });
+                    };
                 }
 
                 // FIXME(eddyb) this may get expensive, cache it?
-                let ext_set_name = &printer.cx[ext_set];
+                let ext_set_name = &printer.cx[*ext_set];
                 let lowercase_ext_set_name = ext_set_name.to_ascii_lowercase();
                 let (ext_set_alias, known_inst_desc) = (spv_spec
                     .get_ext_inst_set_by_lowercase_name(&lowercase_ext_set_name))
@@ -3313,7 +3357,7 @@ impl FuncAt<'_, DataInst> {
                 .map_or((&None, None), |ext_inst_set| {
                     // FIXME(eddyb) check that these aliases are unique
                     // across the entire output before using them!
-                    (&ext_inst_set.short_alias, ext_inst_set.instructions.get(&inst))
+                    (&ext_inst_set.short_alias, ext_inst_set.instructions.get(inst))
                 });
 
                 // FIXME(eddyb) extract and separate out the version?
@@ -3331,8 +3375,8 @@ impl FuncAt<'_, DataInst> {
                     Str(&'a str),
                     U32(u32),
                 }
-                let pseudo_imm_from_value = |v: Value| {
-                    if let Value::Const(ct) = v {
+                let pseudo_imm_from_input = |v: spv::ReaggregatedIdOperand<'_, Value>| {
+                    if let spv::ReaggregatedIdOperand::Direct(Value::Const(ct)) = v {
                         match &printer.cx[ct].kind {
                             ConstKind::Undef
                             | ConstKind::Vector(_)
@@ -3353,10 +3397,8 @@ impl FuncAt<'_, DataInst> {
                 };
 
                 let debuginfo_with_pseudo_imm_inputs: Option<SmallVec<[_; 8]>> = known_inst_desc
-                    .filter(|inst_desc| {
-                        inst_desc.is_debuginfo && output_use_to_print_as_lhs.is_none()
-                    })
-                    .and_then(|_| inputs.iter().copied().map(pseudo_imm_from_value).collect());
+                    .filter(|inst_desc| inst_desc.is_debuginfo && !show_outputs_lhs)
+                    .and_then(|_| inputs.clone().map(pseudo_imm_from_input).collect());
                 let printing_debuginfo_as_comment = debuginfo_with_pseudo_imm_inputs.is_some();
 
                 let [spv_base_style, string_literal_style, numeric_literal_style] =
@@ -3436,9 +3478,9 @@ impl FuncAt<'_, DataInst> {
                     } else {
                         pretty::join_comma_sep(
                             "(",
-                            inputs.iter().zip(operand_names).map(|(&input, name)| {
+                            inputs.zip(operand_names).map(|(input, name)| {
                                 // HACK(eddyb) no need to wrap strings in `OpString(...)`.
-                                let printed_input = match pseudo_imm_from_value(input) {
+                                let printed_input = match pseudo_imm_from_input(input) {
                                     Some(PseudoImm::Str(s)) => printer.pretty_string_literal(s),
                                     _ => input.print(printer),
                                 };
@@ -3468,8 +3510,8 @@ impl FuncAt<'_, DataInst> {
         };
 
         let def_without_name = pretty::Fragment::new([
-            def_without_type,
-            output_type_to_print
+            def_without_types,
+            output_type_for_ascription_suffix
                 .map(|ty| printer.pretty_type_ascription_suffix(ty))
                 .unwrap_or_default(),
         ]);
@@ -3480,11 +3522,26 @@ impl FuncAt<'_, DataInst> {
             def_without_name,
         ]);
 
+        // NOTE(eddyb) adding a type to a single output on the LHS can only
+        // be needed when *a different type* was shown via type ascription.
+        let sole_output_needs_lhs_type = outputs.len() == 1
+            && output_type_for_ascription_suffix.is_some_and(|ty| outputs[0].ty != ty);
+
+        let outputs_lhs = show_outputs_lhs.then(|| {
+            let mut outputs = output_uses_for_lhs.zip_eq(outputs).map(|(output_use, output)| {
+                output.print(printer).insert_name_before_def(output_use.print_as_def(printer))
+            });
+
+            if outputs.len() == 1 && !sole_output_needs_lhs_type {
+                return outputs.next().unwrap();
+            }
+
+            pretty::join_comma_sep("(", outputs, ")")
+        });
+
         AttrsAndDef { attrs, def_without_name }.insert_name_before_def(
-            output_use_to_print_as_lhs
-                .map(|output_use| {
-                    pretty::Fragment::new([output_use.print_as_def(printer), " = ".into()])
-                })
+            outputs_lhs
+                .map(|outputs_lhs| pretty::Fragment::new([outputs_lhs, " = ".into()]))
                 .unwrap_or_default(),
         )
     }
@@ -3524,10 +3581,18 @@ impl Print for cfg::ControlInst {
             cfg::ControlInstKind::Return => {
                 // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
                 assert!(targets.len() == 0);
-                match inputs[..] {
-                    [] => kw("return"),
-                    [v] => pretty::Fragment::new([kw("return"), " ".into(), v.print(printer)]),
-                    _ => unreachable!(),
+                if inputs.is_empty() {
+                    kw("return")
+                } else {
+                    let inputs = match inputs[..] {
+                        [v] => v.print(printer),
+                        _ => pretty::join_comma_sep(
+                            "(",
+                            inputs.iter().map(|v| v.print(printer)),
+                            ")",
+                        ),
+                    };
+                    pretty::Fragment::new([kw("return"), " ".into(), inputs])
                 }
             }
             cfg::ControlInstKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(spv::Inst {
