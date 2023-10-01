@@ -3124,6 +3124,7 @@ impl FuncAt<'_, DataInst> {
                     QPtrOp::FuncLocalVar(_) => (None, &inputs[..]),
                     _ => (Some(inputs[0]), &inputs[1..]),
                 };
+                let mut qptr_input = qptr_input.map(|v| v.print(printer));
                 let (name, extra_inputs): (_, SmallVec<[_; 1]>) = match op {
                     QPtrOp::FuncLocalVar(mem_layout) => {
                         assert!(extra_inputs.len() <= 1);
@@ -3218,12 +3219,32 @@ impl FuncAt<'_, DataInst> {
                         )
                     }
 
-                    QPtrOp::Load => {
+                    &QPtrOp::Load { offset } => {
                         assert_eq!(extra_inputs.len(), 0);
+                        if offset != 0 {
+                            qptr_input = Some(pretty::Fragment::new([
+                                qptr_input.take().unwrap(),
+                                if offset < 0 { " - " } else { " + " }.into(),
+                                printer
+                                    .numeric_literal_style()
+                                    .apply(offset.abs().to_string())
+                                    .into(),
+                            ]));
+                        }
                         ("load", [].into_iter().collect())
                     }
-                    QPtrOp::Store => {
+                    &QPtrOp::Store { offset } => {
                         assert_eq!(extra_inputs.len(), 1);
+                        if offset != 0 {
+                            qptr_input = Some(pretty::Fragment::new([
+                                qptr_input.take().unwrap(),
+                                if offset < 0 { " - " } else { " + " }.into(),
+                                printer
+                                    .numeric_literal_style()
+                                    .apply(offset.abs().to_string())
+                                    .into(),
+                            ]));
+                        }
                         ("store", [extra_inputs[0].print(printer)].into_iter().collect())
                     }
                 };
@@ -3234,11 +3255,7 @@ impl FuncAt<'_, DataInst> {
                         .apply("qptr.")
                         .into(),
                     printer.declarative_keyword_style().apply(name).into(),
-                    pretty::join_comma_sep(
-                        "(",
-                        qptr_input.map(|v| v.print(printer)).into_iter().chain(extra_inputs),
-                        ")",
-                    ),
+                    pretty::join_comma_sep("(", qptr_input.into_iter().chain(extra_inputs), ")"),
                 ])
             }
 
