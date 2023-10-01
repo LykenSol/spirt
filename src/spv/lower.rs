@@ -844,29 +844,11 @@ impl Module {
             return Err(invalid("OpFunction without matching OpFunctionEnd"));
         }
 
-        // HACK(eddyb) `OpNop` is useful for defining `DataInst`s before they're
-        // actually lowered (to be able to refer to their outputs `Value`s).
-        let mut cached_op_nop_form = None;
-        let mut get_op_nop_form = || {
-            *cached_op_nop_form.get_or_insert_with(|| {
-                cx.intern(DataInstFormDef {
-                    kind: DataInstKind::SpvInst(wk.OpNop.into()),
-                    output_type: None,
-                })
-            })
-        };
-
         // Process function bodies, having seen the whole module.
         for func_body in pending_func_bodies {
             let FuncBody { func_id, func, insts: raw_insts } = func_body;
 
             let func_decl = &mut module.funcs[func];
-
-            #[derive(Copy, Clone)]
-            enum LocalIdDef {
-                Value(Type, Value),
-                BlockLabel(ControlRegion),
-            }
 
             #[derive(PartialEq, Eq, Hash)]
             struct PhiKey {
@@ -884,9 +866,7 @@ impl Module {
                 cfgssa_inter_block_uses: FxIndexMap<spv::Id, Type>,
             }
 
-            // Index IDs declared within the function, first.
-            let mut local_id_defs = FxIndexMap::default();
-            // `OpPhi`s are also collected here, to assign them per-edge.
+            // Gather `OpLabel`s and `OpPhi`s early (so they can be random-accessed).
             let mut phi_to_values = FxIndexMap::<PhiKey, SmallVec<[spv::Id; 1]>>::default();
             // FIXME(eddyb) wouldn't `EntityOrientedDenseMap` make more sense?
             let mut block_details = FxIndexMap::<ControlRegion, BlockDetails>::default();
@@ -909,7 +889,6 @@ impl Module {
                 })
             };
             {
-                let mut next_param_idx = 0u32;
                 for raw_inst in &raw_insts {
                     let IntraFuncInst {
                         without_ids: spv::Inst { opcode, ref imms },
@@ -918,112 +897,58 @@ impl Module {
                         ..
                     } = *raw_inst;
 
-                    if let Some(id) = result_id {
-                        let local_id_def = if opcode == wk.OpFunctionParameter {
-                            let idx = next_param_idx;
-                            next_param_idx = idx.checked_add(1).unwrap();
+                    if opcode == wk.OpFunctionParameter {
+                        continue;
+                    }
 
-                            let body = match &func_decl.def {
-                                // `LocalIdDef`s not needed for declarations.
-                                DeclDef::Imported(_) => continue,
+                    let is_entry_block = !has_blocks;
+                    has_blocks = true;
 
-                                DeclDef::Present(def) => def.body,
-                            };
-                            LocalIdDef::Value(result_type.unwrap(), Value::ControlRegionInput {
-                                region: body,
-                                input_idx: idx,
-                            })
+                    let func_def_body = match &mut func_decl.def {
+                        // Error will be emitted later, below.
+                        DeclDef::Imported(_) => continue,
+                        DeclDef::Present(def) => def,
+                    };
+
+                    if opcode == wk.OpLabel {
+                        let block = if is_entry_block {
+                            // A `ControlRegion` was defined earlier,
+                            // to be able to create the `FuncDefBody`.
+                            func_def_body.body
                         } else {
-                            let is_entry_block = !has_blocks;
-                            has_blocks = true;
-
-                            let func_def_body = match &mut func_decl.def {
-                                // Error will be emitted later, below.
-                                DeclDef::Imported(_) => continue,
-                                DeclDef::Present(def) => def,
-                            };
-
-                            if opcode == wk.OpLabel {
-                                let block = if is_entry_block {
-                                    // A `ControlRegion` was defined earlier,
-                                    // to be able to create the `FuncDefBody`.
-                                    func_def_body.body
-                                } else {
-                                    func_def_body
-                                        .control_regions
-                                        .define(&cx, ControlRegionDef::default())
-                                };
-                                block_details.insert(block, BlockDetails {
-                                    label_id: id,
-                                    phi_count: 0,
-                                    cfgssa_inter_block_uses: Default::default(),
-                                });
-                                LocalIdDef::BlockLabel(block)
-                            } else if opcode == wk.OpPhi {
-                                let (&current_block, block_details) = match block_details.last_mut()
-                                {
-                                    Some(entry) => entry,
-                                    // Error will be emitted later, below.
-                                    None => continue,
-                                };
-
-                                let phi_idx = block_details.phi_count;
-                                block_details.phi_count = phi_idx.checked_add(1).unwrap();
-                                let phi_idx = u32::try_from(phi_idx).unwrap();
-
-                                assert!(imms.is_empty());
-                                // FIXME(eddyb) use `array_chunks` when that's stable.
-                                for value_and_source_block_id in raw_inst.ids.chunks(2) {
-                                    let &[value_id, source_block_id]: &[_; 2] =
-                                        value_and_source_block_id.try_into().unwrap();
-
-                                    phi_to_values
-                                        .entry(PhiKey {
-                                            source_block_id,
-                                            target_block_id: block_details.label_id,
-                                            target_phi_idx: phi_idx,
-                                        })
-                                        .or_default()
-                                        .push(value_id);
-                                }
-
-                                LocalIdDef::Value(result_type.unwrap(), Value::ControlRegionInput {
-                                    region: current_block,
-                                    input_idx: phi_idx,
-                                })
-                            } else if opcode == wk.OpFunctionCall {
-                                // HACK(eddyb) can't get a `ControlNode` without
-                                // defining it (as a dummy) first.
-                                let control_node = func_def_body.control_nodes.define(
-                                    &cx,
-                                    ControlNodeDef {
-                                        attrs: AttrSet::default(),
-                                        kind: ControlNodeKind::Block { insts: Default::default() },
-                                        outputs: [].into_iter().collect(),
-                                    }
-                                    .into(),
-                                );
-                                LocalIdDef::Value(result_type.unwrap(), Value::ControlNodeOutput {
-                                    control_node,
-                                    output_idx: 0,
-                                })
-                            } else {
-                                // HACK(eddyb) can't get a `DataInst` without
-                                // defining it (as a dummy) first.
-                                let inst = func_def_body.data_insts.define(
-                                    &cx,
-                                    DataInstDef {
-                                        attrs: AttrSet::default(),
-                                        // FIXME(eddyb) cache this form locally.
-                                        form: get_op_nop_form(),
-                                        inputs: [].into_iter().collect(),
-                                    }
-                                    .into(),
-                                );
-                                LocalIdDef::Value(result_type.unwrap(), Value::DataInstOutput(inst))
-                            }
+                            func_def_body.control_regions.define(&cx, ControlRegionDef::default())
                         };
-                        local_id_defs.insert(id, local_id_def);
+                        block_details.insert(block, BlockDetails {
+                            label_id: result_id.unwrap(),
+                            phi_count: 0,
+                            cfgssa_inter_block_uses: Default::default(),
+                        });
+                    } else if opcode == wk.OpPhi {
+                        let (_, block_details) = match block_details.last_mut() {
+                            Some(entry) => entry,
+                            // Error will be emitted later, below.
+                            None => continue,
+                        };
+
+                        let phi_idx = block_details.phi_count;
+                        block_details.phi_count = phi_idx.checked_add(1).unwrap();
+                        let phi_idx = u32::try_from(phi_idx).unwrap();
+
+                        assert!(imms.is_empty());
+                        // FIXME(eddyb) use `array_chunks` when that's stable.
+                        for value_and_source_block_id in raw_inst.ids.chunks(2) {
+                            let &[value_id, source_block_id]: &[_; 2] =
+                                value_and_source_block_id.try_into().unwrap();
+
+                            phi_to_values
+                                .entry(PhiKey {
+                                    source_block_id,
+                                    target_block_id: block_details.label_id,
+                                    target_phi_idx: phi_idx,
+                                })
+                                .or_default()
+                                .push(value_id);
+                        }
                     }
 
                     if let Some(def_map) = &mut cfgssa_def_map {
@@ -1078,6 +1003,21 @@ impl Module {
 
                 None
             };
+
+            #[derive(Copy, Clone)]
+            enum LocalIdDef {
+                Value(Type, Value),
+                BlockLabel(ControlRegion),
+            }
+
+            let mut local_id_defs = FxIndexMap::default();
+
+            // Labels can be forward-referenced, so always have them present.
+            local_id_defs.extend(
+                block_details
+                    .iter()
+                    .map(|(&region, details)| (details.label_id, LocalIdDef::BlockLabel(region))),
+            );
 
             // HACK(eddyb) an entire separate traversal is required to find
             // all inter-block uses, before any blocks get lowered to SPIR-T.
@@ -1220,6 +1160,9 @@ impl Module {
                         "unsupported use of {} outside `OpExtInst`",
                         id_def.descr(&cx),
                     ))),
+                    // FIXME(eddyb) scan the rest of the function for any
+                    // instructions returning this ID, to report an invalid
+                    // forward reference (use before def).
                     None => local_id_defs
                         .get(&id)
                         .copied()
@@ -1239,11 +1182,17 @@ impl Module {
                     let ty = result_type.unwrap();
                     params.push(FuncParam { attrs, ty });
                     if let Some(func_def_body) = &mut func_def_body {
-                        func_def_body
-                            .at_mut_body()
-                            .def()
-                            .inputs
-                            .push(ControlRegionInputDecl { attrs, ty });
+                        let body_inputs = &mut func_def_body.at_mut_body().def().inputs;
+                        let input_idx = u32::try_from(body_inputs.len()).unwrap();
+                        body_inputs.push(ControlRegionInputDecl { attrs, ty });
+
+                        local_id_defs.insert(
+                            result_id.unwrap(),
+                            LocalIdDef::Value(ty, Value::ControlRegionInput {
+                                region: func_def_body.body,
+                                input_idx,
+                            }),
+                        );
                     }
                     continue;
                 }
@@ -1257,8 +1206,7 @@ impl Module {
                         return Err(invalid("block lacks terminator instruction"));
                     }
 
-                    // A `ControlRegion` (using an empty `Block` `ControlNode`
-                    // as its sole child) was defined earlier,
+                    // An empty `ControlRegion` was defined earlier,
                     // to be able to have an entry in `local_id_defs`.
                     let region = match local_id_defs[&result_id.unwrap()] {
                         LocalIdDef::BlockLabel(region) => region,
@@ -1301,14 +1249,13 @@ impl Module {
                     current_block.shadowed_local_id_defs.extend(
                         current_block.details.cfgssa_inter_block_uses.iter().map(
                             |(&used_id, &ty)| {
-                                let input_idx = current_block_control_region_def
-                                    .inputs
-                                    .len()
-                                    .try_into()
-                                    .unwrap();
+                                let input_idx =
+                                    u32::try_from(current_block_control_region_def.inputs.len())
+                                        .unwrap();
                                 current_block_control_region_def
                                     .inputs
                                     .push(ControlRegionInputDecl { attrs: AttrSet::default(), ty });
+
                                 (
                                     used_id,
                                     LocalIdDef::Value(ty, Value::ControlRegionInput {
@@ -1532,9 +1479,21 @@ impl Module {
                         ));
                     }
 
+                    let ty = result_type.unwrap();
+
+                    let input_idx =
+                        u32::try_from(current_block_control_region_def.inputs.len()).unwrap();
                     current_block_control_region_def
                         .inputs
-                        .push(ControlRegionInputDecl { attrs, ty: result_type.unwrap() });
+                        .push(ControlRegionInputDecl { attrs, ty });
+
+                    local_id_defs.insert(
+                        result_id.unwrap(),
+                        LocalIdDef::Value(ty, Value::ControlRegionInput {
+                            region: current_block.region,
+                            input_idx,
+                        }),
+                    );
                 } else if [wk.OpSelectionMerge, wk.OpLoopMerge].contains(&opcode) {
                     let is_second_to_last_in_block = lookahead_raw_inst(2)
                         .map_or(true, |next_raw_inst| {
@@ -1694,40 +1653,19 @@ impl Module {
                             }
                         },
                     );
-                    let inst_or_node = match result_id {
-                        Some(id) => match (local_id_defs[&id], inst_or_node_def) {
-                            // A dummy was defined earlier, to be able to
-                            // have an entry in `local_id_defs`.
-                            (
-                                LocalIdDef::Value(_, Value::DataInstOutput(inst)),
-                                Either::Left(data_inst_def),
-                            ) => {
-                                func_def_body.data_insts[inst] = data_inst_def.into();
-
-                                Either::Left(inst)
-                            }
-                            (
-                                LocalIdDef::Value(
-                                    _,
-                                    Value::ControlNodeOutput { control_node, output_idx: 0 },
-                                ),
-                                Either::Right(control_node_def),
-                            ) => {
-                                func_def_body.control_nodes[control_node] = control_node_def.into();
-
-                                Either::Right(control_node)
-                            }
-                            _ => unreachable!(),
+                    let inst_or_node = inst_or_node_def.map_either(
+                        |data_inst_def| func_def_body.data_insts.define(&cx, data_inst_def.into()),
+                        |control_node_def| {
+                            func_def_body.control_nodes.define(&cx, control_node_def.into())
                         },
-                        None => inst_or_node_def.map_either(
-                            |data_inst_def| {
-                                func_def_body.data_insts.define(&cx, data_inst_def.into())
-                            },
-                            |control_node_def| {
-                                func_def_body.control_nodes.define(&cx, control_node_def.into())
-                            },
-                        ),
-                    };
+                    );
+                    if let Some(result_id) = result_id {
+                        let output = inst_or_node.either(Value::DataInstOutput, |control_node| {
+                            Value::ControlNodeOutput { control_node, output_idx: 0 }
+                        });
+                        local_id_defs
+                            .insert(result_id, LocalIdDef::Value(result_type.unwrap(), output));
+                    }
 
                     let data_inst = match inst_or_node {
                         Either::Left(data_inst) => data_inst,
