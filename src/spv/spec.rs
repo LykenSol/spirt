@@ -153,6 +153,8 @@ def_well_known! {
 
         OpFunctionCall,
 
+        OpImageTexelPointer,
+
         OpLoad,
         OpStore,
         OpCopyMemory,
@@ -197,6 +199,8 @@ def_well_known! {
         UniformConstant,
         Input,
         Output,
+
+        Image,
 
         IncomingRayPayloadKHR,
         IncomingCallableDataKHR,
