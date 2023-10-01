@@ -1155,10 +1155,9 @@ impl DataInstLifting {
                 unreachable!()
             }
 
-            // Disallowed while visiting.
-            DataInstKind::Mem(_) | DataInstKind::QPtr(_) => unreachable!(),
-
-            DataInstKind::Scalar(_) | DataInstKind::Vector(_) => {
+            DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
+            | DataInstKind::Mem(MemOp::Load { offset: None } | MemOp::Store { offset: None }) => {
                 // FIXME(eddyb) deduplicate creating this `OpTypeStruct`.
                 if output_types.len() > 1 {
                     let tuple_ty =
@@ -1181,6 +1180,9 @@ impl DataInstLifting {
             DataInstKind::SpvInst(_, lowering) | DataInstKind::SpvExtInst { lowering, .. } => {
                 lowering
             }
+
+            // Disallowed while visiting.
+            DataInstKind::Mem(_) | DataInstKind::QPtr(_) => unreachable!(),
         };
 
         let reaggregate_inputs = spv_inst_lowering
