@@ -896,7 +896,7 @@ impl<'a> InferUsage<'a> {
             after: |node| post_order_nodes.push(node),
         });
         for &node in post_order_nodes.iter().rev() {
-            let per_output_usage = node_to_per_output_usage.remove(&node).unwrap_or_default();
+            let mut per_output_usage = node_to_per_output_usage.remove(&node).unwrap_or_default();
 
             let node_def = func_def_body.at(node).def();
 
@@ -1012,13 +1012,19 @@ impl<'a> InferUsage<'a> {
                 | DataInstKind::Vector(_)
                 | DataInstKind::FuncCall(_)
                 | DataInstKind::QPtr(_)
-                | DataInstKind::SpvInst(_)
+                | DataInstKind::SpvInst(..)
                 | DataInstKind::SpvExtInst { .. } => {}
             }
 
-            // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-            assert!(per_output_usage.len() <= 1);
-            let output_usage = per_output_usage.into_iter().next().flatten();
+            // HACK(eddyb) this may be a bit wasteful, but it avoids
+            // complicating acessing `per_output_usage` below, and
+            // most instructions should only have at most two outputs.
+            {
+                let expected = node_def.outputs.len();
+                if per_output_usage.len() < expected {
+                    per_output_usage.extend((per_output_usage.len()..expected).map(|_| None));
+                }
+            }
 
             // FIXME(eddyb) merge with `match &node_def.kind` above.
             let data_inst_def = node_def;
@@ -1052,10 +1058,12 @@ impl<'a> InferUsage<'a> {
                     // with the inherent size/align (given by `_mem_layout`)?
                 }
                 DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
+                    assert_eq!(per_output_usage.len(), 1);
                     generate_usage(
                         self,
                         data_inst_def.inputs[0],
-                        output_usage
+                        per_output_usage[0]
+                            .take()
                             .unwrap_or_else(|| {
                                 Err(AnalysisError(Diag::bug([
                                     "HandleArrayIndex: unknown element".into()
@@ -1070,10 +1078,12 @@ impl<'a> InferUsage<'a> {
                     );
                 }
                 DataInstKind::QPtr(QPtrOp::BufferData) => {
+                    assert_eq!(per_output_usage.len(), 1);
                     generate_usage(
                         self,
                         data_inst_def.inputs[0],
-                        output_usage
+                        per_output_usage[0]
+                            .take()
                             .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
                             .and_then(|usage| {
                                 let usage = match usage {
@@ -1119,10 +1129,11 @@ impl<'a> InferUsage<'a> {
                     );
                 }
                 &DataInstKind::QPtr(QPtrOp::Offset(offset)) => {
+                    assert_eq!(per_output_usage.len(), 1);
                     generate_usage(
                         self,
                         data_inst_def.inputs[0],
-                        output_usage
+                        per_output_usage[0].take()
                             .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
                             .and_then(|usage| {
                                 let usage = match usage {
@@ -1167,10 +1178,11 @@ impl<'a> InferUsage<'a> {
                     );
                 }
                 DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
+                    assert_eq!(per_output_usage.len(), 1);
                     generate_usage(
                         self,
                         data_inst_def.inputs[0],
-                        output_usage
+                        per_output_usage[0].take()
                             .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
                             .and_then(|usage| {
                                 let usage = match usage {
@@ -1308,7 +1320,7 @@ impl<'a> InferUsage<'a> {
                     );
                 }
 
-                DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
+                DataInstKind::SpvInst(..) | DataInstKind::SpvExtInst { .. } => {
                     for attr in &cx[data_inst_def.attrs].attrs {
                         if let Attr::QPtr(QPtrAttr::ToSpvPtrInput { input_idx, pointee }) = *attr {
                             let ty = pointee.0;

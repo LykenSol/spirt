@@ -322,7 +322,7 @@ impl InnerVisit for TypeDef {
             | TypeKind::QPtr
             | TypeKind::SpvStringLiteralForExtInst => {}
 
-            TypeKind::SpvInst { spv_inst: _, type_and_const_inputs } => {
+            TypeKind::SpvInst { spv_inst: _, type_and_const_inputs, value_lowering: _ } => {
                 for &ty_or_ct in type_and_const_inputs {
                     match ty_or_ct {
                         TypeOrConst::Type(ty) => visitor.visit_type_use(ty),
@@ -399,10 +399,12 @@ impl InnerVisit for GlobalVarDefBody {
 
 impl InnerVisit for FuncDecl {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, ret_type, params, def } = self;
+        let Self { attrs, ret_types, params, def } = self;
 
         visitor.visit_attr_set_use(*attrs);
-        visitor.visit_type_use(*ret_type);
+        for &ty in ret_types {
+            visitor.visit_type_use(ty);
+        }
         for param in params {
             param.inner_visit_with(visitor);
         }
@@ -488,9 +490,11 @@ impl<'a> FuncAt<'a, Node> {
                 | QPtrOp::DynOffset { .. }
                 | QPtrOp::Load { .. }
                 | QPtrOp::Store { .. },
-            )
-            | DataInstKind::SpvInst(_)
-            | DataInstKind::SpvExtInst { .. } => {}
+            ) => {}
+            DataInstKind::SpvInst(_, lowering)
+            | DataInstKind::SpvExtInst { ext_set: _, inst: _, lowering } => {
+                lowering.inner_visit_with(visitor);
+            }
         }
         for v in inputs {
             visitor.visit_value_use(v);
@@ -516,6 +520,19 @@ impl InnerVisit for VarDecl {
 
         visitor.visit_attr_set_use(attrs);
         visitor.visit_type_use(ty);
+    }
+}
+
+impl InnerVisit for spv::InstLowering {
+    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
+        let Self { disaggregated_output, disaggregated_inputs } = self;
+
+        if let Some(ty) = *disaggregated_output {
+            visitor.visit_type_use(ty);
+        }
+        for &(_, ty) in disaggregated_inputs {
+            visitor.visit_type_use(ty);
+        }
     }
 }
 
