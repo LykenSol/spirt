@@ -18,6 +18,7 @@ mod layout;
 pub mod lift;
 pub mod lower;
 pub mod shapes;
+pub mod simplify;
 
 use bitflags::bitflags;
 pub use layout::LayoutConfig;
