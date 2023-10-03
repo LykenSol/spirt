@@ -182,7 +182,7 @@ impl ShadersDeviceHooks {
                     let layout_config = &spirt::qptr::LayoutConfig {
                         abstract_bool_size_align: (1, 1),
                         logical_ptr_size_align: (8, 8),
-                        ..spirt::qptr::LayoutConfig::VULKAN_SCALAR_LAYOUT
+                        ..spirt::qptr::LayoutConfig::VULKAN_SCALAR_LAYOUT_LE
                     };
 
                     self.timed_pass("qptr::lower_from_spv_ptrs", || {
