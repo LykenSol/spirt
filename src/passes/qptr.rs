@@ -62,6 +62,11 @@ pub fn partition_and_propagate(module: &mut Module, layout_config: &crate::mem::
             loop {
                 qptr::simplify::partition_locals_in_func(cx.clone(), layout_config, func_def_body);
 
+                if true {
+                    crate::flow::flow_func(cx.clone(), func_def_body);
+                    break;
+                }
+
                 let report = qptr::simplify::propagate_contents_of_locals_in_func(
                     cx.clone(),
                     layout_config,

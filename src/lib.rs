@@ -155,6 +155,7 @@
 // (i.e. using inner doc comments).
 pub mod cf;
 mod context;
+pub mod flow;
 pub mod func_at;
 pub mod print;
 pub mod transform;
