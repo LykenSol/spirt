@@ -157,6 +157,7 @@
 pub mod cfg;
 pub mod cfgssa;
 mod context;
+pub mod flow;
 pub mod func_at;
 pub mod print;
 pub mod transform;
