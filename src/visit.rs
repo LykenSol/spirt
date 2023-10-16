@@ -335,6 +335,8 @@ impl InnerVisit for ConstDef {
         visitor.visit_attr_set_use(*attrs);
         visitor.visit_type_use(*ty);
         match kind {
+            ConstKind::Undef | ConstKind::SpvStringLiteralForExtInst(_) => {}
+
             &ConstKind::PtrToGlobalVar(gv) => visitor.visit_global_var_use(gv),
             ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                 let (_spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
@@ -342,7 +344,6 @@ impl InnerVisit for ConstDef {
                     visitor.visit_const_use(ct);
                 }
             }
-            ConstKind::SpvStringLiteralForExtInst(_) => {}
         }
     }
 }
