@@ -4,7 +4,7 @@ use crate::transform::{InnerInPlaceTransform as _, Transformer};
 use crate::{
     AttrSet, Const, ConstDef, ConstKind, Context, DbgSrcLoc, EntityOrientedDenseMap, FuncDefBody,
     FxIndexMap, FxIndexSet, Node, NodeDef, NodeKind, NodeOutputDecl, Region, RegionDef,
-    SelectionKind, Type, TypeKind, Value, spv,
+    SelectionKind, Type, Value, scalar, spv,
 };
 use itertools::{Either, Itertools};
 use smallvec::SmallVec;
@@ -995,32 +995,9 @@ struct ClaimedRegion {
 
 impl<'a> Structurizer<'a> {
     pub fn new(cx: &'a Context, func_def_body: &'a mut FuncDefBody) -> Self {
-        // FIXME(eddyb) SPIR-T should have native booleans itself.
-        let wk = &spv::spec::Spec::get().well_known;
-        let type_bool = cx.intern(TypeKind::SpvInst {
-            spv_inst: wk.OpTypeBool.into(),
-            type_and_const_inputs: [].into_iter().collect(),
-        });
-        let const_true = cx.intern(ConstDef {
-            attrs: AttrSet::default(),
-            ty: type_bool,
-            kind: ConstKind::SpvInst {
-                spv_inst_and_const_inputs: Rc::new((
-                    wk.OpConstantTrue.into(),
-                    [].into_iter().collect(),
-                )),
-            },
-        });
-        let const_false = cx.intern(ConstDef {
-            attrs: AttrSet::default(),
-            ty: type_bool,
-            kind: ConstKind::SpvInst {
-                spv_inst_and_const_inputs: Rc::new((
-                    wk.OpConstantFalse.into(),
-                    [].into_iter().collect(),
-                )),
-            },
-        });
+        let type_bool = cx.intern(scalar::Type::Bool);
+        let const_true = cx.intern(scalar::Const::TRUE);
+        let const_false = cx.intern(scalar::Const::FALSE);
 
         let (loop_header_to_exit_targets, incoming_edge_counts_including_loop_exits) =
             func_def_body
