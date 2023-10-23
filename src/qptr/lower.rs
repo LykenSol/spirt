@@ -616,6 +616,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             NodeKind::Select(_)
             | NodeKind::Loop { .. }
             | NodeKind::ExitInvocation(_)
+            | DataInstKind::Scalar(_)
             | DataInstKind::FuncCall(_)
             | DataInstKind::QPtr(_) => return,
 
