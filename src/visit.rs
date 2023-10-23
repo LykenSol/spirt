@@ -474,6 +474,7 @@ impl<'a> FuncAt<'a, Node> {
             NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
             | NodeKind::Loop { repeat_condition: _ }
             | NodeKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(_))
+            | DataInstKind::Scalar(_)
             | DataInstKind::QPtr(
                 QPtrOp::FuncLocalVar(_)
                 | QPtrOp::HandleArrayIndex

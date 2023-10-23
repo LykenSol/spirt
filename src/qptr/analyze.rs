@@ -973,7 +973,8 @@ impl<'a> InferUsage<'a> {
                 }
                 NodeKind::ExitInvocation { .. } => continue,
 
-                DataInstKind::FuncCall(_)
+                DataInstKind::Scalar(_)
+                | DataInstKind::FuncCall(_)
                 | DataInstKind::QPtr(_)
                 | DataInstKind::SpvInst(_)
                 | DataInstKind::SpvExtInst { .. } => {}
@@ -989,6 +990,8 @@ impl<'a> InferUsage<'a> {
                 NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
                     unreachable!()
                 }
+
+                DataInstKind::Scalar(_) => {}
 
                 &DataInstKind::FuncCall(callee) => {
                     match self.infer_usage_in_func(module, callee) {
