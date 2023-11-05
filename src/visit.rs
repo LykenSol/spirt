@@ -483,6 +483,7 @@ impl<'a> FuncAt<'a, Node> {
             | NodeKind::Loop { repeat_condition: _ }
             | NodeKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(_))
             | DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
             | DataInstKind::QPtr(
                 QPtrOp::FuncLocalVar(_)
                 | QPtrOp::HandleArrayIndex

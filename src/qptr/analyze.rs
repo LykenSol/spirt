@@ -974,6 +974,7 @@ impl<'a> InferUsage<'a> {
                 NodeKind::ExitInvocation { .. } => continue,
 
                 DataInstKind::Scalar(_)
+                | DataInstKind::Vector(_)
                 | DataInstKind::FuncCall(_)
                 | DataInstKind::QPtr(_)
                 | DataInstKind::SpvInst(_)
@@ -991,7 +992,7 @@ impl<'a> InferUsage<'a> {
                     unreachable!()
                 }
 
-                DataInstKind::Scalar(_) => {}
+                DataInstKind::Scalar(_) | DataInstKind::Vector(_) => {}
 
                 &DataInstKind::FuncCall(callee) => {
                     match self.infer_usage_in_func(module, callee) {
