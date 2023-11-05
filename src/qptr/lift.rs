@@ -410,7 +410,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 return Ok(Transformed::Unchanged);
             }
 
-            DataInstKind::Scalar(_) => return Ok(Transformed::Unchanged),
+            DataInstKind::Scalar(_) | DataInstKind::Vector(_) => return Ok(Transformed::Unchanged),
 
             &DataInstKind::FuncCall(_callee) => {
                 for &v in &data_inst_def.inputs {

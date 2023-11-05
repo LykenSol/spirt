@@ -247,6 +247,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
             | NodeKind::Loop { .. }
             | NodeKind::ExitInvocation(_)
             | DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
             | DataInstKind::FuncCall(_)
             | DataInstKind::SpvInst(_) => {}
 
@@ -461,6 +462,7 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
                 | NodeKind::ExitInvocation { .. } => None,
 
                 DataInstKind::Scalar(_)
+                | DataInstKind::Vector(_)
                 | DataInstKind::FuncCall(_)
                 | DataInstKind::QPtr(_)
                 | DataInstKind::SpvInst(_)
@@ -672,6 +674,7 @@ impl<'a> FuncLifting<'a> {
                     }
 
                     DataInstKind::Scalar(_)
+                    | DataInstKind::Vector(_)
                     | DataInstKind::FuncCall(_)
                     | DataInstKind::QPtr(_)
                     | DataInstKind::SpvInst(_)
@@ -771,6 +774,7 @@ impl<'a> FuncLifting<'a> {
                         },
 
                         DataInstKind::Scalar(_)
+                        | DataInstKind::Vector(_)
                         | DataInstKind::FuncCall(_)
                         | DataInstKind::QPtr(_)
                         | DataInstKind::SpvInst(_)
@@ -840,6 +844,7 @@ impl<'a> FuncLifting<'a> {
 
                         NodeKind::ExitInvocation { .. }
                         | DataInstKind::Scalar(_)
+                        | DataInstKind::Vector(_)
                         | DataInstKind::FuncCall(_)
                         | DataInstKind::QPtr(_)
                         | DataInstKind::SpvInst(_)
@@ -1346,7 +1351,7 @@ impl LazyInst<'_, '_> {
                             | NodeKind::ExitInvocation(_),
                         ) => unreachable!(),
 
-                        Err(DataInstKind::Scalar(_)) => {
+                        Err(DataInstKind::Scalar(_) | DataInstKind::Vector(_)) => {
                             unreachable!("should've been handled as canonical")
                         }
 
