@@ -732,6 +732,7 @@ impl InnerTransform for DataInstFormDef {
                     | QPtrOp::Store => Transformed::Unchanged,
                 },
                 DataInstKind::Scalar(_)
+                | DataInstKind::Vector(_)
                 | DataInstKind::SpvInst(_)
                 | DataInstKind::SpvExtInst { .. } => Transformed::Unchanged,
             },

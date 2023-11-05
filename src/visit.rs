@@ -550,6 +550,7 @@ impl InnerVisit for DataInstFormDef {
                 | QPtrOp::Store => {}
             },
             DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
             | DataInstKind::SpvInst(_)
             | DataInstKind::SpvExtInst { .. } => {}
         }
