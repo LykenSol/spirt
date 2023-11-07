@@ -631,7 +631,9 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
         match kind {
             DataInstKind::FuncCall(func) => transformer.transform_func_use(*func).apply_to(func),
 
-            NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
+            NodeKind::Select(
+                SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
+            )
             | NodeKind::Loop { repeat_condition: _ }
             | NodeKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(_))
             | DataInstKind::Scalar(_)
@@ -697,7 +699,7 @@ impl InnerInPlaceTransform for cfg::ControlInst {
             | cfg::ControlInstKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(_))
             | cfg::ControlInstKind::Branch
             | cfg::ControlInstKind::SelectBranch(
-                SelectionKind::BoolCond | SelectionKind::SpvInst(_),
+                SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
             ) => {}
         }
         for v in inputs {
