@@ -9,9 +9,10 @@ use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
     DataInstKind, DeclDef, Diag, EntityOrientedDenseMap, FuncDecl, GlobalVarDecl, GlobalVarInit,
-    Node, NodeKind, NodeOutputDecl, OrdAssertEq, Region, Type, TypeKind, TypeOrConst, Value, spv,
+    Node, NodeKind, NodeOutputDecl, OrdAssertEq, Region, Type, TypeKind, TypeOrConst, Value,
+    scalar, spv,
 };
-use itertools::Either;
+use itertools::{Either, Itertools};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -326,15 +327,18 @@ impl Transformer for EraseSpvPtrs<'_> {
     fn transform_const_use(&mut self, ct: Const) -> Transformed<Const> {
         // FIXME(eddyb) maybe cache this remap (in `LowerFromSpvPtrs`, globally).
         let ct_def = &self.lowerer.cx[ct];
-        if let ConstKind::PtrToGlobalVar(_) = ct_def.kind {
-            Transformed::Changed(self.lowerer.cx.intern(ConstDef {
-                attrs: ct_def.attrs,
-                ty: self.lowerer.qptr_type(),
-                kind: ct_def.kind.clone(),
-            }))
-        } else {
-            Transformed::Unchanged
+        match &ct_def.kind {
+            ConstKind::Undef | ConstKind::PtrToGlobalVar(_) => {}
+            ConstKind::SpvInst { spv_inst_and_const_inputs }
+                if {
+                    // FIXME(eddyb) maybe `qptr` should have its own null constant?
+                    let (spv_inst, _) = &**spv_inst_and_const_inputs;
+                    spv_inst.opcode == self.lowerer.wk.OpConstantNull
+                } => {}
+
+            _ => return Transformed::Unchanged,
         }
+        self.transform_const_def(ct_def).map(|ct_def| self.lowerer.cx.intern(ct_def))
     }
 }
 
@@ -520,6 +524,113 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
 
         let (spv_inst, spv_inst_lowering) = match &data_inst_def.kind {
             DataInstKind::SpvInst(spv_inst, lowering) => (spv_inst, lowering),
+
+            // FIXME(eddyb) these (e.g. `ptr2int(p) == ptr2int(q) -> p == q`)
+            // transforms belong in a general-purpose rewrite rule system, not here.
+            // FIXME(eddyb) pointer equality could, in theory, fail due to
+            // provenance mismatch, even when integer equality would fail,
+            // but there is no way to encode this in a sane way yet, and
+            // might require a "pointer equality by address" operation.
+            &DataInstKind::Scalar(scalar::Op::IntBinary(
+                cmp_op @ (scalar::IntBinOp::Eq | scalar::IntBinOp::Ne),
+            )) => {
+                let ptr_addr_bit_width = self
+                    .lowerer
+                    .layout_cache
+                    .config
+                    .logical_ptr_size_align
+                    .0
+                    .checked_mul(8)
+                    .unwrap();
+                let Some(int_scalar_ty) = data_inst_def
+                    .inputs
+                    .iter()
+                    .map(|&v| func.at(v).type_of(cx).as_scalar(cx))
+                    .dedup()
+                    .exactly_one()
+                    .ok()
+                    .flatten()
+                    .filter(|ty| ty.bit_width() >= ptr_addr_bit_width)
+                else {
+                    return Ok(Transformed::Unchanged);
+                };
+                let Some(inputs) = data_inst_def
+                    .inputs
+                    .iter()
+                    .map(|&v| {
+                        match v {
+                            Value::NodeOutput { node, output_idx: 0 } => {
+                                let def = func.at(node).def();
+                                match &def.kind {
+                                    DataInstKind::SpvInst(spv_inst, lowering)
+                                        if spv_inst.opcode == wk.OpConvertPtrToU
+                                            && lowering.disaggregated_output.is_none()
+                                            && lowering.disaggregated_inputs.is_empty() =>
+                                    {
+                                        assert_eq!(def.inputs.len(), 1);
+                                        Some(def.inputs[0])
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            Value::Const(ct) => {
+                                let ct = ct.as_scalar(cx)?;
+                                assert!(ct.ty() == int_scalar_ty);
+
+                                // FIXME(eddyb) support arbitrary constant address ptrs.
+                                match ct.int_as_u32()? {
+                                    0 if self
+                                        .lowerer
+                                        .layout_cache
+                                        .config
+                                        .logical_ptr_null_is_zero =>
+                                    {
+                                        Some(Value::Const(cx.intern(ConstDef {
+                                            attrs: Default::default(),
+                                            ty: self.lowerer.qptr_type(),
+                                            // FIXME(eddyb) maybe `qptr` should
+                                            // have its own null constant?
+                                            kind: ConstKind::SpvInst {
+                                                spv_inst_and_const_inputs: Rc::new((
+                                                    wk.OpConstantNull.into(),
+                                                    [].into_iter().collect(),
+                                                )),
+                                            },
+                                        })))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect()
+                else {
+                    return Ok(Transformed::Unchanged);
+                };
+
+                // FIXME(eddyb) these are only supported since
+                // SPIR-V 1.4, and also `qptr` should maybe have
+                // its own comparison ops (esp. if they might
+                // require emulation).
+                let spv_ptr_cmp_opcode = match cmp_op {
+                    scalar::IntBinOp::Eq => wk.OpPtrEqual,
+                    scalar::IntBinOp::Ne => wk.OpPtrNotEqual,
+                    _ => unreachable!(),
+                };
+
+                return Ok(Transformed::Changed(DataInstDef {
+                    attrs,
+                    kind: DataInstKind::SpvInst(
+                        spv_ptr_cmp_opcode.into(),
+                        spv::InstLowering::default(),
+                    ),
+                    inputs,
+                    child_regions: [].into_iter().collect(),
+                    outputs: data_inst_def.outputs.clone(),
+                }));
+            }
+
             _ => return Ok(Transformed::Unchanged),
         };
 
@@ -1248,6 +1359,13 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             } else {
                 return Ok(Transformed::Unchanged);
             }
+        } else if spv_inst.opcode == wk.OpConvertPtrToU {
+            // HACK(eddyb) this is only here because of potential simplifications
+            // (when compared against the integer constant `0`) which aren't
+            // currently handled in a more generalized manner anywhere else.
+            self.remove_if_dead_inst_and_parent_region
+                .push((data_inst, self.parent_region.unwrap()));
+            return Ok(Transformed::Unchanged);
         } else {
             return Ok(Transformed::Unchanged);
         };
