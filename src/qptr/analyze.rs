@@ -8,8 +8,8 @@ use crate::func_at::FuncAt;
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, ControlNode, ControlNodeKind,
-    DataInst, DataInstForm, DataInstKind, DeclDef, Diag, EntityList, ExportKey, Exportee, Func,
-    FxIndexMap, GlobalVar, Module, OrdAssertEq, Type, TypeKind, Value,
+    DataInst, DataInstForm, DataInstKind, DeclDef, Diag, ExportKey, Exportee, Func, FxIndexMap,
+    GlobalVar, Module, OrdAssertEq, Type, TypeKind, Value,
 };
 use itertools::Either;
 use rustc_hash::FxHashMap;
@@ -866,51 +866,146 @@ impl<'a> InferUsage<'a> {
             }
         };
 
-        let mut all_data_insts = CollectAllDataInsts::default();
-        func_def_body.inner_visit_with(&mut all_data_insts);
+        let mut data_inst_output_usages: FxHashMap<_, Option<_>> = FxHashMap::default();
+        let mut control_node_to_per_output_usage: FxHashMap<_, SmallVec<[Option<_>; 2]>> =
+            FxHashMap::default();
 
-        let mut data_inst_output_usages = FxHashMap::default();
-        for insts in all_data_insts.0.into_iter().rev() {
-            for func_at_inst in func_def_body.at(insts).into_iter().rev() {
+        // FIXME(eddyb) should really be a method on a type with all these fields.
+        let mut generate_usage = |this: &mut Self,
+                                  usage_or_err_attrs_to_attach: &mut Vec<_>,
+                                  fallback_diagnosis_target,
+                                  data_inst_output_usages: &mut FxHashMap<DataInst, Option<_>>,
+                                  control_node_to_per_output_usage: &mut FxHashMap<
+            ControlNode,
+            SmallVec<[Option<_>; 2]>,
+        >,
+                                  ptr: Value,
+                                  new_usage| {
+            let slot = match ptr {
+                Value::Const(ct) => match cx[ct].kind {
+                    ConstKind::PtrToGlobalVar(gv) => this.global_var_usages.entry(gv).or_default(),
+                    // FIXME(eddyb) may be relevant?
+                    _ => unreachable!(),
+                },
+                Value::ControlRegionInput { region, input_idx } if region == func_def_body.body => {
+                    &mut param_usages[input_idx as usize]
+                }
+                // FIXME(eddyb) implement `qptr.usage` propagation across
+                // loop state (will likely require computing the effect
+                // of the body in terms of its inputs, then somehow taking
+                // the fixpoint of that without risking infinite unfolding).
+                Value::ControlRegionInput { .. } => {
+                    match new_usage {
+                        Ok(usage) => {
+                            usage_or_err_attrs_to_attach.push((
+                                ptr,
+                                Err(AnalysisError(Diag::bug([
+                                    "unsupported loop state qptr.usage: ".into(),
+                                    crate::DiagMsgPart::from(usage),
+                                ]))),
+                            ));
+                        }
+                        Err(err) => {
+                            usage_or_err_attrs_to_attach.extend([
+                                (ptr, Err(err)),
+                                (
+                                    ptr,
+                                    Err(AnalysisError(Diag::bug([
+                                        "unsupported loop state qptr".into()
+                                    ]))),
+                                ),
+                            ]);
+                        }
+                    }
+                    return;
+                }
+                Value::ControlNodeOutput { control_node: ptr_node, output_idx } => {
+                    let i = output_idx as usize;
+                    let slots = control_node_to_per_output_usage.entry(ptr_node).or_default();
+                    if i >= slots.len() {
+                        slots.extend((slots.len()..=i).map(|_| None));
+                    }
+                    &mut slots[i]
+                }
+                Value::DataInstOutput(ptr_inst) => {
+                    data_inst_output_usages.entry(ptr_inst).or_default()
+                }
+            };
+            *slot = Some(match slot.take() {
+                Some(old) => old.and_then(|old| {
+                    UsageMerger { layout_cache: &this.layout_cache }
+                        .merge(old, new_usage?)
+                        .into_result()
+                }),
+                None => new_usage,
+            });
+        };
+
+        // HACK(eddyb) reversing a post-order traversal to get RPO, which for
+        // structured control-flow means outside-in/top-down (just like pre-order),
+        // while post-order and reverse pre-order are inside-out/bottom-up.
+        let mut post_order_control_nodes = vec![];
+        func_def_body.inner_visit_with(&mut VisitAllControlNodes {
+            before: |_| {},
+            after: |node| post_order_control_nodes.push(node),
+        });
+        for control_node in post_order_control_nodes.into_iter().rev() {
+            let block_insts = match &func_def_body.at(control_node).def().kind {
+                &ControlNodeKind::Block { insts } => insts,
+                ControlNodeKind::Select { cases, .. } => {
+                    let per_output_usage =
+                        control_node_to_per_output_usage.remove(&control_node).unwrap_or_default();
+
+                    // Always attach attributes to `qptr`-typed outputs,
+                    // on top of propagating them from uses to definitions.
+                    for (i, usage) in per_output_usage.iter().enumerate() {
+                        let output = Value::ControlNodeOutput {
+                            control_node,
+                            output_idx: i.try_into().unwrap(),
+                        };
+                        if let Some(usage) = usage {
+                            usage_or_err_attrs_to_attach.push((output, Clone::clone(usage)));
+                            for &case in cases {
+                                generate_usage(
+                                    self,
+                                    &mut usage_or_err_attrs_to_attach,
+                                    output,
+                                    &mut data_inst_output_usages,
+                                    &mut control_node_to_per_output_usage,
+                                    func_def_body.at(case).def().outputs[i],
+                                    usage.clone(),
+                                );
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+                ControlNodeKind::Loop { .. } => {
+                    // FIXME(eddyb) implement `qptr.usage` propagation across
+                    // loop state (will likely require computing the effect
+                    // of the body in terms of its inputs, then somehow taking
+                    // the fixpoint of that without risking infinite unfolding).
+                    continue;
+                }
+                ControlNodeKind::ExitInvocation { .. } => continue,
+            };
+            for func_at_inst in func_def_body.at(block_insts).into_iter().rev() {
                 let data_inst = func_at_inst.position;
                 let data_inst_def = func_at_inst.def();
                 let data_inst_form_def = &cx[data_inst_def.form];
                 let output_usage = data_inst_output_usages.remove(&data_inst).flatten();
 
                 let mut generate_usage = |this: &mut Self, ptr: Value, new_usage| {
-                    let slot = match ptr {
-                        Value::Const(ct) => match cx[ct].kind {
-                            ConstKind::PtrToGlobalVar(gv) => {
-                                this.global_var_usages.entry(gv).or_default()
-                            }
-                            // FIXME(eddyb) may be relevant?
-                            _ => unreachable!(),
-                        },
-                        Value::ControlRegionInput { region, input_idx }
-                            if region == func_def_body.body =>
-                        {
-                            &mut param_usages[input_idx as usize]
-                        }
-                        // FIXME(eddyb) implement
-                        Value::ControlRegionInput { .. } | Value::ControlNodeOutput { .. } => {
-                            usage_or_err_attrs_to_attach.push((
-                                ptr,
-                                Err(AnalysisError(Diag::bug(["unsupported φ".into()]))),
-                            ));
-                            return;
-                        }
-                        Value::DataInstOutput(ptr_inst) => {
-                            data_inst_output_usages.entry(ptr_inst).or_default()
-                        }
-                    };
-                    *slot = Some(match slot.take() {
-                        Some(old) => old.and_then(|old| {
-                            UsageMerger { layout_cache: &this.layout_cache }
-                                .merge(old, new_usage?)
-                                .into_result()
-                        }),
-                        None => new_usage,
-                    });
+                    generate_usage(
+                        this,
+                        &mut usage_or_err_attrs_to_attach,
+                        Value::DataInstOutput(data_inst),
+                        &mut data_inst_output_usages,
+                        &mut control_node_to_per_output_usage,
+                        ptr,
+                        new_usage,
+                    );
                 };
                 match &data_inst_form_def.kind {
                     DataInstKind::Scalar(_) | DataInstKind::Vector(_) => {}
@@ -1252,9 +1347,12 @@ impl<'a> InferUsage<'a> {
 
 // HACK(eddyb) this is easier than implementing a proper reverse traversal.
 #[derive(Default)]
-struct CollectAllDataInsts(Vec<EntityList<DataInst>>);
+struct VisitAllControlNodes<B: FnMut(ControlNode), A: FnMut(ControlNode)> {
+    before: B,
+    after: A,
+}
 
-impl Visitor<'_> for CollectAllDataInsts {
+impl<B: FnMut(ControlNode), A: FnMut(ControlNode)> Visitor<'_> for VisitAllControlNodes<B, A> {
     // FIXME(eddyb) this is excessive, maybe different kinds of
     // visitors should exist for module-level and func-level?
     fn visit_attr_set_use(&mut self, _: AttrSet) {}
@@ -1265,9 +1363,8 @@ impl Visitor<'_> for CollectAllDataInsts {
     fn visit_func_use(&mut self, _: Func) {}
 
     fn visit_control_node_def(&mut self, func_at_control_node: FuncAt<'_, ControlNode>) {
-        if let ControlNodeKind::Block { insts } = func_at_control_node.def().kind {
-            self.0.push(insts);
-        }
+        (self.before)(func_at_control_node.position);
         func_at_control_node.inner_visit_with(self);
+        (self.after)(func_at_control_node.position);
     }
 }
