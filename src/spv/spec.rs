@@ -130,6 +130,10 @@ def_well_known! {
         OpSpecConstantComposite,
         OpConstantFunctionPointerINTEL,
 
+        // FIXME(eddyb) this are only exposed here for `qptr`.
+        OpConstantNull,
+        OpSpecConstantOp,
+
         OpVariable,
 
         OpFunction,
@@ -162,6 +166,10 @@ def_well_known! {
         OpPtrAccessChain,
         OpInBoundsPtrAccessChain,
         OpBitcast,
+
+        OpConvertPtrToU,
+        OpPtrEqual,
+        OpPtrNotEqual,
 
         // FIXME(eddyb) hide these from code, lowering should handle most cases.
         OpCompositeInsert,
