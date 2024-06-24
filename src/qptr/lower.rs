@@ -7,8 +7,8 @@ use crate::func_at::FuncAtMut;
 use crate::qptr::{QPtrAttr, QPtrOp, shapes};
 use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
-    AddrSpace, AttrSetDef, Const, ConstDef, ConstKind, Context, ControlNode, ControlNodeKind,
-    DataInst, DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DeclDef, Diag,
+    AddrSpace, AttrSetDef, Const, ConstKind, Context, ControlNode, ControlNodeKind, DataInst,
+    DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DeclDef, Diag,
     EntityOrientedDenseMap, FuncDecl, GlobalVarDecl, GlobalVarInit, OrdAssertEq, Type, TypeKind,
     TypeOrConst, Value, spv,
 };
@@ -326,15 +326,18 @@ impl Transformer for EraseSpvPtrs<'_> {
     fn transform_const_use(&mut self, ct: Const) -> Transformed<Const> {
         // FIXME(eddyb) maybe cache this remap (in `LowerFromSpvPtrs`, globally).
         let ct_def = &self.lowerer.cx[ct];
-        if let ConstKind::PtrToGlobalVar(_) = ct_def.kind {
-            Transformed::Changed(self.lowerer.cx.intern(ConstDef {
-                attrs: ct_def.attrs,
-                ty: self.lowerer.qptr_type(),
-                kind: ct_def.kind.clone(),
-            }))
-        } else {
-            Transformed::Unchanged
+        match &ct_def.kind {
+            ConstKind::Undef | ConstKind::PtrToGlobalVar(_) => {}
+            ConstKind::SpvInst { spv_inst_and_const_inputs }
+                if {
+                    // FIXME(eddyb) maybe `qptr` should have its own null constant?
+                    let (spv_inst, _) = &**spv_inst_and_const_inputs;
+                    spv_inst.opcode == self.lowerer.wk.OpConstantNull
+                } => {}
+
+            _ => return Transformed::Unchanged,
         }
+        self.transform_const_def(ct_def).map(|ct_def| self.lowerer.cx.intern(ct_def))
     }
 
     // FIXME(eddyb) because this is now interned, it might be better to

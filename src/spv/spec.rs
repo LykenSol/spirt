@@ -133,6 +133,10 @@ def_well_known! {
         OpConstantComposite,
         OpSpecConstantComposite,
 
+        // FIXME(eddyb) this is only exposed here for `qptr::lower`, which lacks
+        // its own "null `qptr`" constant.
+        OpConstantNull,
+
         OpVariable,
 
         OpFunction,
