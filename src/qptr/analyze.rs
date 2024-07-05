@@ -565,30 +565,31 @@ impl MemTypeLayout {
         }
 
         {
-            // FIXME(eddyb) should `QPtrMemUsage` track a `min_size` as well?
-            // FIXME(eddyb) duplicated below.
-            let min_usage_offset_range =
-                usage_offset..usage_offset.saturating_add(usage.max_size.unwrap_or(0));
+            // FIXME(eddyb) should `QPtrMemUsage` have have an `.extent()` method?
+            let usage_extent =
+                Extent { start: 0, end: usage.max_size }.saturating_add(usage_offset);
 
             // "Fast reject" based on size alone (expected w/ multiple attempts).
-            if self.mem_layout.dyn_unit_stride.is_none()
-                && (self.mem_layout.fixed_base.size < min_usage_offset_range.end
-                    || usage.max_size.is_none())
-            {
+            // FIXME(eddyb) should `MemTypeLayout` have have an `.extent()` method?
+            let extent = Extent {
+                start: 0,
+                end: (self.mem_layout.dyn_unit_stride.is_none())
+                    .then_some(self.mem_layout.fixed_base.size),
+            };
+            if !extent.includes(&usage_extent) {
                 return false;
             }
         }
 
         let any_component_supports = |usage_offset: u32, usage: &QPtrMemUsage| {
-            // FIXME(eddyb) should `QPtrMemUsage` track a `min_size` as well?
-            // FIXME(eddyb) duplicated above.
-            let min_usage_offset_range =
-                usage_offset..usage_offset.saturating_add(usage.max_size.unwrap_or(0));
+            // FIXME(eddyb) should `QPtrMemUsage` have have an `.extent()` method?
+            let usage_extent =
+                Extent { start: 0, end: usage.max_size }.saturating_add(usage_offset);
 
             // FIXME(eddyb) `find_components_containing` is linear today but
             // could be made logarithmic (via binary search).
-            self.components.find_components_containing(min_usage_offset_range).any(
-                |idx| match &self.components {
+            self.components.find_components_containing(usage_extent).any(|idx| {
+                match &self.components {
                     Components::Scalar => unreachable!(),
                     Components::Elements { stride, elem, .. } => {
                         elem.supports_usage_at_offset(usage_offset % stride.get(), usage)
@@ -596,8 +597,8 @@ impl MemTypeLayout {
                     Components::Fields { offsets, layouts, .. } => {
                         layouts[idx].supports_usage_at_offset(usage_offset - offsets[idx], usage)
                     }
-                },
-            )
+                }
+            })
         };
         match &usage.kind {
             _ if any_component_supports(usage_offset, usage) => true,
@@ -987,101 +988,92 @@ impl<'a> InferUsage<'a> {
             before: |_| {},
             after: |node| post_order_control_nodes.push(node),
         });
-        for control_node in post_order_control_nodes.into_iter().rev() {
-            let block_insts = match &func_def_body.at(control_node).def().kind {
-                &ControlNodeKind::Block { insts } => insts,
-                ControlNodeKind::FuncCall { callee, inputs } => {
-                    let per_output_usage =
-                        control_node_to_per_output_usage.remove(&control_node).unwrap_or_default();
+        for &control_node in post_order_control_nodes.iter().rev() {
+            let control_node_def = func_def_body.at(control_node).def();
+            let ControlNodeKind::Block { insts: block_insts } = control_node_def.kind else {
+                let per_output_usage =
+                    control_node_to_per_output_usage.remove(&control_node).unwrap_or_default();
 
-                    let mut generate_usage = |this: &mut Self, ptr: Value, new_usage| {
-                        generate_usage(
-                            this,
-                            &mut usage_or_err_attrs_to_attach,
-                            Value::ControlNodeOutput { control_node, output_idx: !0 },
-                            &mut data_inst_output_usages,
-                            &mut control_node_to_per_output_usage,
-                            ptr,
-                            new_usage,
-                        );
+                // Always attach attributes to `qptr`-typed outputs,
+                // on top of propagating them from uses to definitions.
+                for (i, usage) in per_output_usage.iter().enumerate() {
+                    let output = Value::ControlNodeOutput {
+                        control_node,
+                        output_idx: i.try_into().unwrap(),
                     };
+                    if let Some(usage) = usage {
+                        usage_or_err_attrs_to_attach.push((output, Clone::clone(usage)));
+                    }
+                }
 
-                    match self.infer_usage_in_func(module, *callee) {
-                        FuncInferUsageState::Complete(callee_results) => {
-                            for (&arg, param_usage) in
-                                inputs.iter().zip(&callee_results.param_usages)
+                let mut generate_usage = |this: &mut Self, ptr: Value, new_usage| {
+                    generate_usage(
+                        this,
+                        &mut usage_or_err_attrs_to_attach,
+                        Value::ControlNodeOutput { control_node, output_idx: !0 },
+                        &mut data_inst_output_usages,
+                        &mut control_node_to_per_output_usage,
+                        ptr,
+                        new_usage,
+                    );
+                };
+
+                match &control_node_def.kind {
+                    ControlNodeKind::Block { .. } => unreachable!(),
+                    ControlNodeKind::FuncCall { callee, inputs } => {
+                        match self.infer_usage_in_func(module, *callee) {
+                            FuncInferUsageState::Complete(callee_results) => {
+                                for (&arg, param_usage) in
+                                    inputs.iter().zip(&callee_results.param_usages)
+                                {
+                                    if let Some(param_usage) = param_usage {
+                                        generate_usage(self, arg, param_usage.clone());
+                                    }
+                                }
+                            }
+                            FuncInferUsageState::InProgress => {
+                                usage_or_err_attrs_to_attach.push((
+                                    Value::ControlNodeOutput { control_node, output_idx: !0 },
+                                    Err(AnalysisError(Diag::bug([
+                                        "unsupported recursive call".into()
+                                    ]))),
+                                ));
+                            }
+                        }
+                    }
+                    ControlNodeKind::Select { cases, .. } => {
+                        for &case in cases {
+                            for (&per_case_output, usage) in
+                                func_def_body.at(case).def().outputs.iter().zip(&per_output_usage)
                             {
-                                if let Some(param_usage) = param_usage {
-                                    generate_usage(self, arg, param_usage.clone());
+                                if let Some(usage) = usage {
+                                    generate_usage(self, per_case_output, usage.clone());
                                 }
                             }
                         }
-                        FuncInferUsageState::InProgress => {
-                            usage_or_err_attrs_to_attach.push((
-                                Value::ControlNodeOutput { control_node, output_idx: !0 },
-                                Err(AnalysisError(Diag::bug(
-                                    ["unsupported recursive call".into()],
-                                ))),
-                            ));
-                        }
-                    };
-                    for (i, usage) in per_output_usage.iter().enumerate() {
-                        assert_eq!(i, 0);
-                        assert_eq!(func_def_body.at(control_node).def().outputs.len(), 1);
-
-                        if let Some(usage) = usage {
-                            usage_or_err_attrs_to_attach.push((
-                                Value::ControlNodeOutput { control_node, output_idx: 0 },
-                                Clone::clone(usage),
-                            ));
-                        }
                     }
-
-                    continue;
-                }
-                ControlNodeKind::Select { cases, .. } => {
-                    let per_output_usage =
-                        control_node_to_per_output_usage.remove(&control_node).unwrap_or_default();
-
-                    // Always attach attributes to `qptr`-typed outputs,
-                    // on top of propagating them from uses to definitions.
-                    for (i, usage) in per_output_usage.iter().enumerate() {
-                        let output = Value::ControlNodeOutput {
-                            control_node,
-                            output_idx: i.try_into().unwrap(),
-                        };
-                        if let Some(usage) = usage {
-                            usage_or_err_attrs_to_attach.push((output, Clone::clone(usage)));
-                            for &case in cases {
-                                generate_usage(
-                                    self,
-                                    &mut usage_or_err_attrs_to_attach,
-                                    output,
-                                    &mut data_inst_output_usages,
-                                    &mut control_node_to_per_output_usage,
-                                    func_def_body.at(case).def().outputs[i],
-                                    usage.clone(),
-                                );
-                            }
-                        }
+                    ControlNodeKind::Loop { .. } => {
+                        // FIXME(eddyb) implement `qptr.usage` propagation across
+                        // loop state (will likely require computing the effect
+                        // of the body in terms of its inputs, then somehow taking
+                        // the fixpoint of that without risking infinite unfolding).
                     }
-
-                    continue;
+                    ControlNodeKind::ExitInvocation { .. } => {}
                 }
-                ControlNodeKind::Loop { .. } => {
-                    // FIXME(eddyb) implement `qptr.usage` propagation across
-                    // loop state (will likely require computing the effect
-                    // of the body in terms of its inputs, then somehow taking
-                    // the fixpoint of that without risking infinite unfolding).
-                    continue;
-                }
-                ControlNodeKind::ExitInvocation { .. } => continue,
+                continue;
             };
             for func_at_inst in func_def_body.at(block_insts).into_iter().rev() {
                 let data_inst = func_at_inst.position;
                 let data_inst_def = func_at_inst.def();
                 let data_inst_form_def = &cx[data_inst_def.form];
                 let output_usage = data_inst_output_usages.remove(&data_inst).flatten();
+
+                // Always attach attributes to `qptr`-producing instructions,
+                // on top of propagating them from uses to definitions.
+                if let Some(usage) = &output_usage {
+                    usage_or_err_attrs_to_attach
+                        .push((Value::DataInstOutput(data_inst), Clone::clone(usage)));
+                }
 
                 let mut generate_usage = |this: &mut Self, ptr: Value, new_usage| {
                     generate_usage(
@@ -1097,11 +1089,9 @@ impl<'a> InferUsage<'a> {
                 match &data_inst_form_def.kind {
                     DataInstKind::Scalar(_) | DataInstKind::Vector(_) => {}
 
-                    DataInstKind::QPtr(QPtrOp::FuncLocalVar(_)) => {
-                        if let Some(usage) = output_usage {
-                            usage_or_err_attrs_to_attach
-                                .push((Value::DataInstOutput(data_inst), usage));
-                        }
+                    DataInstKind::QPtr(QPtrOp::FuncLocalVar(_mem_layout)) => {
+                        // FIXME(eddyb) merge/intersect `qptr.usage` from uses,
+                        // with the inherent size/align (given by `_mem_layout`)?
                     }
                     DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
                         generate_usage(
@@ -1352,12 +1342,12 @@ impl<'a> InferUsage<'a> {
                     }
 
                     DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
-                        let mut has_from_spv_ptr_output_attr = false;
                         for attr in &cx[data_inst_def.attrs].attrs {
-                            match *attr {
-                                Attr::QPtr(QPtrAttr::ToSpvPtrInput { input_idx, pointee }) => {
-                                    let ty = pointee.0;
-                                    generate_usage(
+                            if let Attr::QPtr(QPtrAttr::ToSpvPtrInput { input_idx, pointee }) =
+                                *attr
+                            {
+                                let ty = pointee.0;
+                                generate_usage(
                                         self,
                                         data_inst_def.inputs[input_idx as usize],
                                         self.layout_cache
@@ -1394,43 +1384,74 @@ impl<'a> InferUsage<'a> {
                                                 }
                                                 TypeLayout::Concrete(concrete) => {
                                                     Ok(QPtrUsage::Memory(QPtrMemUsage {
-                                                        max_size: if concrete
-                                                            .mem_layout
-                                                            .dyn_unit_stride
-                                                            .is_some()
-                                                        {
-                                                            None
-                                                        } else {
-                                                            Some(
-                                                                concrete.mem_layout.fixed_base.size,
-                                                            )
-                                                        },
+                                                        max_size: (concrete.mem_layout.dyn_unit_stride.is_none())
+                                                            .then_some(concrete.mem_layout.fixed_base.size),
                                                         kind: QPtrMemUsageKind::StrictlyTyped(ty),
                                                     }))
                                                 }
                                             }),
                                     );
-                                }
-                                Attr::QPtr(QPtrAttr::FromSpvPtrOutput {
-                                    addr_space: _,
-                                    pointee: _,
-                                }) => {
-                                    has_from_spv_ptr_output_attr = true;
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        if has_from_spv_ptr_output_attr {
-                            // FIXME(eddyb) merge with `FromSpvPtrOutput`'s `pointee`.
-                            if let Some(usage) = output_usage {
-                                usage_or_err_attrs_to_attach
-                                    .push((Value::DataInstOutput(data_inst), usage));
                             }
                         }
                     }
                 }
             }
+        }
+
+        // HACK(eddyb) this should never happen, unless the IR is malformed or
+        // the traversal order is subtly incorrect, but it's important to catch.
+        if !data_inst_output_usages.is_empty() || !control_node_to_per_output_usage.is_empty() {
+            let mut attach_as_err = |v, usage: Option<Result<_, _>>| {
+                let diag = match usage.transpose() {
+                    Ok(usage) => Diag::bug([
+                        "extra qptr.usage contributions ignored (visited too late): ".into(),
+                        usage.unwrap_or(QPtrUsage::Memory(QPtrMemUsage::UNUSED)).into(),
+                    ]),
+                    Err(AnalysisError(mut diag)) => {
+                        diag.message.insert(
+                            0,
+                            "extra qptr.usage-related errors ignored (visited too late): ".into(),
+                        );
+                        diag
+                    }
+                };
+                usage_or_err_attrs_to_attach.push((v, Err(AnalysisError(diag))));
+            };
+
+            for &control_node in &post_order_control_nodes {
+                match &func_def_body.at(control_node).def().kind {
+                    &ControlNodeKind::Block { insts } => {
+                        for func_at_inst in func_def_body.at(insts) {
+                            let data_inst = func_at_inst.position;
+                            if let Some(usage) = data_inst_output_usages.remove(&data_inst) {
+                                attach_as_err(Value::DataInstOutput(data_inst), usage);
+                            }
+                        }
+                    }
+                    _ => {
+                        for (i, usage) in control_node_to_per_output_usage
+                            .remove(&control_node)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .enumerate()
+                        {
+                            attach_as_err(
+                                Value::ControlNodeOutput {
+                                    control_node,
+                                    output_idx: i.try_into().unwrap(),
+                                },
+                                usage,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // FIXME(eddyb) if this fails, the IR (or visiting) is really broken,
+            // but there's no way to properly signal this by e.g. attaching
+            // diagnostic attributes to the function itself.
+            assert_eq!(data_inst_output_usages.len(), 0);
+            assert_eq!(control_node_to_per_output_usage.len(), 0);
         }
 
         FuncInferUsageResults { param_usages, usage_or_err_attrs_to_attach }
