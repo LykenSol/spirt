@@ -1166,6 +1166,7 @@ impl<'a> InferUsage<'a> {
                         max_size: None,
                         flags: QPtrMemUsageFlags::empty(),
                         kind: QPtrMemUsageKind::DynOffsetBase {
+                            // FIXME(eddyb) allocating `Rc` a bit wasteful here.
                             element: Rc::new(QPtrMemUsage::UNUSED),
                             stride: dyn_unit_stride,
                         },
@@ -1225,9 +1226,7 @@ impl<'a> InferUsage<'a> {
                                     max_size: usage
                                         .max_size
                                         .map(|max_size| offset.checked_add(max_size).ok_or_else(|| {
-                                            AnalysisError(Diag::bug([format!(
-                                                "Offset({offset}): size overflow ({offset}+{max_size})"
-                                            ).into()]))
+                                            AnalysisError(Diag::bug([format!("Offset({offset}): size overflow ({offset}+{max_size})").into()]))
                                         })).transpose()?,
                                     flags: usage.flags.propagate_outwards(),
                                     // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
@@ -1242,10 +1241,12 @@ impl<'a> InferUsage<'a> {
                 }
                 DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
                     assert_eq!(per_output_usage.len(), 1);
+                    let (stride, index_bounds) = (*stride, index_bounds.clone());
                     generate_usage(
                         self,
                         data_inst_def.inputs[0],
-                        per_output_usage[0].take()
+                        per_output_usage[0]
+                            .take()
                             .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
                             .and_then(|usage| {
                                 let usage = match usage {
@@ -1256,51 +1257,81 @@ impl<'a> InferUsage<'a> {
                                     }
                                     QPtrUsage::Memory(usage) => usage,
                                 };
-                                match usage.max_size {
-                                    None => {
-                                        return Err(AnalysisError(Diag::bug([
-                                            "DynOffset: unsized element".into(),
-                                        ])));
-                                    }
-                                    // FIXME(eddyb) support this by "folding"
-                                    // the usage onto itself (i.e. applying
-                                    // `%= stride` on all offsets inside).
-                                    Some(max_size) if max_size > stride.get() => {
-                                        return Err(AnalysisError(Diag::bug([
-                                            "DynOffset: element max_size exceeds stride".into(),
-                                        ])));
-                                    }
-                                    Some(_) => {}
-                                }
-                                Ok(QPtrUsage::Memory(QPtrMemUsage {
-                                    // FIXME(eddyb) does the `None` case allow
-                                    // for negative offsets?
-                                    max_size: index_bounds
-                                        .as_ref()
-                                        .map(|index_bounds| {
-                                            if index_bounds.start < 0 || index_bounds.end < 0 {
-                                                return Err(AnalysisError(
-                                                    Diag::bug([
-                                                        "DynOffset: potentially negative offset".into(),
-                                                    ])
-                                                ));
-                                            }
-                                            let index_bounds_end = u32::try_from(index_bounds.end).unwrap();
-                                            index_bounds_end.checked_mul(stride.get()).ok_or_else(|| {
+
+                                // FIXME(eddyb) does the `None` case allow
+                                // for negative offsets?
+                                // FIXME(eddyb) LLVM's new `nuw`/`nusw` flags
+                                // on GEPs are likely a good starting point
+                                // for offset signedness disambiguation.
+                                let max_size = index_bounds
+                                    .map(|index_bounds| {
+                                        if index_bounds.start < 0 || index_bounds.end < 0 {
+                                            return Err(AnalysisError(Diag::bug([
+                                                "DynOffset: potentially negative offset".into(),
+                                            ])));
+                                        }
+                                        let index_bounds_end =
+                                            u32::try_from(index_bounds.end).unwrap();
+                                        index_bounds_end.checked_mul(stride.get()).ok_or_else(
+                                            || {
                                                 AnalysisError(Diag::bug([format!(
-                                                    "DynOffset: size overflow ({index_bounds_end}*{stride})"
+                                                    "DynOffset: size overflow ({index_bounds_end} × {stride})"
                                                 ).into()]))
-                                            })
-                                        })
-                                        .transpose()?,
-                                    flags: usage.flags.propagate_outwards(),
+                                            },
+                                        )
+                                    })
+                                    .transpose()?;
+
+                                // HACK(eddyb) force an array-like "reshaping"
+                                // of `usage`, by demanding it *also* support
+                                // dynamic indexing with `stride`.
+                                let strided_usage =
+                                    UsageMerger { layout_cache: &self.layout_cache }
+                                        .merge_mem(
+                                            usage,
+                                            QPtrMemUsage {
+                                                max_size: None,
+                                                flags: QPtrMemUsageFlags::empty(),
+                                                kind: QPtrMemUsageKind::DynOffsetBase {
+                                                    // FIXME(eddyb) allocating `Rc` a bit wasteful here.
+                                                    element: Rc::new(QPtrMemUsage::UNUSED),
+                                                    stride,
+                                                },
+                                            },
+                                        )
+                                        .into_result()?;
+                                let intra_stride_usage = match strided_usage.kind {
+                                    QPtrMemUsageKind::DynOffsetBase {
+                                        element,
+                                        stride: merged_stride,
+                                    } if merged_stride == stride
+                                        && element
+                                            .max_size
+                                            .is_some_and(|s| s <= stride.get()) =>
+                                    {
+                                        element
+                                    }
+
+                                    _ => {
+                                        return Err(AnalysisError(Diag::bug([
+                                            format!(
+                                                "DynOffset: unexpected strided (N × {stride}) reshaping result: "
+                                            ).into(),
+                                            QPtrUsage::Memory(strided_usage).into(),
+                                        ])));
+                                    }
+                                };
+
+                                Ok(QPtrUsage::Memory(QPtrMemUsage {
+                                    max_size,
+                                    flags: intra_stride_usage.flags.propagate_outwards(),
                                     kind: QPtrMemUsageKind::DynOffsetBase {
-                                        element: Rc::new(usage),
-                                        stride: *stride,
+                                        element: intra_stride_usage,
+                                        stride,
                                     },
                                 }))
                             }),
-                        );
+                    );
                 }
                 DataInstKind::QPtr(op @ (QPtrOp::Load { offset } | QPtrOp::Store { offset })) => {
                     let (op_name, access_type) = match op {
