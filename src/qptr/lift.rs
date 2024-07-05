@@ -407,6 +407,12 @@ struct DeferredPtrNoop {
     parent_block: ControlNode,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum MaybeDynOffset {
+    Const(i32),
+    Dyn { index: Value, stride: NonZeroU32, array_max_size: Option<u32> },
+}
+
 impl LiftToSpvPtrInstsInFunc<'_> {
     // FIXME(eddyb) maybe all this data should be packaged up together in a
     // type with fields like those of `DeferredPtrNoop` (or even more).
@@ -611,8 +617,24 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     ..data_inst_def.clone()
                 }
             }
-            &DataInstKind::QPtr(QPtrOp::Offset(offset)) => {
+            DataInstKind::QPtr(offset_op @ (QPtrOp::Offset(_) | QPtrOp::DynOffset { .. })) => {
                 let mut data_inst_def = data_inst_def.clone();
+
+                let maybe_dyn_offset = match offset_op {
+                    &QPtrOp::Offset(offset) => MaybeDynOffset::Const(offset),
+                    QPtrOp::DynOffset { stride, index_bounds } => MaybeDynOffset::Dyn {
+                        index: data_inst_def.inputs[1],
+                        stride: *stride,
+                        array_max_size: index_bounds.clone().map(|index_bounds| {
+                            u32::try_from(index_bounds.end)
+                                .ok()
+                                .unwrap_or(0)
+                                .checked_mul(stride.get())
+                                .unwrap_or(0)
+                        }),
+                    },
+                    _ => unreachable!(),
+                };
 
                 let output_qptr_usage = self
                     .lifter
@@ -623,7 +645,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 let (output_pointer, (output_pointer_addr_space, output_pointee_layout)) = self
                     .adjust_pointer_for_offset_and_usage(
                         data_inst_def.inputs[0],
-                        offset,
+                        maybe_dyn_offset,
                         output_qptr_usage,
                         func.reborrow(),
                         insert_aux_data_inst,
@@ -639,108 +661,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 });
                 // FIXME(eddyb) avoid the repeated call to `type_of_val`
                 // (and the interning of a temporary `DataInstFormDef`),
-                // maybe don't even replace the `QPtrOp::Offset` instruction?
+                // maybe don't even replace the original instruction?
                 data_inst_def.form = cx.intern(DataInstFormDef {
                     kind: QPtrOp::Offset(0).into(),
                     output_types: [func.freeze().at(output_pointer).type_of(cx)]
                         .into_iter()
                         .collect(),
                 });
+                data_inst_def.inputs = [output_pointer].into_iter().collect();
                 data_inst_def
-            }
-            DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
-                let data_inst_def = data_inst_def.clone();
-
-                let output_qptr_usage = self
-                    .lifter
-                    .find_qptr_usage_attr(data_inst_def.attrs)
-                    .unwrap_or(&QPtrUsage::Memory(QPtrMemUsage::UNUSED));
-
-                let strided_qptr_usage = QPtrUsage::Memory(QPtrMemUsage {
-                    // FIXME(eddyb) there might be a better way to estimate the
-                    // relevant extent for the array, maybe assume length >= 1
-                    // so the minimum range is always `0..stride`?
-                    max_size: index_bounds.clone().map(|index_bounds| {
-                        u32::try_from(index_bounds.end)
-                            .ok()
-                            .unwrap_or(0)
-                            .checked_mul(stride.get())
-                            .unwrap_or(0)
-                    }),
-                    flags: QPtrMemUsageFlags::empty(),
-                    kind: QPtrMemUsageKind::DynOffsetBase {
-                        // FIXME(eddyb) allocating `Rc` a bit wasteful here.
-                        element: Rc::new(QPtrMemUsage::UNUSED),
-
-                        stride: *stride,
-                    },
-                });
-
-                let (array_ptr, (array_addr_space, array_layout)) = self
-                    .adjust_pointer_for_offset_and_usage(
-                        data_inst_def.inputs[0],
-                        0,
-                        &strided_qptr_usage,
-                        func_at_data_inst.reborrow().at(()),
-                        insert_aux_data_inst,
-                    )?;
-
-                let (elem_layout, array_index_multiplier) = match array_layout {
-                    TypeLayout::Concrete(array_layout) => match &array_layout.components {
-                        Components::Elements { stride: layout_stride, elem, fixed_len }
-                            if stride.get() % layout_stride.get() == 0
-                                && Ok(index_bounds.clone())
-                                    == fixed_len
-                                        .map(|len| i32::try_from(len.get()).map(|len| 0..len))
-                                        .transpose() =>
-                        {
-                            (elem.clone(), stride.get() / layout_stride.get())
-                        }
-                        _ => {
-                            return Err(LiftError(Diag::bug([
-                                "matching array not found in pointee type layout".into(),
-                            ])));
-                        }
-                    },
-                    _ => unreachable!(),
-                };
-
-                let array_index = if array_index_multiplier == 1 {
-                    data_inst_def.inputs[1]
-                } else {
-                    // FIXME(eddyb) implement
-                    return Err(LiftError(Diag::bug([
-                        "unimplemented stride factor (index multiplier)".into(),
-                    ])));
-                };
-
-                let usage_bounded_intra_elem = match output_qptr_usage {
-                    &QPtrUsage::Memory(QPtrMemUsage { max_size: Some(max_size), .. }) => {
-                        max_size <= elem_layout.mem_layout.fixed_base.size
-                    }
-                    _ => false,
-                };
-                if !usage_bounded_intra_elem {
-                    // FIXME(eddyb) should this change the choice of pointer
-                    // representation, or at least leave `QPtrOp::DynIndex`
-                    // behind unchanged?
-                }
-
-                DataInstDef {
-                    attrs: self.lifter.strip_qptr_usage_attr(data_inst_def.attrs),
-                    form: cx.intern(DataInstFormDef {
-                        kind: DataInstKind::SpvInst(
-                            wk.OpAccessChain.into(),
-                            spv::InstLowering::default(),
-                        ),
-                        output_types: [self
-                            .lifter
-                            .spv_ptr_type(array_addr_space, elem_layout.original_type)]
-                        .into_iter()
-                        .collect(),
-                    }),
-                    inputs: [array_ptr, array_index].into_iter().collect(),
-                }
             }
             DataInstKind::QPtr(op @ (QPtrOp::Load { offset } | QPtrOp::Store { offset })) => {
                 let mut data_inst_def = data_inst_def.clone();
@@ -777,7 +706,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 let (adjusted_ptr, (_, adjusted_pointee_layout)) = self
                     .adjust_pointer_for_offset_and_usage(
                         data_inst_def.inputs[0],
-                        *offset,
+                        MaybeDynOffset::Const(*offset),
                         &access_qptr_usage,
                         func_at_data_inst.reborrow().at(()),
                         insert_aux_data_inst,
@@ -870,7 +799,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                             let (adjusted_ptr, (_, adjusted_pointee_layout)) = self
                                 .adjust_pointer_for_offset_and_usage(
                                     input_ptr,
-                                    0,
+                                    MaybeDynOffset::Const(0),
                                     &expected_qptr_usage,
                                     func_at_data_inst.reborrow().at(()),
                                     insert_aux_data_inst,
@@ -926,12 +855,12 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     fn adjust_pointer_for_offset_and_usage(
         &mut self,
         ptr: Value,
-        offset: i32,
+        mut offset: MaybeDynOffset,
         target_usage: &QPtrUsage,
 
         // FIXME(eddyb) bundle these into some kind of "cursor" type.
         mut func: FuncAtMut<'_, ()>,
-        mut insert_aux_data_inst: impl FnMut(&mut Self, FuncAtMut<'_, ()>, DataInstDef) -> DataInst,
+        insert_aux_data_inst: impl Fn(&mut Self, FuncAtMut<'_, ()>, DataInstDef) -> DataInst,
     ) -> Result<(Value, (AddrSpace, TypeLayout)), LiftError> {
         let wk = self.lifter.wk;
         let cx = &self.lifter.cx;
@@ -939,17 +868,29 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         let (addr_space, mut pointee_layout) =
             self.type_of_val_as_spv_ptr_with_layout(func.reborrow().freeze().at(ptr))?;
 
-        let mk_access_chain = |access_chain_inputs: SmallVec<_>, final_pointee_type| {
+        let mut access_chain_inputs: SmallVec<_> = [ptr].into_iter().collect();
+
+        // HACK(eddyb) account for `deferred_ptr_noops` interactions.
+        self.resolve_deferred_ptr_noop_uses(&mut access_chain_inputs);
+
+        // HACK(eddyb) disallowing naming the original `ptr` again.
+        #[allow(unused)]
+        let ptr = ();
+
+        let access_chain_data_inst_kind =
+            DataInstKind::SpvInst(wk.OpAccessChain.into(), spv::InstLowering::default());
+
+        let mk_access_chain = |this: &mut Self,
+                               func: FuncAtMut<'_, ()>,
+                               access_chain_inputs: SmallVec<_>,
+                               final_pointee_type| {
             if access_chain_inputs.len() > 1 {
                 Value::DataInstOutput {
-                    inst: insert_aux_data_inst(self, func, DataInstDef {
+                    inst: insert_aux_data_inst(this, func, DataInstDef {
                         attrs: Default::default(),
                         form: cx.intern(DataInstFormDef {
-                            kind: DataInstKind::SpvInst(
-                                wk.OpAccessChain.into(),
-                                spv::InstLowering::default(),
-                            ),
-                            output_types: [self
+                            kind: access_chain_data_inst_kind.clone(),
+                            output_types: [this
                                 .lifter
                                 .spv_ptr_type(addr_space, final_pointee_type)]
                             .into_iter()
@@ -960,11 +901,9 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     output_idx: 0,
                 }
             } else {
-                ptr
+                access_chain_inputs[0]
             }
         };
-
-        let mut access_chain_inputs: SmallVec<_> = [ptr].into_iter().collect();
 
         if let TypeLayout::HandleArray(handle, _) = pointee_layout {
             access_chain_inputs.push(Value::Const(cx.intern(scalar::Const::from_u32(0))));
@@ -977,7 +916,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             (_, QPtrUsage::Handles(shapes::Handle::Buffer(..))) => {
                 return Err(LiftError(Diag::bug(["cannot access whole Buffer".into()])));
             }
-            (TypeLayout::Handle(_), _) if offset != 0 => {
+            (TypeLayout::Handle(_), _) if offset != MaybeDynOffset::Const(0) => {
                 return Err(LiftError(Diag::bug(["cannot offset Handles".into()])));
             }
             (TypeLayout::Handle(shapes::Handle::Buffer(..)), _) => {
@@ -994,7 +933,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 TypeLayout::Handle(shapes::Handle::Opaque(pointee_handle_type)),
                 &QPtrUsage::Handles(shapes::Handle::Opaque(access_handle_type)),
             ) => {
-                assert_eq!(offset, 0);
+                assert!(offset == MaybeDynOffset::Const(0));
 
                 if pointee_handle_type != access_handle_type {
                     return Err(LiftError(Diag::bug([
@@ -1007,7 +946,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 }
 
                 return Ok((
-                    mk_access_chain(access_chain_inputs, pointee_handle_type),
+                    mk_access_chain(self, func, access_chain_inputs, pointee_handle_type),
                     (addr_space, TypeLayout::Handle(shapes::Handle::Opaque(pointee_handle_type))),
                 ));
             }
@@ -1017,14 +956,53 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             }
         };
 
-        let mut offset = u32::try_from(offset)
-            .ok()
-            .ok_or_else(|| LiftError(Diag::bug(["negative offset".into()])))?;
+        // HACK(eddyb) helper for `if !target_fits_in_pointee` (see below).
+        let decompose_array_indexing = |this: &Self, func_at_ptr: FuncAt<'_, Value>| {
+            let func = func_at_ptr.at(());
+            let inst = match func_at_ptr.position {
+                Value::DataInstOutput { inst, output_idx: 0 } => inst,
+                _ => return None,
+            };
+            let inst_def = func.at(inst).def();
+            if inst_def.inputs.len() != 2 || cx[inst_def.form].kind != access_chain_data_inst_kind {
+                return None;
+            }
+
+            let array_ptr = inst_def.inputs[0];
+            let array_index = inst_def.inputs[1];
+            let (array_address_space, array_layout) =
+                this.type_of_val_as_spv_ptr_with_layout(func.at(array_ptr)).ok()?;
+            if addr_space != array_address_space {
+                return None;
+            }
+
+            match array_layout {
+                TypeLayout::Concrete(array_layout) => match &array_layout.components {
+                    Components::Elements { stride, elem, .. } => {
+                        Some((array_ptr, array_index, *stride, elem.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
 
         loop {
             // FIXME(eddyb) should `QPtrMemUsage` have have an `.extent()` method?
-            let target_extent =
-                Extent { start: 0, end: target_usage.max_size }.saturating_add(offset);
+            let target_extent = match offset {
+                MaybeDynOffset::Const(offset) => {
+                    // FIXME(eddyb) allow `target_extent` to represent negatives,
+                    // or special-case it as overlapping no components. and thus
+                    // requiring walking up `ptr` and/or a special representation.
+                    let offset = u32::try_from(offset)
+                        .ok()
+                        .ok_or_else(|| LiftError(Diag::bug(["negative offset".into()])))?;
+                    Extent { start: 0, end: target_usage.max_size }.saturating_add(offset)
+                }
+                MaybeDynOffset::Dyn { array_max_size, .. } => {
+                    Extent { start: 0, end: array_max_size }
+                }
+            };
 
             // FIXME(eddyb) should `MemTypeLayout` have have an `.extent()` method?
             let pointee_extent = Extent {
@@ -1033,11 +1011,82 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     .then_some(pointee_layout.mem_layout.fixed_base.size),
             };
 
+            let target_fits_in_pointee = pointee_extent.includes(&target_extent);
+
+            // HACK(eddyb) escaping the logical pointer bounds is illegal,
+            // but can be made to work by walking up the pointer definition.
+            // FIXME(eddyb) consider tracking representations of `qptr`s
+            // that deviate from "`Value` of SPIR-V logical pointer type".
+            if !target_fits_in_pointee && access_chain_inputs.len() == 1 {
+                // HACK(eddyb) approximating a `try {...}` block.
+                let mut maybe_recompose_dyn_indexing = || {
+                    let (array_ptr, array_index, array_stride, array_elem) =
+                        decompose_array_indexing(
+                            self,
+                            func.reborrow().freeze().at(access_chain_inputs[0]),
+                        )?;
+
+                    let array_index_ty = func.reborrow().freeze().at(array_index).type_of(cx);
+                    let array_index_scalar_ty = array_index_ty.as_scalar(cx)?;
+                    let (index_addend, remainder_offset) = match offset {
+                        MaybeDynOffset::Const(offset) => {
+                            let offset = u32::try_from(offset).ok()?;
+                            (
+                                Value::Const(cx.intern(scalar::Const::int_try_from_i128(
+                                    array_index_scalar_ty,
+                                    (offset / array_stride.get()).into(),
+                                )?)),
+                                offset % array_stride.get(),
+                            )
+                        }
+                        MaybeDynOffset::Dyn { index, stride, .. } => {
+                            // FIXME(eddyb) implement stride factoring.
+                            if stride != array_stride {
+                                return None;
+                            }
+
+                            // FIMXE(eddyb) cast mismatched types.
+                            let index_scalar_ty =
+                                func.reborrow().freeze().at(index).type_of(cx).as_scalar(cx)?;
+                            if index_scalar_ty != array_index_scalar_ty {
+                                return None;
+                            }
+
+                            (index, 0)
+                        }
+                    };
+
+                    let combined_index = Value::DataInstOutput {
+                        inst: insert_aux_data_inst(self, func.reborrow(), DataInstDef {
+                            attrs: Default::default(),
+                            form: cx.intern(DataInstFormDef {
+                                kind: DataInstKind::Scalar(scalar::IntBinOp::Add.into()),
+                                output_types: [array_index_ty].into_iter().collect(),
+                            }),
+                            inputs: [array_index, index_addend].into_iter().collect(),
+                        }),
+                        output_idx: 0,
+                    };
+
+                    access_chain_inputs = [array_ptr, combined_index].into_iter().collect();
+                    offset = MaybeDynOffset::Const(remainder_offset.try_into().unwrap());
+                    pointee_layout = array_elem;
+
+                    Some(())
+                };
+                if let Some(()) = maybe_recompose_dyn_indexing() {
+                    continue;
+                }
+            }
+
             // FIXME(eddyb) how much of this is actually useful given the
             // `if offset == 0 { break; }` tied to running out of leaves?
-            let is_compatible = offset == 0 && pointee_extent.includes(&target_extent) && {
+            let is_compatible = offset == MaybeDynOffset::Const(0) && target_fits_in_pointee && {
                 match target_usage.kind {
-                    QPtrMemUsageKind::Unused | QPtrMemUsageKind::OffsetBase(_) => true,
+                    QPtrMemUsageKind::Unused
+                    | QPtrMemUsageKind::OffsetBase(_)
+                    | QPtrMemUsageKind::DynOffsetBase { .. } => true,
+
                     QPtrMemUsageKind::StrictlyTyped(target_ty) => {
                         pointee_layout.original_type == target_ty
                     }
@@ -1055,16 +1104,6 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         pointee_layout.original_type == target_ty
                             || can_bitcast(pointee_layout.original_type) && can_bitcast(target_ty)
                     }
-                    QPtrMemUsageKind::DynOffsetBase { stride: target_stride, .. } => {
-                        match pointee_layout.components {
-                            Components::Elements { stride, .. } => {
-                                // FIXME(eddyb) take advantage of this by implementing
-                                // stride factoring in `qptr::{analyze,lift}`.
-                                target_stride.get() % stride.get() == 0
-                            }
-                            _ => false,
-                        }
-                    }
                 }
             };
 
@@ -1072,6 +1111,49 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             // `target_usage` exactly (i.e. can only get worse, not better).
             if is_compatible && pointee_extent == target_extent {
                 break;
+            }
+
+            // Handle dynamic indexing without using `find_components_containing`,
+            // which has can only express constant offsets, not symbolic ones.
+            match (&pointee_layout.components, offset) {
+                (
+                    Components::Elements { stride: array_stride, elem, .. },
+                    MaybeDynOffset::Dyn { index, stride: index_stride, .. },
+                ) if index_stride.get() % array_stride.get() == 0 => {
+                    let index_multiplier = index_stride.get() / array_stride.get();
+
+                    let index = if index_multiplier == 1 {
+                        index
+                    } else {
+                        // FIXME(eddyb) implement stride factoring here, and
+                        // take advantage of it in `qptr::analyze`.
+                        return Err(LiftError(Diag::bug([format!(
+                            "unimplemented stride factor (index multiplier) of {index_multiplier}"
+                        )
+                        .into()])));
+                    };
+
+                    // HACK(eddyb) separate the `OpAccessChain`s into one for
+                    // obtaining the array pointer itself, and one for indexing
+                    // the array, to allow folding the latter in subsequent calls
+                    // to `adjust_pointer_for_offset_and_usage`.
+                    // FIXME(eddyb) consider tracking representations of `qptr`s
+                    // that deviate from "`Value` of SPIR-V logical pointer type".
+                    let array_ptr = mk_access_chain(
+                        self,
+                        func.reborrow(),
+                        access_chain_inputs,
+                        pointee_layout.original_type,
+                    );
+                    access_chain_inputs = [array_ptr, index].into_iter().collect();
+
+                    offset = MaybeDynOffset::Const(0);
+                    pointee_layout = elem.clone();
+
+                    continue;
+                }
+
+                _ => {}
             }
 
             let mut component_indices =
@@ -1082,20 +1164,16 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     // there's a good chance the pointer is already compatible
                     // with `target_usage` (and the only reason to keep going
                     // would be to find smaller types that remain compatible).
-                    if is_compatible {
+                    if offset == MaybeDynOffset::Const(0) {
                         break;
                     }
 
                     // FIXME(eddyb) this could include the chosen indices,
-                    // and maybe the current type and/or layout.
-                    return Err(LiftError(Diag::bug([format!(
-                        "offsets {:?}..{:?} not found in pointee type layout, \
-                         after {} access chain indices",
-                        target_extent.start,
-                        target_extent.end,
-                        access_chain_inputs.len() - 1
-                    )
-                    .into()])));
+                    // and/or maybe the original type as well?
+                    return Err(LiftError(Diag::bug([
+                        format!("offsets {target_extent} not found, in the layout of ").into(),
+                        pointee_layout.original_type.into(),
+                    ])));
                 }
                 (Some(_), Some(_)) => {
                     return Err(LiftError(Diag::bug([
@@ -1112,21 +1190,37 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             access_chain_inputs
                 .push(Value::Const(cx.intern(scalar::Const::from_u32(idx_as_i32 as u32))));
 
-            match &pointee_layout.components {
-                Components::Scalar => unreachable!(),
-                Components::Elements { stride, elem, .. } => {
-                    offset %= stride.get();
-                    pointee_layout = elem.clone();
+            match &mut offset {
+                MaybeDynOffset::Const(offset) => {
+                    let mut offset_u32 = u32::try_from(*offset).unwrap();
+                    match &pointee_layout.components {
+                        Components::Scalar => unreachable!(),
+                        Components::Elements { stride, .. } => {
+                            offset_u32 %= stride.get();
+                        }
+                        Components::Fields { offsets, .. } => {
+                            offset_u32 -= offsets[idx];
+                        }
+                    };
+                    *offset = offset_u32.try_into().unwrap();
                 }
-                Components::Fields { offsets, layouts } => {
-                    offset -= offsets[idx];
-                    pointee_layout = layouts[idx].clone();
-                }
+
+                // HACK(eddyb) `target_extent.start` should be `0` for `Dyn`,
+                // so no matching components should ever have an offset.
+                MaybeDynOffset::Dyn { .. } => assert_eq!(target_extent.start, 0),
             }
+
+            // FIXME(eddyb) `find_components_containing` should probably
+            // return some of this information for free.
+            pointee_layout = match &pointee_layout.components {
+                Components::Scalar => unreachable!(),
+                Components::Elements { elem, .. } => elem.clone(),
+                Components::Fields { layouts, .. } => layouts[idx].clone(),
+            };
         }
 
         Ok((
-            mk_access_chain(access_chain_inputs, pointee_layout.original_type),
+            mk_access_chain(self, func, access_chain_inputs, pointee_layout.original_type),
             (addr_space, TypeLayout::Concrete(pointee_layout)),
         ))
     }
