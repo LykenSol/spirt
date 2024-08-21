@@ -2303,6 +2303,8 @@ impl Print for Vec<DiagMsgPart> {
             DiagMsgPart::Type(ty) => ty.print(printer),
             DiagMsgPart::Const(ct) => ct.print(printer),
             DiagMsgPart::QPtrUsage(usage) => usage.print(printer),
+
+            DiagMsgPart::Func(func) => func.print(printer),
         }))
     }
 }

@@ -199,6 +199,7 @@ def_well_known! {
     ],
     storage_class: u32 = [
         Function,
+        Private,
 
         UniformConstant,
         Input,

@@ -14,7 +14,8 @@ use std::rc::Rc;
 // (i.e. using inner doc comments).
 pub mod analyze;
 pub mod const_data;
-mod layout;
+// HACK(eddyb) `pub(crate)` for callgraph's stack emulation.
+pub(crate) mod layout;
 pub mod legalize;
 pub mod lift;
 pub mod lower;

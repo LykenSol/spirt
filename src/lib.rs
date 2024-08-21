@@ -154,6 +154,7 @@
 
 // NOTE(eddyb) all the modules are declared here, but they're documented "inside"
 // (i.e. using inner doc comments).
+pub mod callgraph;
 pub mod cfg;
 pub mod cfgssa;
 mod context;
@@ -493,6 +494,9 @@ pub enum DiagMsgPart {
     Type(Type),
     Const(Const),
     QPtrUsage(qptr::QPtrUsage),
+
+    // TODO(eddyb) this is potentially problematic!!!
+    Func(Func),
 }
 
 /// Wrapper to limit `Ord` for interned index types (e.g. [`InternedStr`])
