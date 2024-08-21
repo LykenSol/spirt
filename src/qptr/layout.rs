@@ -293,7 +293,9 @@ impl Components {
 }
 
 /// Context for computing `TypeLayout`s from `Type`s (with caching).
-pub(super) struct LayoutCache<'a> {
+//
+// HACK(eddyb) `pub(crate)` for callgraph's stack emulation.
+pub(crate) struct LayoutCache<'a> {
     cx: Rc<Context>,
     wk: &'static spv::spec::WellKnown,
 
@@ -303,7 +305,8 @@ pub(super) struct LayoutCache<'a> {
 }
 
 impl<'a> LayoutCache<'a> {
-    pub(super) fn new(cx: Rc<Context>, config: &'a LayoutConfig) -> Self {
+    // HACK(eddyb) `pub(crate)` for callgraph's stack emulation.
+    pub(crate) fn new(cx: Rc<Context>, config: &'a LayoutConfig) -> Self {
         Self { cx, wk: &spv::spec::Spec::get().well_known, config, cache: Default::default() }
     }
 
@@ -311,6 +314,31 @@ impl<'a> LayoutCache<'a> {
         // HACK(eddyb) lossless roundtrip through `i32` is most conservative
         // option (only `0..=i32::MAX`, i.e. `0 <= x < 2**32, is allowed).
         u32::try_from(ct.as_scalar(&self.cx)?.int_as_i32()?).ok()
+    }
+
+    // HACK(eddyb) `pub(crate)` for callgraph's stack emulation.
+    pub(crate) fn fixed_mem_layout_of(
+        &self,
+        ty: Type,
+        reason: &str,
+    ) -> Result<shapes::MemLayout, Diag> {
+        let err = |kind| {
+            Err(Diag::bug([
+                format!("{kind} type `").into(),
+                ty.into(),
+                format!("` cannot be used for {reason}").into(),
+            ]))
+        };
+        match self.layout_of(ty).map_err(|LayoutError(err)| err)? {
+            TypeLayout::Handle(_) | TypeLayout::HandleArray(..) => err("handle"),
+            TypeLayout::Concrete(layout) => {
+                if layout.mem_layout.dyn_unit_stride.is_some() {
+                    err("dynamically sized")
+                } else {
+                    Ok(layout.mem_layout.fixed_base)
+                }
+            }
+        }
     }
 
     /// Attempt to compute a `TypeLayout` for a given (SPIR-V) `Type`.

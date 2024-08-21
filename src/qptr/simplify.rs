@@ -252,6 +252,8 @@ impl Visitor<'_> for CollectLocalVarPartitions<'_> {
 
     // FIXME(eddyb) we can't use `visit_data_inst_def` because we need either
     // the resulting `DataInst`, or access to `FuncAt<Value>::type_of`.
+    // FIXME(eddyb) the definition of `visit_data_inst_def` was changed since
+    // the above comment was written, so it might be fixable now.
     fn visit_control_node_def(&mut self, func_at_control_node: FuncAt<'_, ControlNode>) {
         if let ControlNodeKind::Block { insts } = func_at_control_node.def().kind {
             for func_at_inst in func_at_control_node.at(insts) {
@@ -1078,6 +1080,8 @@ impl Visitor<'_> for FindMutatedLocalVars<'_, '_> {
 
     // FIXME(eddyb) we can't use `visit_data_inst_def` because we need either
     // the resulting `DataInst`, or access to `FuncAt<Value>::type_of`.
+    // FIXME(eddyb) the definition of `visit_data_inst_def` was changed since
+    // the above comment was written, so it might be fixable now.
     fn visit_control_node_def(&mut self, func_at_control_node: FuncAt<'_, ControlNode>) {
         if let ControlNodeKind::Block { insts } = func_at_control_node.def().kind {
             for func_at_inst in func_at_control_node.at(insts) {

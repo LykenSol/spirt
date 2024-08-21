@@ -185,6 +185,13 @@ pub trait Transformer: Sized {
     ) -> Transformed<DataInstFormDef> {
         data_inst_form_def.inner_transform_with(self)
     }
+    // HACK(eddyb) transition existing impls to the new form.
+    fn transform_value_use_in_func(
+        &mut self,
+        func_at_val: FuncAtMut<'_, Value>,
+    ) -> Transformed<Value> {
+        self.transform_value_use(&func_at_val.position)
+    }
     fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
         v.inner_transform_with(self)
     }
@@ -630,6 +637,25 @@ impl InnerInPlaceTransform for FuncDefBody {
     }
 }
 
+impl<P: Copy> FuncAtMut<'_, P> {
+    // HACK(eddyb) this avoids writing the same cursed loop everywhere it's needed.
+    // FIXME(eddyb) come up with something less inefficient for this purpose.
+    fn in_place_transform_many<T: Copy>(
+        &mut self,
+        get_all_mut: impl Fn(FuncAtMut<'_, P>) -> &mut [T],
+        mut transform: impl FnMut(FuncAtMut<'_, T>) -> Transformed<T>,
+    ) {
+        let count = get_all_mut(self.reborrow()).len();
+        for i in 0..count {
+            let x = get_all_mut(self.reborrow())[i];
+            match transform(self.reborrow().at(x)) {
+                Transformed::Unchanged => {}
+                Transformed::Changed(new) => get_all_mut(self.reborrow())[i] = new,
+            }
+        }
+    }
+}
+
 impl InnerInPlaceTransform for FuncAtMut<'_, ControlRegion> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
         // HACK(eddyb) handle the fields of `ControlRegion` separately, to
@@ -641,10 +667,10 @@ impl InnerInPlaceTransform for FuncAtMut<'_, ControlRegion> {
 
         self.reborrow().at_children().into_iter().inner_in_place_transform_with(transformer);
 
-        let ControlRegionDef { inputs: _, children: _, outputs } = self.reborrow().def();
-        for v in outputs {
-            transformer.transform_value_use(v).apply_to(v);
-        }
+        self.in_place_transform_many(
+            |this| &mut this.def().outputs,
+            |func_at_val| transformer.transform_value_use_in_func(func_at_val),
+        );
     }
 }
 
@@ -671,22 +697,6 @@ impl InnerInPlaceTransform for FuncAtMut<'_, EntityListIter<ControlNode>> {
     }
 }
 
-impl FuncAtMut<'_, ControlNode> {
-    fn child_regions(&mut self) -> &mut [ControlRegion] {
-        match &mut self.reborrow().def().kind {
-            ControlNodeKind::Block { insts: _ }
-            | ControlNodeKind::FuncCall { callee: _, inputs: _ }
-            | ControlNodeKind::ExitInvocation {
-                kind: cfg::ExitInvocationKind::SpvInst(_),
-                inputs: _,
-            } => &mut [][..],
-
-            ControlNodeKind::Select { cases, .. } => cases,
-            ControlNodeKind::Loop { body, .. } => slice::from_mut(body),
-        }
-    }
-}
-
 impl InnerInPlaceTransform for FuncAtMut<'_, ControlNode> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
         // HACK(eddyb) handle all pre-child-regions fields separately to
@@ -700,54 +710,78 @@ impl InnerInPlaceTransform for FuncAtMut<'_, ControlNode> {
                     transformer.in_place_transform_data_inst_def(func_at_inst);
                 }
             }
-            ControlNodeKind::FuncCall { callee, inputs } => {
+            ControlNodeKind::FuncCall { callee, inputs: _ } => {
                 transformer.transform_func_use(*callee).apply_to(callee);
-                for v in inputs {
-                    transformer.transform_value_use(v).apply_to(v);
-                }
             }
             ControlNodeKind::Select {
                 kind: SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
-                scrutinee,
+                scrutinee: _,
                 cases: _,
-            } => {
-                transformer.transform_value_use(scrutinee).apply_to(scrutinee);
             }
-            ControlNodeKind::Loop { initial_inputs: inputs, body: _, repeat_condition: _ }
-            | ControlNodeKind::ExitInvocation {
-                kind: cfg::ExitInvocationKind::SpvInst(_),
-                inputs,
-            } => {
-                for v in inputs {
-                    transformer.transform_value_use(v).apply_to(v);
-                }
-            }
-        }
-
-        // FIXME(eddyb) represent the list of child regions without having them
-        // in a `Vec` (or `SmallVec`), which requires workarounds like this.
-        for child_region_idx in 0..self.child_regions().len() {
-            let child_region = self.child_regions()[child_region_idx];
-            transformer.in_place_transform_control_region_def(self.reborrow().at(child_region));
-        }
-
-        let ControlNodeDef { attrs: _, kind, outputs } = self.reborrow().def();
-
-        match kind {
-            // Fully handled above, before recursing into any child regions.
-            ControlNodeKind::Block { insts: _ }
-            | ControlNodeKind::FuncCall { callee: _, inputs: _ }
-            | ControlNodeKind::Select { kind: _, scrutinee: _, cases: _ }
+            | ControlNodeKind::Loop { initial_inputs: _, body: _, repeat_condition: _ }
             | ControlNodeKind::ExitInvocation {
                 kind: cfg::ExitInvocationKind::SpvInst(_),
                 inputs: _,
             } => {}
+        }
+        self.in_place_transform_many(
+            |this| match &mut this.def().kind {
+                ControlNodeKind::Block { .. } => &mut [],
+                ControlNodeKind::Select {
+                    kind: SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
+                    scrutinee,
+                    cases: _,
+                } => slice::from_mut(scrutinee),
+                ControlNodeKind::FuncCall { callee: _, inputs }
+                | ControlNodeKind::Loop { initial_inputs: inputs, body: _, repeat_condition: _ }
+                | ControlNodeKind::ExitInvocation {
+                    kind: cfg::ExitInvocationKind::SpvInst(_),
+                    inputs,
+                } => inputs,
+            },
+            |func_at_val| transformer.transform_value_use_in_func(func_at_val),
+        );
 
-            ControlNodeKind::Loop { initial_inputs: _, body: _, repeat_condition } => {
-                transformer.transform_value_use(repeat_condition).apply_to(repeat_condition);
-            }
-        };
+        // FIXME(eddyb) represent the list of child regions without having them
+        // in a `Vec` (or `SmallVec`), which requires workarounds like this.
+        self.in_place_transform_many(
+            |this| match &mut this.def().kind {
+                ControlNodeKind::Block { insts: _ }
+                | ControlNodeKind::FuncCall { callee: _, inputs: _ }
+                | ControlNodeKind::ExitInvocation {
+                    kind: cfg::ExitInvocationKind::SpvInst(_),
+                    inputs: _,
+                } => &mut [][..],
 
+                ControlNodeKind::Select { cases, .. } => cases,
+                ControlNodeKind::Loop { body, .. } => slice::from_mut(body),
+            },
+            |func_at_region| {
+                transformer.in_place_transform_control_region_def(func_at_region);
+                // HACK(eddyb) `ControlRegion` references themselves don't change.
+                Transformed::Unchanged
+            },
+        );
+
+        self.in_place_transform_many(
+            |this| match &mut this.def().kind {
+                // Fully handled above, before recursing into any child regions.
+                ControlNodeKind::Block { insts: _ }
+                | ControlNodeKind::FuncCall { callee: _, inputs: _ }
+                | ControlNodeKind::Select { kind: _, scrutinee: _, cases: _ }
+                | ControlNodeKind::ExitInvocation {
+                    kind: cfg::ExitInvocationKind::SpvInst(_),
+                    inputs: _,
+                } => &mut [],
+
+                ControlNodeKind::Loop { initial_inputs: _, body: _, repeat_condition } => {
+                    slice::from_mut(repeat_condition)
+                }
+            },
+            |func_at_val| transformer.transform_value_use_in_func(func_at_val),
+        );
+
+        let ControlNodeDef { attrs: _, kind: _, outputs } = self.reborrow().def();
         for output in outputs {
             output.inner_transform_with(transformer).apply_to(output);
         }
@@ -770,13 +804,15 @@ impl InnerTransform for ControlNodeOutputDecl {
 
 impl InnerInPlaceTransform for FuncAtMut<'_, DataInst> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let DataInstDef { attrs, form, inputs } = self.reborrow().def();
+        let DataInstDef { attrs, form, inputs: _ } = self.reborrow().def();
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
         transformer.transform_data_inst_form_use(*form).apply_to(form);
-        for v in inputs {
-            transformer.transform_value_use(v).apply_to(v);
-        }
+
+        self.in_place_transform_many(
+            |this| &mut this.def().inputs,
+            |func_at_val| transformer.transform_value_use_in_func(func_at_val),
+        );
     }
 }
 
@@ -844,6 +880,7 @@ impl InnerInPlaceTransform for cfg::ControlInst {
                 SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
             ) => {}
         }
+        // FIXME(eddyb) these can't use `transform_value_use_in_func`.
         for v in inputs {
             transformer.transform_value_use(v).apply_to(v);
         }
