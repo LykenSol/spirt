@@ -767,6 +767,24 @@ impl<E: sealed::Entity<Def = EntityListNode<E, D>>, D> EntityList<E> {
             (None, None) => self.0 = None,
         }
     }
+
+    /// Remove the first node (defined in `defs`) from `self`, and return it,
+    /// if the list isn't empty.
+    #[track_caller]
+    pub fn remove_first(&mut self, defs: &mut EntityDefs<E>) -> Option<E> {
+        let first = self.0?.first;
+        self.remove(first, defs);
+        Some(first)
+    }
+
+    /// Remove the last node (defined in `defs`) from `self`, and return it,
+    /// if the list isn't empty.
+    #[track_caller]
+    pub fn remove_last(&mut self, defs: &mut EntityDefs<E>) -> Option<E> {
+        let last = self.0?.last;
+        self.remove(last, defs);
+        Some(last)
+    }
 }
 
 /// [`EntityList<E>`] iterator, but with a different API than [`Iterator`].
