@@ -945,6 +945,8 @@ pub use context::ControlNode;
 /// See [`ControlRegion`] docs for more on control-flow in SPIR-T.
 #[derive(Clone)]
 pub struct ControlNodeDef {
+    pub attrs: AttrSet,
+
     pub kind: ControlNodeKind,
 
     /// Outputs from this [`ControlNode`]:

@@ -1674,6 +1674,7 @@ impl Module {
                             let block_node = func_def_body.control_nodes.define(
                                 &cx,
                                 ControlNodeDef {
+                                    attrs: AttrSet::default(),
                                     kind: ControlNodeKind::Block { insts: EntityList::empty() },
                                     outputs: SmallVec::new(),
                                 }

@@ -788,9 +788,16 @@ impl<'a> InferUsage<'a> {
                                     .attrs
                             }
                             Value::ControlNodeOutput { control_node, output_idx } => {
-                                &mut func_def_body.at_mut(control_node).def().outputs
-                                    [output_idx as usize]
-                                    .attrs
+                                let control_node_def = func_def_body.at_mut(control_node).def();
+
+                                // HACK(eddyb) `ControlNodeOutput { output_idx: !0, .. }`
+                                // may be used to attach errors to a whole `ControlNode`.
+                                if output_idx == !0 {
+                                    assert!(usage.is_err());
+                                    &mut control_node_def.attrs
+                                } else {
+                                    &mut control_node_def.outputs[output_idx as usize].attrs
+                                }
                             }
                             Value::DataInstOutput(data_inst) => {
                                 &mut func_def_body.at_mut(data_inst).def().attrs

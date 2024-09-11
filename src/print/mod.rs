@@ -944,9 +944,9 @@ impl<'a> Printer<'a> {
                     for func_at_control_node in func_def_body.at(*children) {
                         let control_node = func_at_control_node.position;
 
-                        define(Use::AlignmentAnchorForControlNode(control_node), None);
+                        let ControlNodeDef { attrs, kind, outputs } = func_at_control_node.def();
 
-                        let ControlNodeDef { kind, outputs } = func_at_control_node.def();
+                        define(Use::AlignmentAnchorForControlNode(control_node), Some(*attrs));
 
                         if let ControlNodeKind::Block { insts } = *kind {
                             for func_at_inst in func_def_body.at(insts) {
@@ -2921,7 +2921,9 @@ impl Print for FuncAt<'_, ControlNode> {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
         let control_node = self.position;
-        let ControlNodeDef { kind, outputs } = self.def();
+        let ControlNodeDef { attrs, kind, outputs } = self.def();
+
+        let attrs = attrs.print(printer);
 
         let outputs_header = if !outputs.is_empty() {
             let mut outputs = outputs.iter().enumerate().map(|(output_idx, output)| {
@@ -3053,11 +3055,11 @@ impl Print for FuncAt<'_, ControlNode> {
                 inputs.iter().map(|v| v.print(printer)),
             ),
         };
-        pretty::Fragment::new([
+        let def_without_name = pretty::Fragment::new([
             Use::AlignmentAnchorForControlNode(self.position).print_as_def(printer),
-            outputs_header,
             control_node_body,
-        ])
+        ]);
+        AttrsAndDef { attrs, def_without_name }.insert_name_before_def(outputs_header)
     }
 }
 

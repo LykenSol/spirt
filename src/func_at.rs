@@ -68,6 +68,14 @@ impl<'a> Iterator for FuncAt<'a, EntityListIter<ControlNode>> {
     }
 }
 
+impl DoubleEndedIterator for FuncAt<'_, EntityListIter<ControlNode>> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let (prev, rest) = self.position.split_last(self.control_nodes)?;
+        self.position = rest;
+        Some(self.at(prev))
+    }
+}
+
 impl<'a> FuncAt<'a, ControlNode> {
     pub fn def(self) -> &'a ControlNodeDef {
         &self.control_nodes[self.position]
