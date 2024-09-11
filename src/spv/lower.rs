@@ -1559,6 +1559,7 @@ impl Module {
                             let block_node = func_def_body.nodes.define(
                                 &cx,
                                 NodeDef {
+                                    attrs: AttrSet::default(),
                                     kind: NodeKind::Block { insts: EntityList::empty() },
                                     outputs: SmallVec::new(),
                                 }
