@@ -242,12 +242,12 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
 
     fn visit_node_def(&mut self, func_at_node: FuncAt<'_, Node>) {
         match func_at_node.def().kind {
-            NodeKind::Select(_)
+            NodeKind::FuncCall { .. }
+            | NodeKind::Select(_)
             | NodeKind::Loop { .. }
             | NodeKind::ExitInvocation(_)
             | DataInstKind::Scalar(_)
             | DataInstKind::Vector(_)
-            | DataInstKind::FuncCall(_)
             | DataInstKind::SpvInst(_) => {}
 
             // FIXME(eddyb) this should be a proper `Result`-based error instead,
@@ -456,9 +456,9 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
                 | NodeKind::Loop { .. }
                 | NodeKind::ExitInvocation { .. } => None,
 
-                DataInstKind::Scalar(_)
+                NodeKind::FuncCall { .. }
+                | DataInstKind::Scalar(_)
                 | DataInstKind::Vector(_)
-                | DataInstKind::FuncCall(_)
                 | DataInstKind::QPtr(_)
                 | DataInstKind::SpvInst(_)
                 | DataInstKind::SpvExtInst { .. } => {
@@ -567,6 +567,7 @@ impl<'a> FuncLifting<'a> {
 
         let mut region_inputs_source = FxHashMap::default();
         region_inputs_source.insert(func_def_body.body, RegionInputsSource::FuncParams);
+        let mut data_inst_output_ids = FxHashMap::default();
 
         // Create a SPIR-V block for every CFG point needing one.
         let mut blocks = FxIndexMap::default();
@@ -656,18 +657,27 @@ impl<'a> FuncLifting<'a> {
             };
 
             let insts = match point {
-                CfgPoint::NodeEntry(node) => match func_def_body.at(node).def().kind {
-                    NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
-                        SmallVec::new()
-                    }
+                CfgPoint::NodeEntry(node) => {
+                    let node_def = func_def_body.at(node).def();
+                    match node_def.kind {
+                        NodeKind::Select(_)
+                        | NodeKind::Loop { .. }
+                        | NodeKind::ExitInvocation(_) => SmallVec::new(),
 
-                    DataInstKind::Scalar(_)
-                    | DataInstKind::Vector(_)
-                    | DataInstKind::FuncCall(_)
-                    | DataInstKind::QPtr(_)
-                    | DataInstKind::SpvInst(_)
-                    | DataInstKind::SpvExtInst { .. } => [node].into_iter().collect(),
-                },
+                        NodeKind::FuncCall { .. }
+                        | DataInstKind::Scalar(_)
+                        | DataInstKind::Vector(_)
+                        | DataInstKind::QPtr(_)
+                        | DataInstKind::SpvInst(_)
+                        | DataInstKind::SpvExtInst { .. } => {
+                            if !node_def.outputs.is_empty() {
+                                data_inst_output_ids.insert(node, alloc_id()?);
+                            }
+
+                            [node].into_iter().collect()
+                        }
+                    }
+                }
                 _ => SmallVec::new(),
             };
 
@@ -761,9 +771,9 @@ impl<'a> FuncLifting<'a> {
                             merge: None,
                         },
 
-                        DataInstKind::Scalar(_)
+                        NodeKind::FuncCall { .. }
+                        | DataInstKind::Scalar(_)
                         | DataInstKind::Vector(_)
-                        | DataInstKind::FuncCall(_)
                         | DataInstKind::QPtr(_)
                         | DataInstKind::SpvInst(_)
                         | DataInstKind::SpvExtInst { .. } => unreachable!(),
@@ -830,10 +840,10 @@ impl<'a> FuncLifting<'a> {
                             }
                         }
 
-                        NodeKind::ExitInvocation { .. }
+                        NodeKind::FuncCall { .. }
+                        | NodeKind::ExitInvocation { .. }
                         | DataInstKind::Scalar(_)
                         | DataInstKind::Vector(_)
-                        | DataInstKind::FuncCall(_)
                         | DataInstKind::QPtr(_)
                         | DataInstKind::SpvInst(_)
                         | DataInstKind::SpvExtInst { .. } => unreachable!(),
@@ -1005,18 +1015,11 @@ impl<'a> FuncLifting<'a> {
             }
         }
 
-        let all_insts_with_output = blocks
-            .values()
-            .flat_map(|block| block.insts.iter().copied())
-            .filter(|&inst| !func_def_body.at(inst).def().outputs.is_empty());
-
         Ok(Self {
             func_id,
             param_ids,
             region_inputs_source,
-            data_inst_output_ids: all_insts_with_output
-                .map(|inst| Ok((inst, alloc_id()?)))
-                .collect::<Result<_, _>>()?,
+            data_inst_output_ids,
             label_ids: blocks
                 .keys()
                 .map(|&point| Ok((point, alloc_id()?)))
@@ -1334,9 +1337,10 @@ impl LazyInst<'_, '_> {
                             unreachable!()
                         }
 
-                        Err(&DataInstKind::FuncCall(callee)) => {
-                            (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))
+                        Err(NodeKind::FuncCall { callee }) => {
+                            (wk.OpFunctionCall.into(), Some(ids.funcs[callee].func_id))
                         }
+
                         Err(DataInstKind::SpvInst(inst)) => (inst.clone(), None),
                         Err(&DataInstKind::SpvExtInst { ext_set, inst }) => (
                             spv::Inst {

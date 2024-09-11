@@ -523,10 +523,10 @@ impl spv::Inst {
                 }
             }),
 
-            NodeKind::Select(_)
+            NodeKind::FuncCall { .. }
+            | NodeKind::Select(_)
             | NodeKind::Loop { .. }
             | NodeKind::ExitInvocation(_)
-            | DataInstKind::FuncCall(_)
             | DataInstKind::QPtr(_)
             | DataInstKind::SpvInst(..)
             | DataInstKind::SpvExtInst { .. } => None,

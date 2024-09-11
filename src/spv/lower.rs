@@ -5,10 +5,11 @@ use crate::spv::{self, spec};
 use crate::{
     AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, DataInstDef, DataInstKind,
     DbgSrcLoc, DeclDef, Diag, EntityDefs, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
-    FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr, Module,
-    NodeOutputDecl, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind,
-    TypeOrConst, Value, cfg, print, scalar,
+    FuncParam, FxIndexMap, GlobalVarDecl, GlobalVarDefBody, Import, InternedStr, Module, NodeDef,
+    NodeKind, NodeOutputDecl, Region, RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef,
+    TypeKind, TypeOrConst, Value, cfg, print, scalar,
 };
+use itertools::Either;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1545,7 +1546,7 @@ impl Module {
                         result_type.map(|ty| [ty]).as_ref().map_or(&[][..], |tys| &tys[..]),
                     ) {
                         // FIXME(eddyb) sanity-check the number/types of inputs.
-                        kind
+                        Either::Left(kind)
                     } else if opcode == wk.OpFunctionCall {
                         assert!(imms.is_empty());
                         let callee_id = ids[0];
@@ -1565,12 +1566,14 @@ impl Module {
                         match maybe_callee {
                             Some(callee) => {
                                 ids = &ids[1..];
-                                DataInstKind::FuncCall(callee)
+                                Either::Right(NodeKind::FuncCall { callee })
                             }
 
                             // HACK(eddyb) this should be an error, but it shows
                             // up in Rust-GPU output (likely a zombie?).
-                            None => DataInstKind::SpvInst(raw_inst.without_ids.clone()),
+                            None => {
+                                Either::Left(DataInstKind::SpvInst(raw_inst.without_ids.clone()))
+                            }
                         }
                     } else if opcode == wk.OpExtInst {
                         let ext_set_id = ids[0];
@@ -1596,60 +1599,88 @@ impl Module {
                             ))
                         })?;
 
-                        DataInstKind::SpvExtInst { ext_set, inst }
+                        Either::Left(DataInstKind::SpvExtInst { ext_set, inst })
                     } else {
-                        DataInstKind::SpvInst(raw_inst.without_ids.clone())
+                        Either::Left(DataInstKind::SpvInst(raw_inst.without_ids.clone()))
                     };
 
-                    let data_inst_def = DataInstDef {
-                        attrs,
-                        kind,
-                        inputs: ids
-                            .iter()
-                            .map(|&id| {
-                                match lookup_global_or_local_id_for_data_or_control_inst_input(id)?
-                                {
-                                    LocalIdDef::Value(_, v) => Ok(v),
-                                    LocalIdDef::BlockLabel { .. } => Err(invalid(
-                                        "unsupported use of block label as a value, \
-                                         in non-terminator instruction",
-                                    )),
-                                }
+                    let outputs = result_id
+                        .map(|_| {
+                            result_type.ok_or_else(|| {
+                                invalid(
+                                    "expected value-producing instruction, \
+                                     with a result type",
+                                )
                             })
-                            .collect::<io::Result<_>>()?,
-                        child_regions: [].into_iter().collect(),
-                        outputs: result_id
-                            .map(|_| {
-                                result_type.ok_or_else(|| {
-                                    invalid(
-                                        "expected value-producing instruction, \
-                                         with a result type",
-                                    )
-                                })
-                            })
-                            .transpose()?
-                            .into_iter()
-                            .map(|ty| {
-                                // FIXME(eddyb) split attrs between output and inst.
-                                NodeOutputDecl { attrs: AttrSet::default(), ty }
-                            })
-                            .collect(),
-                    };
-                    let inst = match result_id {
-                        Some(id) => match local_id_defs[&id] {
-                            LocalIdDef::Value(_, Value::NodeOutput { node: inst, .. }) => {
-                                // A dummy was defined earlier, to be able to
-                                // have an entry in `local_id_defs`.
+                        })
+                        .transpose()?
+                        .into_iter()
+                        .map(|ty| NodeOutputDecl { attrs: AttrSet::default(), ty })
+                        .collect();
+
+                    let inputs = ids
+                        .iter()
+                        .map(|&id| match lookup_global_or_local_id_for_data_or_control_inst_input(
+                            id,
+                        )? {
+                            LocalIdDef::Value(_, v) => Ok(v),
+                            LocalIdDef::BlockLabel { .. } => Err(invalid(
+                                "unsupported use of block label as a value, \
+                                 in non-terminator instruction",
+                            )),
+                        })
+                        .collect::<io::Result<_>>()?;
+
+                    let inst_or_node_def = kind.map_either_with(
+                        (inputs, outputs),
+                        |(inputs, outputs), kind| DataInstDef {
+                            attrs,
+                            kind,
+                            inputs,
+                            child_regions: [].into_iter().collect(),
+                            outputs,
+                        },
+                        |(inputs, outputs), kind| NodeDef {
+                            attrs,
+                            kind,
+                            inputs,
+                            child_regions: [].into_iter().collect(),
+                            outputs,
+                        },
+                    );
+                    let inst_or_node = match result_id {
+                        Some(id) => match (local_id_defs[&id], inst_or_node_def) {
+                            // A dummy was defined earlier, to be able to
+                            // have an entry in `local_id_defs`.
+                            (
+                                LocalIdDef::Value(_, Value::NodeOutput { node: inst, .. }),
+                                Either::Left(data_inst_def),
+                            ) => {
                                 func_def_body.nodes[inst] = data_inst_def.into();
 
-                                inst
+                                Either::Left(inst)
+                            }
+                            (
+                                LocalIdDef::Value(_, Value::NodeOutput { node, output_idx: 0 }),
+                                Either::Right(node_def),
+                            ) => {
+                                func_def_body.nodes[node] = node_def.into();
+
+                                Either::Right(node)
                             }
                             _ => unreachable!(),
                         },
-                        None => func_def_body.nodes.define(&cx, data_inst_def.into()),
+                        None => inst_or_node_def.map_either_with(
+                            &mut func_def_body.nodes,
+                            |nodes, data_inst_def| nodes.define(&cx, data_inst_def.into()),
+                            |nodes, node_def| nodes.define(&cx, node_def.into()),
+                        ),
                     };
 
-                    current_block_region_def.children.insert_last(inst, &mut func_def_body.nodes);
+                    current_block_region_def.children.insert_last(
+                        inst_or_node.either(|inst| inst, |node| node),
+                        &mut func_def_body.nodes,
+                    );
                 }
             }
 

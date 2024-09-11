@@ -956,9 +956,10 @@ pub struct NodeDef {
 
     /// Outputs from this [`Node`]:
     /// * accessed using [`Value::NodeOutput`]
-    /// * values provided by `region.outputs`, where `region` is the executed
-    ///   child [`Region`]:
-    ///   * when this is a `Select`: the case that was chosen
+    /// * values provided by:
+    ///   * when this is a `FuncCall`: the callee's return values
+    ///   * when executing a child [`Region`]: `region.outputs`
+    ///     (for `Select`, `region` is the case that was chosen)
     // TODO(eddyb) include former `DataInst`s in above docs.
     pub outputs: SmallVec<[NodeOutputDecl; 2]>,
 }
@@ -972,6 +973,15 @@ pub struct NodeOutputDecl {
 
 #[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
 pub enum NodeKind {
+    /// Execute `callee`'s body with `inputs` as arguments, until it returns,
+    /// upon which this node's `outputs` become the returned values.
+    //
+    // FIXME(eddyb) handle never-returning functions more like `ExitInvocation`.
+    FuncCall {
+        // FIXME(eddyb) allow indirect calls (i.e. to function pointers).
+        callee: Func,
+    },
+
     /// Choose one [`Region`] out of `child_regions` to execute, based on a single
     /// value input (`input[0]`) interpreted according to [`SelectionKind`].
     ///
@@ -1017,8 +1027,6 @@ pub enum NodeKind {
     /// See also the [`vector`] module for more documentation and definitions.
     #[from]
     Vector(vector::Op),
-
-    FuncCall(Func),
 
     /// `QPtr`-specific operations (see [`qptr::QPtrOp`]).
     #[from]
@@ -1074,9 +1082,10 @@ pub enum Value {
 
     /// One of the outputs produced by a [`Node`]:
     /// * declared by `node.outputs[output_idx]`
-    /// * value provided by `region.outputs[output_idx]`, where `region` is the
-    ///   executed child [`Region`] (of `node`):
-    ///   * when `node` is a `Select`: the case that was chosen
+    /// * values provided by:
+    ///   * when `node` is a `FuncCall`: the callee's return values
+    ///   * when executing a child [`Region`]: `region.outputs[output_idx]`
+    ///     (for `Select`, `region` is the case that was chosen)
     // TODO(eddyb) include former `DataInst`s in above docs.
     NodeOutput {
         node: Node,

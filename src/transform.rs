@@ -631,7 +631,9 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
         match kind {
-            DataInstKind::FuncCall(func) => transformer.transform_func_use(*func).apply_to(func),
+            NodeKind::FuncCall { callee } => {
+                transformer.transform_func_use(*callee).apply_to(callee);
+            }
 
             NodeKind::Select(
                 SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },

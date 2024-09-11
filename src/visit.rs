@@ -475,7 +475,9 @@ impl<'a> FuncAt<'a, Node> {
 
         visitor.visit_attr_set_use(*attrs);
         match kind {
-            &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
+            NodeKind::FuncCall { callee } => {
+                visitor.visit_func_use(*callee);
+            }
 
             NodeKind::Select(
                 SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },

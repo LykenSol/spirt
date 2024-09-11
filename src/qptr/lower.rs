@@ -610,12 +610,12 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
 
         match data_inst_def.kind {
             // Known semantics, no need to preserve SPIR-V pointer information.
-            NodeKind::Select(_)
+            NodeKind::FuncCall { .. }
+            | NodeKind::Select(_)
             | NodeKind::Loop { .. }
             | NodeKind::ExitInvocation(_)
             | DataInstKind::Scalar(_)
             | DataInstKind::Vector(_)
-            | DataInstKind::FuncCall(_)
             | DataInstKind::QPtr(_) => return,
 
             DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}

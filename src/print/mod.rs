@@ -2900,6 +2900,12 @@ impl Print for FuncAt<'_, Node> {
         let kw_style = printer.imperative_keyword_style();
         let kw = |kw| kw_style.apply(kw).into();
         let node_body = match kind {
+            NodeKind::FuncCall { callee } => pretty::Fragment::new([
+                printer.declarative_keyword_style().apply("call").into(),
+                " ".into(),
+                callee.print(printer),
+                pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
+            ]),
             NodeKind::Select(kind) => kind.print_with_scrutinee_and_cases(
                 printer,
                 kw_style,
@@ -2998,7 +3004,6 @@ impl Print for FuncAt<'_, Node> {
 
             DataInstKind::Scalar(_)
             | DataInstKind::Vector(_)
-            | DataInstKind::FuncCall(_)
             | DataInstKind::QPtr(_)
             | DataInstKind::SpvInst(_)
             | DataInstKind::SpvExtInst { .. } => {
@@ -3076,7 +3081,10 @@ impl FuncAt<'_, DataInst> {
         };
 
         let def_without_type = match kind {
-            NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
+            NodeKind::FuncCall { .. }
+            | NodeKind::Select(_)
+            | NodeKind::Loop { .. }
+            | NodeKind::ExitInvocation(_) => {
                 unreachable!()
             }
 
@@ -3122,13 +3130,6 @@ impl FuncAt<'_, DataInst> {
                     ),
                 ])
             }
-
-            &DataInstKind::FuncCall(func) => pretty::Fragment::new([
-                printer.declarative_keyword_style().apply("call").into(),
-                " ".into(),
-                func.print(printer),
-                pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
-            ]),
 
             DataInstKind::QPtr(op) => {
                 let (qptr_input, extra_inputs) = match op {

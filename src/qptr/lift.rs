@@ -406,22 +406,14 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             Ok((addr_space, self.lifter.layout_of(pointee_type)?))
         };
         let replacement_data_inst_def = match &data_inst_def.kind {
-            NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
+            NodeKind::FuncCall { .. }
+            | NodeKind::Select(_)
+            | NodeKind::Loop { .. }
+            | NodeKind::ExitInvocation(_) => {
                 return Ok(Transformed::Unchanged);
             }
 
             DataInstKind::Scalar(_) | DataInstKind::Vector(_) => return Ok(Transformed::Unchanged),
-
-            &DataInstKind::FuncCall(_callee) => {
-                for &v in &data_inst_def.inputs {
-                    if self.lifter.as_spv_ptr_type(type_of_val(v)).is_some() {
-                        return Err(LiftError(Diag::bug([
-                            "unimplemented calls with pointer args".into(),
-                        ])));
-                    }
-                }
-                return Ok(Transformed::Unchanged);
-            }
 
             DataInstKind::QPtr(QPtrOp::FuncLocalVar(_mem_layout)) => {
                 let qptr_usage =
@@ -1039,6 +1031,25 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
     fn in_place_transform_node_def(&mut self, mut func_at_node: FuncAtMut<'_, Node>) {
         func_at_node.reborrow().inner_in_place_transform_with(self);
 
+        let record_lift_error = |this: &mut Self, attrs: &mut AttrSet, LiftError(e)| {
+            // HACK(eddyb) do not add redundant errors to `qptr::analyze` bugs.
+            this.func_has_qptr_analysis_bug_diags = this.func_has_qptr_analysis_bug_diags
+                || this.lifter.cx[*attrs].attrs.iter().any(|attr| match attr {
+                    Attr::Diagnostics(diags) => diags.0.iter().any(|diag| match diag.level {
+                        DiagLevel::Bug(loc) => {
+                            loc.file().ends_with("qptr/analyze.rs")
+                                || loc.file().ends_with("qptr\\analyze.rs")
+                        }
+                        _ => false,
+                    }),
+                    _ => false,
+                });
+
+            if !this.func_has_qptr_analysis_bug_diags {
+                attrs.push_diag(&this.lifter.cx, e);
+            }
+        };
+
         let mut lifted = self.try_lift_data_inst_def(func_at_node.reborrow());
         if let Ok(Transformed::Unchanged) = lifted {
             let data_inst_def = func_at_node.reborrow().def();
@@ -1060,31 +1071,29 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
             Ok(Transformed::Changed(new_def)) => {
                 // HACK(eddyb) this whole dance ensures that use counts
                 // remain accurate, no matter what rewrites occur.
-                let data_inst_def = func_at_node.def();
+                let data_inst_def = func_at_node.reborrow().def();
                 self.remove_value_uses(&data_inst_def.inputs);
                 *data_inst_def = new_def;
                 self.resolve_deferred_ptr_noop_uses(&mut data_inst_def.inputs);
                 self.add_value_uses(&data_inst_def.inputs);
             }
-            Err(LiftError(e)) => {
-                let data_inst_def = func_at_node.def();
+            Err(e) => {
+                record_lift_error(self, &mut func_at_node.reborrow().def().attrs, e);
+            }
+        }
 
-                // HACK(eddyb) do not add redundant errors to `qptr::analyze` bugs.
-                self.func_has_qptr_analysis_bug_diags = self.func_has_qptr_analysis_bug_diags
-                    || self.lifter.cx[data_inst_def.attrs].attrs.iter().any(|attr| match attr {
-                        Attr::Diagnostics(diags) => diags.0.iter().any(|diag| match diag.level {
-                            DiagLevel::Bug(loc) => {
-                                loc.file().ends_with("qptr/analyze.rs")
-                                    || loc.file().ends_with("qptr\\analyze.rs")
-                            }
-                            _ => false,
-                        }),
-                        _ => false,
-                    });
-
-                if !self.func_has_qptr_analysis_bug_diags {
-                    data_inst_def.attrs.push_diag(&self.lifter.cx, e);
-                }
+        let func_at_node_frozen = func_at_node.reborrow().freeze();
+        let node_def = func_at_node_frozen.def();
+        if let NodeKind::FuncCall { .. } = node_def.kind {
+            let func = func_at_node_frozen.at(());
+            if node_def.inputs.iter().any(|&v| {
+                self.lifter.as_spv_ptr_type(func.at(v).type_of(&self.lifter.cx)).is_some()
+            }) {
+                record_lift_error(
+                    self,
+                    &mut func_at_node.def().attrs,
+                    LiftError(Diag::bug(["unimplemented calls with pointer args".into()])),
+                );
             }
         }
     }

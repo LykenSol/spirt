@@ -11,7 +11,7 @@ use crate::{
     ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind, OrdAssertEq, Type,
     TypeKind, Value,
 };
-use itertools::{Either, Itertools as _};
+use itertools::Either;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::mem;
@@ -951,6 +951,41 @@ impl<'a> InferUsage<'a> {
             };
 
             match &node_def.kind {
+                &NodeKind::FuncCall { callee } => {
+                    match self.infer_usage_in_func(module, callee) {
+                        FuncInferUsageState::Complete(callee_results) => {
+                            for (&arg, param_usage) in
+                                node_def.inputs.iter().zip(&callee_results.param_usages)
+                            {
+                                if let Some(param_usage) = param_usage {
+                                    generate_usage(self, arg, param_usage.clone());
+                                }
+                            }
+                        }
+                        FuncInferUsageState::InProgress => {
+                            usage_or_err_attrs_to_attach.push((
+                                Value::NodeOutput { node, output_idx: !0 },
+                                Err(AnalysisError(Diag::bug(
+                                    ["unsupported recursive call".into()],
+                                ))),
+                            ));
+                        }
+                    };
+                    for (i, usage) in per_output_usage.iter().enumerate() {
+                        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+                        assert_eq!(i, 0);
+                        assert_eq!(func_def_body.at(node).def().outputs.len(), 1);
+
+                        if let Some(usage) = usage {
+                            usage_or_err_attrs_to_attach.push((
+                                Value::NodeOutput { node, output_idx: 0 },
+                                Clone::clone(usage),
+                            ));
+                        }
+                    }
+
+                    continue;
+                }
                 NodeKind::Select(_) => {
                     for &case in &node_def.child_regions {
                         for (&per_case_output, usage) in
@@ -975,7 +1010,6 @@ impl<'a> InferUsage<'a> {
 
                 DataInstKind::Scalar(_)
                 | DataInstKind::Vector(_)
-                | DataInstKind::FuncCall(_)
                 | DataInstKind::QPtr(_)
                 | DataInstKind::SpvInst(_)
                 | DataInstKind::SpvExtInst { .. } => {}
@@ -988,42 +1022,14 @@ impl<'a> InferUsage<'a> {
             // FIXME(eddyb) merge with `match &node_def.kind` above.
             let data_inst_def = node_def;
             match &data_inst_def.kind {
-                NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
+                NodeKind::FuncCall { .. }
+                | NodeKind::Select(_)
+                | NodeKind::Loop { .. }
+                | NodeKind::ExitInvocation(_) => {
                     unreachable!()
                 }
 
                 DataInstKind::Scalar(_) | DataInstKind::Vector(_) => {}
-
-                &DataInstKind::FuncCall(callee) => {
-                    match self.infer_usage_in_func(module, callee) {
-                        FuncInferUsageState::Complete(callee_results) => {
-                            for (&arg, param_usage) in
-                                data_inst_def.inputs.iter().zip(&callee_results.param_usages)
-                            {
-                                if let Some(param_usage) = param_usage {
-                                    generate_usage(self, arg, param_usage.clone());
-                                }
-                            }
-                        }
-                        FuncInferUsageState::InProgress => {
-                            usage_or_err_attrs_to_attach.push((
-                                Value::NodeOutput { node, output_idx: 0 },
-                                Err(AnalysisError(Diag::bug(
-                                    ["unsupported recursive call".into()],
-                                ))),
-                            ));
-                        }
-                    };
-                    // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-                    if (data_inst_def.outputs.iter().at_most_one().ok().unwrap())
-                        .map_or(false, |o| is_qptr(o.ty))
-                    {
-                        if let Some(usage) = output_usage {
-                            usage_or_err_attrs_to_attach
-                                .push((Value::NodeOutput { node, output_idx: 0 }, usage));
-                        }
-                    }
-                }
 
                 DataInstKind::QPtr(QPtrOp::FuncLocalVar(_)) => {
                     if let Some(usage) = output_usage {
