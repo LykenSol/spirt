@@ -490,6 +490,12 @@ impl<'a> FuncAt<'a, ControlNode> {
                     visitor.visit_data_inst_def(func_at_inst.def());
                 }
             }
+            ControlNodeKind::FuncCall { callee, inputs } => {
+                visitor.visit_func_use(*callee);
+                for v in inputs {
+                    visitor.visit_value_use(v);
+                }
+            }
             ControlNodeKind::Select {
                 kind: SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
                 scrutinee,
@@ -548,8 +554,7 @@ impl InnerVisit for DataInstFormDef {
         let Self { kind, output_type } = self;
 
         match kind {
-            &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
-            DataInstKind::QPtr(op) => match *op {
+            DataInstKind::QPtr(
                 QPtrOp::FuncLocalVar(_)
                 | QPtrOp::HandleArrayIndex
                 | QPtrOp::BufferData
@@ -557,9 +562,9 @@ impl InnerVisit for DataInstFormDef {
                 | QPtrOp::Offset(_)
                 | QPtrOp::DynOffset { .. }
                 | QPtrOp::Load
-                | QPtrOp::Store => {}
-            },
-            DataInstKind::Scalar(_)
+                | QPtrOp::Store,
+            )
+            | DataInstKind::Scalar(_)
             | DataInstKind::Vector(_)
             | DataInstKind::SpvInst(_)
             | DataInstKind::SpvExtInst { .. } => {}

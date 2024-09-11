@@ -520,10 +520,9 @@ impl spv::Inst {
                     }
                 }
             }),
-            DataInstKind::FuncCall(_)
-            | DataInstKind::QPtr(_)
-            | DataInstKind::SpvInst(..)
-            | DataInstKind::SpvExtInst { .. } => None,
+            DataInstKind::QPtr(_) | DataInstKind::SpvInst(..) | DataInstKind::SpvExtInst { .. } => {
+                None
+            }
         }
     }
 }

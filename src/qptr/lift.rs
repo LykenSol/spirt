@@ -406,17 +406,6 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         let replacement_data_inst_def = match &data_inst_form_def.kind {
             DataInstKind::Scalar(_) | DataInstKind::Vector(_) => return Ok(Transformed::Unchanged),
 
-            &DataInstKind::FuncCall(_callee) => {
-                for &v in &data_inst_def.inputs {
-                    if self.lifter.as_spv_ptr_type(type_of_val(v)).is_some() {
-                        return Err(LiftError(Diag::bug([
-                            "unimplemented calls with pointer args".into(),
-                        ])));
-                    }
-                }
-                return Ok(Transformed::Unchanged);
-            }
-
             DataInstKind::QPtr(QPtrOp::FuncLocalVar(_mem_layout)) => {
                 let qptr_usage = self.lifter.find_qptr_usage_attr(data_inst_def.attrs)?;
 
@@ -1073,6 +1062,25 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
     ) {
         func_at_control_node.reborrow().inner_in_place_transform_with(self);
 
+        let record_lift_error = |this: &mut Self, attrs: &mut AttrSet, LiftError(e)| {
+            // HACK(eddyb) do not add redundant errors to `qptr::analyze` bugs.
+            this.func_has_qptr_analysis_bug_diags = this.func_has_qptr_analysis_bug_diags
+                || this.lifter.cx[*attrs].attrs.iter().any(|attr| match attr {
+                    Attr::Diagnostics(diags) => diags.0.iter().any(|diag| match diag.level {
+                        DiagLevel::Bug(loc) => {
+                            loc.file().ends_with("qptr/analyze.rs")
+                                || loc.file().ends_with("qptr\\analyze.rs")
+                        }
+                        _ => false,
+                    }),
+                    _ => false,
+                });
+
+            if !this.func_has_qptr_analysis_bug_diags {
+                attrs.push_diag(&this.lifter.cx, e);
+            }
+        };
+
         let control_node = func_at_control_node.position;
         if let ControlNodeKind::Block { insts } = func_at_control_node.reborrow().def().kind {
             let mut func_at_inst_iter = func_at_control_node.reborrow().at(insts).into_iter();
@@ -1103,32 +1111,26 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
                         self.resolve_deferred_ptr_noop_uses(&mut data_inst_def.inputs);
                         self.add_value_uses(&data_inst_def.inputs);
                     }
-                    Err(LiftError(e)) => {
-                        let data_inst_def = func_at_inst.def();
-
-                        // HACK(eddyb) do not add redundant errors to `qptr::analyze` bugs.
-                        self.func_has_qptr_analysis_bug_diags = self
-                            .func_has_qptr_analysis_bug_diags
-                            || self.lifter.cx[data_inst_def.attrs].attrs.iter().any(|attr| {
-                                match attr {
-                                    Attr::Diagnostics(diags) => {
-                                        diags.0.iter().any(|diag| match diag.level {
-                                            DiagLevel::Bug(loc) => {
-                                                loc.file().ends_with("qptr/analyze.rs")
-                                                    || loc.file().ends_with("qptr\\analyze.rs")
-                                            }
-                                            _ => false,
-                                        })
-                                    }
-                                    _ => false,
-                                }
-                            });
-
-                        if !self.func_has_qptr_analysis_bug_diags {
-                            data_inst_def.attrs.push_diag(&self.lifter.cx, e);
-                        }
+                    Err(e) => {
+                        record_lift_error(self, &mut func_at_inst.def().attrs, e);
                     }
                 }
+            }
+        }
+
+        let func_at_control_node_frozen = func_at_control_node.reborrow().freeze();
+        if let ControlNodeKind::FuncCall { callee: _, inputs } =
+            &func_at_control_node_frozen.def().kind
+        {
+            let func = func_at_control_node_frozen.at(());
+            if inputs.iter().any(|&v| {
+                self.lifter.as_spv_ptr_type(func.at(v).type_of(&self.lifter.cx)).is_some()
+            }) {
+                record_lift_error(
+                    self,
+                    &mut func_at_control_node.def().attrs,
+                    LiftError(Diag::bug(["unimplemented calls with pointer args".into()])),
+                );
             }
         }
     }

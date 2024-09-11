@@ -2960,6 +2960,12 @@ impl Print for FuncAt<'_, ControlNode> {
                         .flat_map(|entry| [pretty::Node::ForceLineSeparation.into(), entry]),
                 )
             }
+            ControlNodeKind::FuncCall { callee, inputs } => pretty::Fragment::new([
+                printer.declarative_keyword_style().apply("call").into(),
+                " ".into(),
+                callee.print(printer),
+                pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
+            ]),
             ControlNodeKind::Select { kind, scrutinee, cases } => kind
                 .print_with_scrutinee_and_cases(
                     printer,
@@ -3156,13 +3162,6 @@ impl Print for FuncAt<'_, DataInst> {
                     ),
                 ])
             }
-
-            &DataInstKind::FuncCall(func) => pretty::Fragment::new([
-                printer.declarative_keyword_style().apply("call").into(),
-                " ".into(),
-                func.print(printer),
-                pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
-            ]),
 
             DataInstKind::QPtr(op) => {
                 let (qptr_input, extra_inputs) = match op {

@@ -952,6 +952,55 @@ impl<'a> InferUsage<'a> {
         for control_node in post_order_control_nodes.into_iter().rev() {
             let block_insts = match &func_def_body.at(control_node).def().kind {
                 &ControlNodeKind::Block { insts } => insts,
+                ControlNodeKind::FuncCall { callee, inputs } => {
+                    let per_output_usage =
+                        control_node_to_per_output_usage.remove(&control_node).unwrap_or_default();
+
+                    let mut generate_usage = |this: &mut Self, ptr: Value, new_usage| {
+                        generate_usage(
+                            this,
+                            &mut usage_or_err_attrs_to_attach,
+                            Value::ControlNodeOutput { control_node, output_idx: !0 },
+                            &mut data_inst_output_usages,
+                            &mut control_node_to_per_output_usage,
+                            ptr,
+                            new_usage,
+                        );
+                    };
+
+                    match self.infer_usage_in_func(module, *callee) {
+                        FuncInferUsageState::Complete(callee_results) => {
+                            for (&arg, param_usage) in
+                                inputs.iter().zip(&callee_results.param_usages)
+                            {
+                                if let Some(param_usage) = param_usage {
+                                    generate_usage(self, arg, param_usage.clone());
+                                }
+                            }
+                        }
+                        FuncInferUsageState::InProgress => {
+                            usage_or_err_attrs_to_attach.push((
+                                Value::ControlNodeOutput { control_node, output_idx: !0 },
+                                Err(AnalysisError(Diag::bug(
+                                    ["unsupported recursive call".into()],
+                                ))),
+                            ));
+                        }
+                    };
+                    for (i, usage) in per_output_usage.iter().enumerate() {
+                        assert_eq!(i, 0);
+                        assert_eq!(func_def_body.at(control_node).def().outputs.len(), 1);
+
+                        if let Some(usage) = usage {
+                            usage_or_err_attrs_to_attach.push((
+                                Value::ControlNodeOutput { control_node, output_idx: 0 },
+                                Clone::clone(usage),
+                            ));
+                        }
+                    }
+
+                    continue;
+                }
                 ControlNodeKind::Select { cases, .. } => {
                     let per_output_usage =
                         control_node_to_per_output_usage.remove(&control_node).unwrap_or_default();
@@ -1009,34 +1058,6 @@ impl<'a> InferUsage<'a> {
                 };
                 match &data_inst_form_def.kind {
                     DataInstKind::Scalar(_) | DataInstKind::Vector(_) => {}
-
-                    &DataInstKind::FuncCall(callee) => {
-                        match self.infer_usage_in_func(module, callee) {
-                            FuncInferUsageState::Complete(callee_results) => {
-                                for (&arg, param_usage) in
-                                    data_inst_def.inputs.iter().zip(&callee_results.param_usages)
-                                {
-                                    if let Some(param_usage) = param_usage {
-                                        generate_usage(self, arg, param_usage.clone());
-                                    }
-                                }
-                            }
-                            FuncInferUsageState::InProgress => {
-                                usage_or_err_attrs_to_attach.push((
-                                    Value::DataInstOutput(data_inst),
-                                    Err(AnalysisError(Diag::bug([
-                                        "unsupported recursive call".into()
-                                    ]))),
-                                ));
-                            }
-                        };
-                        if data_inst_form_def.output_type.map_or(false, is_qptr) {
-                            if let Some(usage) = output_usage {
-                                usage_or_err_attrs_to_attach
-                                    .push((Value::DataInstOutput(data_inst), usage));
-                            }
-                        }
-                    }
 
                     DataInstKind::QPtr(QPtrOp::FuncLocalVar(_)) => {
                         if let Some(usage) = output_usage {

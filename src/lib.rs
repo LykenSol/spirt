@@ -951,9 +951,10 @@ pub struct ControlNodeDef {
 
     /// Outputs from this [`ControlNode`]:
     /// * accessed using [`Value::ControlNodeOutput`]
-    /// * values provided by `region.outputs`, where `region` is the executed
-    ///   child [`ControlRegion`]:
-    ///   * when this is a `Select`: the case that was chosen
+    /// * values provided by:
+    ///   * when this is a `FuncCall`: the callee's return values
+    ///   * when executing a child [`ControlRegion`]: `region.outputs`
+    ///     (for `Select`, `region` is the case that was chosen)
     pub outputs: SmallVec<[ControlNodeOutputDecl; 2]>,
 }
 
@@ -974,6 +975,21 @@ pub enum ControlNodeKind {
         // FIXME(eddyb) should empty blocks be allowed? should `DataInst`s be
         // linked directly into the `ControlRegion` `children` list?
         insts: EntityList<DataInst>,
+    },
+
+    /// Execute `callee`'s body with `inputs` as arguments, until it returns,
+    /// upon which this node's `outputs` become the returned values.
+    //
+    // FIXME(eddyb) consider splitting this into recursive vs non-recursive calls,
+    // to avoid defensive traversal handling for recursion, when it's impossible.
+    // FIXME(eddyb) handle never-returning functions more like `ExitInvocation`.
+    FuncCall {
+        // FIXME(eddyb) allow indirect calls (i.e. to function pointers).
+        callee: Func,
+
+        // FIXME(eddyb) centralize `Value` inputs across `ControlNode`s,
+        // and only use stricter types for building/traversing the IR.
+        inputs: SmallVec<[Value; 2]>,
     },
 
     /// Choose one [`ControlRegion`] out of `cases` to execute, based on a single
@@ -1073,6 +1089,9 @@ pub struct DataInstFormDef {
     pub output_type: Option<Type>,
 }
 
+// FIXME(eddyb) consider labeling this in some way that indicates (and requires)
+// that it cannot contain uses of entities (and only `InternedStr` in terms of
+// interned values, for `SpvExtInst`, but that's an optimization over `String`).
 #[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
 pub enum DataInstKind {
     /// Scalar (`bool`, integer, and floating-point) pure operations.
@@ -1086,10 +1105,6 @@ pub enum DataInstKind {
     /// See also the [`vector`] module for more documentation and definitions.
     #[from]
     Vector(vector::Op),
-
-    // FIXME(eddyb) try to split this into recursive and non-recursive calls,
-    // to avoid needing special handling for recursion where it's impossible.
-    FuncCall(Func),
 
     /// `QPtr`-specific operations (see [`qptr::QPtrOp`]).
     #[from]
@@ -1118,9 +1133,10 @@ pub enum Value {
 
     /// One of the outputs produced by a [`ControlNode`]:
     /// * declared by `control_node.outputs[output_idx]`
-    /// * value provided by `region.outputs[output_idx]`, where `region` is the
-    ///   executed child [`ControlRegion`] (of `control_node`):
-    ///   * when `control_node` is a `Select`: the case that was chosen
+    /// * values provided by:
+    ///   * when `control_node` is a `FuncCall`: the callee's return values
+    ///   * when executing a child [`ControlRegion`]: `region.outputs[output_idx]`
+    ///     (for `Select`, `region` is the case that was chosen)
     ControlNodeOutput {
         control_node: ControlNode,
         output_idx: u32,

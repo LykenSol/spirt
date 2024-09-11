@@ -4,13 +4,14 @@ use crate::func_at::FuncAt;
 use crate::spv::{self, spec};
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
-    AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, ControlNode, ControlNodeKind,
-    ControlNodeOutputDecl, ControlRegion, ControlRegionInputDecl, DataInst, DataInstDef,
-    DataInstForm, DataInstFormDef, DataInstKind, DbgSrcLoc, DeclDef, EntityList, ExportKey,
-    Exportee, Func, FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody,
-    Import, Module, ModuleDebugInfo, ModuleDialect, OrdAssertEq, SelectionKind, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, cfg, scalar,
+    AddrSpace, Attr, AttrSet, Const, ConstDef, ConstKind, Context, ControlNode, ControlNodeDef,
+    ControlNodeKind, ControlNodeOutputDecl, ControlRegion, ControlRegionInputDecl, DataInst,
+    DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DbgSrcLoc, DeclDef, EntityList,
+    ExportKey, Exportee, Func, FuncDecl, FuncParam, FxIndexMap, FxIndexSet, GlobalVar,
+    GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, OrdAssertEq, SelectionKind,
+    Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, scalar,
 };
+use itertools::Either;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -254,10 +255,7 @@ impl Visitor<'_> for NeedsIdsCollector<'_> {
                 unreachable!("`DataInstKind::QPtr` should be legalized away before lifting");
             }
 
-            DataInstKind::Scalar(_)
-            | DataInstKind::Vector(_)
-            | DataInstKind::FuncCall(_)
-            | DataInstKind::SpvInst(_) => {}
+            DataInstKind::Scalar(_) | DataInstKind::Vector(_) | DataInstKind::SpvInst(_) => {}
 
             DataInstKind::SpvExtInst { ext_set, .. } => {
                 self.ext_inst_imports.insert(&self.cx[ext_set]);
@@ -286,6 +284,7 @@ struct FuncLifting<'a> {
     region_inputs_source: FxHashMap<ControlRegion, RegionInputsSource>,
     // FIXME(eddyb) use `EntityOrientedDenseMap` here.
     data_inst_output_ids: FxHashMap<DataInst, spv::Id>,
+    call_output_ids: FxHashMap<ControlNode, spv::Id>,
 
     label_ids: FxHashMap<CfgPoint, spv::Id>,
     blocks: FxIndexMap<CfgPoint, BlockLifting<'a>>,
@@ -314,7 +313,7 @@ enum CfgPoint {
 
 struct BlockLifting<'a> {
     phis: SmallVec<[Phi; 2]>,
-    insts: SmallVec<[EntityList<DataInst>; 1]>,
+    insts: SmallVec<[BlockInsts; 4]>,
     terminator: Terminator<'a>,
 }
 
@@ -329,6 +328,12 @@ struct Phi {
     // to the `Loop` (other than the backedge, which is already in `cases`)
     // should automatically get an entry into `cases`, with this value.
     default_value: Option<Value>,
+}
+
+#[derive(Copy, Clone)]
+enum BlockInsts {
+    DataInsts(EntityList<DataInst>),
+    FuncCall(ControlNode),
 }
 
 /// Similar to [`cfg::ControlInst`], except:
@@ -457,10 +462,13 @@ impl<'p> FuncAt<'_, CfgCursor<'p>> {
 
             // Entering a `ControlNode` depends entirely on the `ControlNodeKind`.
             CfgPoint::ControlNodeEntry(control_node) => match self.at(control_node).def().kind {
-                ControlNodeKind::Block { .. } => Some(CfgCursor {
-                    point: CfgPoint::ControlNodeExit(control_node),
-                    parent: cursor.parent,
-                }),
+                // FIXME(eddyb) handle never-returning functions accurately.
+                ControlNodeKind::Block { .. } | ControlNodeKind::FuncCall { .. } => {
+                    Some(CfgCursor {
+                        point: CfgPoint::ControlNodeExit(control_node),
+                        parent: cursor.parent,
+                    })
+                }
 
                 ControlNodeKind::Select { .. }
                 | ControlNodeKind::Loop { .. }
@@ -532,7 +540,9 @@ impl FuncAt<'_, ControlNode> {
         parent: &CfgCursor<'_, ControlParent>,
     ) -> Result<(), E> {
         let child_regions: &[_] = match &self.def().kind {
-            ControlNodeKind::Block { .. } | ControlNodeKind::ExitInvocation { .. } => &[],
+            ControlNodeKind::Block { .. }
+            | ControlNodeKind::FuncCall { .. }
+            | ControlNodeKind::ExitInvocation { .. } => &[],
             ControlNodeKind::Select { cases, .. } => cases,
             ControlNodeKind::Loop { body, .. } => slice::from_ref(body),
         };
@@ -566,6 +576,7 @@ impl<'a> FuncLifting<'a> {
                     param_ids,
                     region_inputs_source: Default::default(),
                     data_inst_output_ids: Default::default(),
+                    call_output_ids: Default::default(),
                     label_ids: Default::default(),
                     blocks: Default::default(),
                 });
@@ -575,6 +586,8 @@ impl<'a> FuncLifting<'a> {
 
         let mut region_inputs_source = FxHashMap::default();
         region_inputs_source.insert(func_def_body.body, RegionInputsSource::FuncParams);
+        let mut data_inst_output_ids = FxHashMap::default();
+        let mut call_output_ids = FxHashMap::default();
 
         // Create a SPIR-V block for every CFG point needing one.
         let mut blocks = FxIndexMap::default();
@@ -641,28 +654,50 @@ impl<'a> FuncLifting<'a> {
                         _ => SmallVec::new(),
                     }
                 }
-                CfgPoint::ControlNodeExit(control_node) => func_def_body
-                    .at(control_node)
-                    .def()
-                    .outputs
-                    .iter()
-                    .map(|&ControlNodeOutputDecl { attrs, ty }| {
-                        Ok(Phi {
-                            attrs,
-                            ty,
+                CfgPoint::ControlNodeExit(control_node) => {
+                    let control_node_def = func_def_body.at(control_node).def();
+                    if let ControlNodeKind::FuncCall { .. } = control_node_def.kind {
+                        SmallVec::new()
+                    } else {
+                        control_node_def
+                            .outputs
+                            .iter()
+                            .map(|&ControlNodeOutputDecl { attrs, ty }| {
+                                Ok(Phi {
+                                    attrs,
+                                    ty,
 
-                            result_id: alloc_id()?,
-                            cases: FxIndexMap::default(),
-                            default_value: None,
-                        })
-                    })
-                    .collect::<Result<_, _>>()?,
+                                    result_id: alloc_id()?,
+                                    cases: FxIndexMap::default(),
+                                    default_value: None,
+                                })
+                            })
+                            .collect::<Result<_, _>>()?
+                    }
+                }
             };
 
             let insts = match point {
                 CfgPoint::ControlNodeEntry(control_node) => {
-                    match func_def_body.at(control_node).def().kind {
-                        ControlNodeKind::Block { insts } => [insts].into_iter().collect(),
+                    let control_node_def = func_def_body.at(control_node).def();
+                    match control_node_def.kind {
+                        ControlNodeKind::Block { insts } => {
+                            for func_at_inst in func_def_body.at(insts) {
+                                if cx[func_at_inst.def().form].output_type.is_some() {
+                                    data_inst_output_ids.insert(func_at_inst.position, alloc_id()?);
+                                }
+                            }
+
+                            [BlockInsts::DataInsts(insts)].into_iter().collect()
+                        }
+                        ControlNodeKind::FuncCall { .. } => {
+                            assert!(control_node_def.outputs.len() <= 1);
+                            if !control_node_def.outputs.is_empty() {
+                                call_output_ids.insert(control_node, alloc_id()?);
+                            }
+
+                            [BlockInsts::FuncCall(control_node)].into_iter().collect()
+                        }
                         _ => SmallVec::new(),
                     }
                 }
@@ -715,7 +750,7 @@ impl<'a> FuncLifting<'a> {
                 (CfgPoint::ControlNodeEntry(control_node), None) => {
                     let control_node_def = func_def_body.at(control_node).def();
                     match &control_node_def.kind {
-                        ControlNodeKind::Block { .. } => {
+                        ControlNodeKind::Block { .. } | ControlNodeKind::FuncCall { .. } => {
                             unreachable!()
                         }
 
@@ -775,7 +810,9 @@ impl<'a> FuncLifting<'a> {
                     };
 
                     match func_def_body.at(parent_node).def().kind {
-                        ControlNodeKind::Block { .. } | ControlNodeKind::ExitInvocation { .. } => {
+                        ControlNodeKind::Block { .. }
+                        | ControlNodeKind::FuncCall { .. }
+                        | ControlNodeKind::ExitInvocation { .. } => {
                             unreachable!()
                         }
 
@@ -987,20 +1024,12 @@ impl<'a> FuncLifting<'a> {
             }
         }
 
-        let all_insts_with_output = blocks
-            .values()
-            .flat_map(|block| block.insts.iter().copied())
-            .flat_map(|insts| func_def_body.at(insts))
-            .filter(|&func_at_inst| cx[func_at_inst.def().form].output_type.is_some())
-            .map(|func_at_inst| func_at_inst.position);
-
         Ok(Self {
             func_id,
             param_ids,
             region_inputs_source,
-            data_inst_output_ids: all_insts_with_output
-                .map(|inst| Ok((inst, alloc_id()?)))
-                .collect::<Result<_, _>>()?,
+            data_inst_output_ids,
+            call_output_ids,
             label_ids: blocks
                 .keys()
                 .map(|&point| Ok((point, alloc_id()?)))
@@ -1035,6 +1064,11 @@ enum LazyInst<'a, 'b> {
         parent_func: &'b FuncLifting<'a>,
         result_id: Option<spv::Id>,
         data_inst_def: &'a DataInstDef,
+    },
+    FuncCall {
+        parent_func: &'b FuncLifting<'a>,
+        result_id: Option<spv::Id>,
+        control_node_def: &'a ControlNodeDef,
     },
     Merge(Merge<spv::Id>),
     Terminator {
@@ -1094,6 +1128,9 @@ impl LazyInst<'_, '_> {
             Self::DataInst { parent_func: _, result_id, data_inst_def } => {
                 (result_id, data_inst_def.attrs, None)
             }
+            Self::FuncCall { parent_func: _, result_id, control_node_def } => {
+                (result_id, control_node_def.attrs, None)
+            }
             Self::Merge(_) => (None, AttrSet::default(), None),
             Self::Terminator { parent_func: _, terminator } => (None, terminator.attrs, None),
             Self::OpFunctionEnd => (None, AttrSet::default(), None),
@@ -1128,9 +1165,17 @@ impl LazyInst<'_, '_> {
                 }
             }
             Value::ControlNodeOutput { control_node, output_idx } => {
-                parent_func.blocks[&CfgPoint::ControlNodeExit(control_node)].phis
-                    [usize::try_from(output_idx).unwrap()]
-                .result_id
+                match parent_func.call_output_ids.get(&control_node) {
+                    Some(&call_result_id) => {
+                        assert_eq!(output_idx, 0);
+                        call_result_id
+                    }
+                    None => {
+                        parent_func.blocks[&CfgPoint::ControlNodeExit(control_node)].phis
+                            [usize::try_from(output_idx).unwrap()]
+                        .result_id
+                    }
+                }
             }
             Value::DataInstOutput(inst) => parent_func.data_inst_output_ids[&inst],
         };
@@ -1305,9 +1350,6 @@ impl LazyInst<'_, '_> {
                         // Disallowed while visiting.
                         Err(DataInstKind::QPtr(_)) => unreachable!(),
 
-                        Err(&DataInstKind::FuncCall(callee)) => {
-                            (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))
-                        }
                         Err(DataInstKind::SpvInst(inst)) => (inst.clone(), None),
                         Err(&DataInstKind::SpvExtInst { ext_set, inst }) => (
                             spv::Inst {
@@ -1325,6 +1367,26 @@ impl LazyInst<'_, '_> {
                     ids: extra_initial_id_operand
                         .into_iter()
                         .chain(data_inst_def.inputs.iter().map(|&v| value_to_id(parent_func, v)))
+                        .collect(),
+                }
+            }
+            Self::FuncCall { parent_func, result_id: _, control_node_def } => {
+                assert!(control_node_def.outputs.len() <= 1);
+                let output_type = match control_node_def.outputs[..] {
+                    [] => None,
+                    [output] => Some(output.ty),
+                    _ => unreachable!(),
+                };
+                let ControlNodeKind::FuncCall { callee, inputs } = &control_node_def.kind else {
+                    unreachable!()
+                };
+                spv::InstWithIds {
+                    without_ids: wk.OpFunctionCall.into(),
+                    result_type_id: output_type.map(|ty| ids.globals[&Global::Type(ty)]),
+                    result_id,
+                    ids: [ids.funcs[callee].func_id]
+                        .into_iter()
+                        .chain(inputs.iter().map(|&v| value_to_id(parent_func, v)))
                         .collect(),
                 }
             }
@@ -1497,25 +1559,38 @@ impl Module {
                                 phis.iter()
                                     .map(|phi| LazyInst::OpPhi { parent_func: func_lifting, phi }),
                             )
-                            .chain(
-                                insts
-                                    .iter()
-                                    .copied()
-                                    .flat_map(move |insts| func_def_body.unwrap().at(insts))
-                                    .map(move |func_at_inst| {
-                                        let data_inst_def = func_at_inst.def();
-                                        LazyInst::DataInst {
+                            .chain(insts.iter().copied().flat_map(move |insts| match insts {
+                                BlockInsts::DataInsts(insts) => {
+                                    Either::Left(func_def_body.unwrap().at(insts).into_iter().map(
+                                        move |func_at_inst| {
+                                            let data_inst_def = func_at_inst.def();
+                                            LazyInst::DataInst {
+                                                parent_func: func_lifting,
+                                                result_id: cx[data_inst_def.form].output_type.map(
+                                                    |_| {
+                                                        func_lifting.data_inst_output_ids
+                                                            [&func_at_inst.position]
+                                                    },
+                                                ),
+                                                data_inst_def,
+                                            }
+                                        },
+                                    ))
+                                }
+                                BlockInsts::FuncCall(call_node) => {
+                                    let control_node_def =
+                                        func_def_body.unwrap().at(call_node).def();
+                                    Either::Right(
+                                        [LazyInst::FuncCall {
                                             parent_func: func_lifting,
-                                            result_id: cx[data_inst_def.form].output_type.map(
-                                                |_| {
-                                                    func_lifting.data_inst_output_ids
-                                                        [&func_at_inst.position]
-                                                },
-                                            ),
-                                            data_inst_def,
-                                        }
-                                    }),
-                            )
+                                            result_id: (!control_node_def.outputs.is_empty())
+                                                .then(|| func_lifting.call_output_ids[&call_node]),
+                                            control_node_def,
+                                        }]
+                                        .into_iter(),
+                                    )
+                                }
+                            }))
                             .chain(terminator.merge.map(|merge| {
                                 LazyInst::Merge(match merge {
                                     Merge::Selection(merge) => {

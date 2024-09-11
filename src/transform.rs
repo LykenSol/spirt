@@ -651,7 +651,12 @@ impl InnerInPlaceTransform for FuncAtMut<'_, EntityListIter<ControlNode>> {
 impl FuncAtMut<'_, ControlNode> {
     fn child_regions(&mut self) -> &mut [ControlRegion] {
         match &mut self.reborrow().def().kind {
-            ControlNodeKind::Block { .. } | ControlNodeKind::ExitInvocation { .. } => &mut [][..],
+            ControlNodeKind::Block { insts: _ }
+            | ControlNodeKind::FuncCall { callee: _, inputs: _ }
+            | ControlNodeKind::ExitInvocation {
+                kind: cfg::ExitInvocationKind::SpvInst(_),
+                inputs: _,
+            } => &mut [][..],
 
             ControlNodeKind::Select { cases, .. } => cases,
             ControlNodeKind::Loop { body, .. } => slice::from_mut(body),
@@ -670,6 +675,12 @@ impl InnerInPlaceTransform for FuncAtMut<'_, ControlNode> {
                 let mut func_at_inst_iter = self.reborrow().at(insts).into_iter();
                 while let Some(func_at_inst) = func_at_inst_iter.next() {
                     transformer.in_place_transform_data_inst_def(func_at_inst);
+                }
+            }
+            ControlNodeKind::FuncCall { callee, inputs } => {
+                transformer.transform_func_use(*callee).apply_to(callee);
+                for v in inputs {
+                    transformer.transform_value_use(v).apply_to(v);
                 }
             }
             ControlNodeKind::Select {
@@ -702,6 +713,7 @@ impl InnerInPlaceTransform for FuncAtMut<'_, ControlNode> {
         match kind {
             // Fully handled above, before recursing into any child regions.
             ControlNodeKind::Block { insts: _ }
+            | ControlNodeKind::FuncCall { callee: _, inputs: _ }
             | ControlNodeKind::Select { kind: _, scrutinee: _, cases: _ }
             | ControlNodeKind::ExitInvocation {
                 kind: cfg::ExitInvocationKind::SpvInst(_),
@@ -751,7 +763,6 @@ impl InnerTransform for DataInstFormDef {
 
         transform!({
             kind -> match kind {
-                DataInstKind::FuncCall(func) => transformer.transform_func_use(*func).map(DataInstKind::FuncCall),
                 DataInstKind::QPtr(op) => match op {
                     QPtrOp::FuncLocalVar(_)
                     | QPtrOp::HandleArrayIndex
