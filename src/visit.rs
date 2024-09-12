@@ -5,10 +5,11 @@ use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUs
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, ControlNode, ControlNodeDef,
     ControlNodeKind, ControlNodeOutputDecl, ControlRegion, ControlRegionDef,
-    ControlRegionInputDecl, DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DeclDef,
-    DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
-    GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect,
-    SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, spv,
+    ControlRegionInputDecl, DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DbgSrcLoc,
+    DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
+    FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
+    ModuleDialect, OrdAssertEq, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
+    spv,
 };
 
 // FIXME(eddyb) `Sized` bound shouldn't be needed but removing it requires
@@ -236,10 +237,18 @@ impl InnerVisit for AttrSetDef {
 impl InnerVisit for Attr {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         match self {
-            Attr::Diagnostics(_)
-            | Attr::SpvAnnotation(_)
-            | Attr::SpvDebugLine { .. }
-            | Attr::SpvBitflagsOperand(_) => {}
+            Attr::Diagnostics(_) | Attr::SpvAnnotation(_) | Attr::SpvBitflagsOperand(_) => {}
+
+            &Attr::DbgSrcLoc(OrdAssertEq(DbgSrcLoc {
+                file_path: _,
+                start_line_col: _,
+                end_line_col: _,
+                inlined_callee_name_and_call_site,
+            })) => {
+                if let Some((_callee_name, call_site_attrs)) = inlined_callee_name_and_call_site {
+                    visitor.visit_attr_set_use(call_site_attrs);
+                }
+            }
 
             Attr::QPtr(attr) => match attr {
                 QPtrAttr::ToSpvPtrInput { input_idx: _, pointee }
