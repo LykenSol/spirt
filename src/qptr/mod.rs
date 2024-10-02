@@ -132,6 +132,9 @@ bitflags! {
         /// even if not explicitly propagated inwards ahead of time.
         const COPY_DST = 1 << 1;
 
+        // HACK(eddyb)
+        const ESCAPES_TO_MEMORY = 1 << 2;
+
         /// Used as a source for some `qptr.copy`s and a destination for others,
         /// making it unsound to rely solely on the offset ranges covered by the
         /// (nested) `QPtrMemUsage`s, as any contained bytes may be implicitly
@@ -144,7 +147,7 @@ bitflags! {
         const COPY_SRC_AND_DST = Self::COPY_SRC.bits() | Self::COPY_DST.bits();
 
         /// Mask for [`QPtrMemUsageFlags::propagate_outwards`] (see its docs).
-        const PROPAGATE_OUTWARDS_MASK = Self::empty().bits();
+        const PROPAGATE_OUTWARDS_MASK = Self::ESCAPES_TO_MEMORY.bits();
     }
 }
 

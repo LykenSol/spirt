@@ -2333,6 +2333,10 @@ impl Print for QPtrMemUsage {
 
         let mut aspects = SmallVec::<[_; 4]>::new();
 
+        if flags.contains(QPtrMemUsageFlags::ESCAPES_TO_MEMORY) {
+            aspects.push(printer.imperative_keyword_style().apply("escapes").into());
+        }
+
         let is_copy_src = flags.contains(QPtrMemUsageFlags::COPY_SRC);
         let is_copy_dst = flags.contains(QPtrMemUsageFlags::COPY_DST);
         if is_copy_src || is_copy_dst {
