@@ -185,6 +185,8 @@ impl UsageMerger<'_> {
                     b_offset_in_a == 0
                 } =>
             {
+                let mut a = a;
+                a.flags = flags;
                 return MergeResult::ok(a);
             }
 
@@ -205,6 +207,7 @@ impl UsageMerger<'_> {
                 };
 
                 let mut ab = a;
+                ab.flags = flags;
                 let mut all_errors = None;
                 for (b_offset, b_sub_usage) in b_entries {
                     let MergeResult { merged, error: new_error } = self.merge_mem_at(
@@ -1482,6 +1485,27 @@ impl<'a> InferUsage<'a> {
                                     }
                                 }),
                         );
+
+                        if is_qptr(access_type) {
+                            match op {
+                                QPtrOp::Load { .. } => {
+                                    // FIXME(eddyb) implement as appending the
+                                    // usage to a global "usage of any escaped".
+                                }
+                                QPtrOp::Store { .. } => generate_usage(
+                                    self,
+                                    data_inst_def.inputs[1],
+                                    // FIXME(eddyb) `QPtrMemUsageKind::Unused` might
+                                    // make sense data-structure wise, but it
+                                    // risks potentially losing the `flags`.
+                                    Ok(QPtrUsage::Memory(QPtrMemUsage {
+                                        flags: QPtrMemUsageFlags::ESCAPES_TO_MEMORY,
+                                        ..QPtrMemUsage::UNUSED
+                                    })),
+                                ),
+                                _ => unreachable!(),
+                            };
+                        }
                     }
                     &DataInstKind::QPtr(QPtrOp::Copy { size }) => {
                         let max_size = Some(size.get());
