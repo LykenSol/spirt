@@ -155,6 +155,17 @@ impl<AI: AllocIds> Visitor<'_> for Lifter<'_, AI> {
         }
         let ty_def = &self.cx[ty];
 
+        // HACK(eddyb) this hijacks `ids.globals` (aliasing two SPIR-T types to
+        // one SPIR-V type ID) and could cause issues if not handled carefully.
+        // FIXME(eddyb) don't vectors-of-bytes have the same issue?
+        if let TypeKind::Scalar(scalar::Type::Byte(w)) = ty_def.kind {
+            let uint_ty =
+                self.cx.intern(TypeDef { attrs: ty_def.attrs, kind: scalar::Type::UInt(w).into() });
+            self.visit_type_use(uint_ty);
+            self.ids.globals.insert(global, self.ids.globals[&Global::Type(uint_ty)]);
+            return;
+        }
+
         // HACK(eddyb) there isn't a great way to handle canonical types, but
         // perhaps this result should be recorded in `self.globals`?
         if let Some((_spv_inst, type_and_const_inputs)) =
@@ -1332,7 +1343,18 @@ impl LazyInst<'_, '_> {
         match self {
             Self::Global(global) => {
                 let (attrs, import) = match global {
-                    Global::Type(ty) => (cx[ty].attrs, None),
+                    Global::Type(ty) => {
+                        let ty_def = &cx[ty];
+
+                        // HACK(eddyb) accounts for the two SPIR-T types using the
+                        // same SPIR-V type ID (only one of them should be defined).
+                        // FIXME(eddyb) don't vectors-of-bytes have the same issue?
+                        if let TypeKind::Scalar(scalar::Type::Byte(_)) = ty_def.kind {
+                            return (None, AttrSet::default(), None);
+                        }
+
+                        (ty_def.attrs, None)
+                    }
                     Global::Const(ct) => {
                         let ct_def = &cx[ct];
                         match ct_def.kind {
@@ -1451,6 +1473,14 @@ impl LazyInst<'_, '_> {
             Self::Global(global) => each_inst(match global {
                 Global::Type(ty) => {
                     let ty_def = &cx[ty];
+
+                    // HACK(eddyb) accounts for the two SPIR-T types using the
+                    // same SPIR-V type ID (only one of them should be defined).
+                    // FIXME(eddyb) don't vectors-of-bytes have the same issue?
+                    if let TypeKind::Scalar(scalar::Type::Byte(_)) = ty_def.kind {
+                        return;
+                    }
+
                     match spv::Inst::from_canonical_type(cx, &ty_def.kind)
                         .as_ref()
                         .ok_or(&ty_def.kind)
