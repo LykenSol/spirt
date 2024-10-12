@@ -350,6 +350,11 @@ impl spv::Inst {
                         opcode: mo.OpTypeFloat,
                         imms: [spv::Imm::Short(wk.LiteralInteger, w.bits())].into_iter().collect(),
                     },
+
+                    scalar::Type::Byte(w) => unreachable!(
+                        "`b{}` should be lifted before `from_canonical_type`!",
+                        w.bits()
+                    ),
                 },
                 [].into_iter().collect(),
             )),

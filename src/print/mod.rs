@@ -2413,6 +2413,9 @@ impl Print for TypeDef {
                 scalar::Type::SInt(_) => format!("s{width}"),
                 scalar::Type::UInt(_) => format!("u{width}"),
                 scalar::Type::Float(_) => format!("f{width}"),
+
+                // FIXME(eddyb) is this a good enough representation?
+                scalar::Type::Byte(_) => format!("b{width}"),
             }
         };
 
@@ -2466,6 +2469,7 @@ impl Print for ConstDef {
                     scalar::Type::Bool => unreachable!(),
                     scalar::Type::SInt(_) => (ct.int_as_i128().map(|x| x.to_string()), 's'),
                     scalar::Type::UInt(_) => (ct.int_as_u128().map(|x| x.to_string()), 'u'),
+                    scalar::Type::Byte(_) => (ct.int_as_u128().map(|x| x.to_string()), 'b'),
                     scalar::Type::Float(_) => {
                         /// Check that parsing the result of printing produces
                         /// the original bits of the floating-point value, and

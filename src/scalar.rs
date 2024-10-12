@@ -10,6 +10,14 @@ pub enum Type {
     SInt(IntWidth),
     UInt(IntWidth),
     Float(FloatWidth),
+
+    /// Raw memory unit, historically referred to as a "byte", e.g.:
+    /// - <https://www.ralfj.de/blog/2018/07/24/pointers-and-bytes.html>
+    /// - <https://gist.github.com/georgemitenkov/3def898b8845c2cc161bd216cbbdb81f>
+    //
+    // FIXME(eddyb) better name? (mem unit aka `muN`, something with "raw"?)
+    // FIXME(eddyb) is `IntWidth` reasonable here?
+    Byte(IntWidth),
 }
 
 impl Type {
@@ -22,7 +30,7 @@ impl Type {
     pub const fn bit_width(self) -> u32 {
         match self {
             Type::Bool => 1,
-            Type::SInt(w) | Type::UInt(w) => w.bits(),
+            Type::SInt(w) | Type::UInt(w) | Type::Byte(w) => w.bits(),
             Type::Float(w) => w.bits(),
         }
     }
@@ -165,7 +173,7 @@ impl Const {
     /// (i.e. `self` has the same sign and absolute value as `v` does).
     pub fn int_as_i128(&self) -> Option<i128> {
         match self.ty {
-            Type::Bool | Type::Float(_) => None,
+            Type::Bool | Type::Float(_) | Type::Byte(_) => None,
             Type::SInt(_) => {
                 let width = self.ty.bit_width();
                 Some((self.bits as i128) << (128 - width) >> (128 - width))
@@ -178,7 +186,7 @@ impl Const {
     /// (i.e. `self` is positive and has the same absolute value as `v` does).
     pub fn int_as_u128(&self) -> Option<u128> {
         match self.ty {
-            Type::Bool | Type::Float(_) => None,
+            Type::Bool | Type::Float(_) | Type::Byte(_) => None,
             Type::SInt(_) => self.int_as_i128()?.try_into().ok(),
             Type::UInt(_) => Some(self.bits),
         }
