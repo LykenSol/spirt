@@ -4,7 +4,9 @@
 use super::layout::*;
 
 use crate::func_at::{FuncAt, FuncAtMut};
-use crate::qptr::{QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage, shapes};
+use crate::qptr::{
+    QPtrAttr, QPtrMemUsage, QPtrMemUsageFlags, QPtrMemUsageKind, QPtrOp, QPtrUsage, shapes,
+};
 use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
@@ -215,34 +217,80 @@ impl<'a> LiftToSpvPtrs<'a> {
                     }
                     QPtrMemUsageKind::OffsetBase(fields) => self.spv_op_type_struct(
                         fields.iter().map(|(&field_offset, field_usage)| {
-                            Ok((field_offset, self.pointee_type_for_mem_usage(field_usage)?))
+                            Ok((
+                                field_offset,
+                                self.pointee_type_for_mem_usage(field_usage, data_usage.flags)?,
+                            ))
                         }),
                         [attr_spv_decorate_block],
                     ),
                     QPtrMemUsageKind::StrictlyTyped(_)
                     | QPtrMemUsageKind::DirectAccess(_)
                     | QPtrMemUsageKind::DynOffsetBase { .. } => self.spv_op_type_struct(
-                        [Ok((0, self.pointee_type_for_mem_usage(data_usage)?))],
+                        [Ok((
+                            0,
+                            self.pointee_type_for_mem_usage(
+                                data_usage,
+                                QPtrMemUsageFlags::empty(),
+                            )?,
+                        ))],
                         [attr_spv_decorate_block],
                     ),
                 }
             }
-            QPtrUsage::Memory(usage) => self.pointee_type_for_mem_usage(usage),
+            QPtrUsage::Memory(usage) => {
+                self.pointee_type_for_mem_usage(usage, QPtrMemUsageFlags::empty())
+            }
         }
     }
 
-    fn pointee_type_for_mem_usage(&self, usage: &QPtrMemUsage) -> Result<Type, LiftError> {
+    fn pointee_type_for_mem_usage(
+        &self,
+        usage: &QPtrMemUsage,
+        outer_effective_flags: QPtrMemUsageFlags,
+    ) -> Result<Type, LiftError> {
+        // FIXME(eddyb) does this make sense across all flags?
+        let effective_flags = outer_effective_flags | usage.flags;
+
+        // TODO(eddyb) implement (or at least validate that there are no gaps).
+        if effective_flags.contains(QPtrMemUsageFlags::COPY_SRC_AND_DST) {
+            return Err(LiftError(Diag::bug([
+                "unimplemented `qptr.copy` src+dst (gap filling)".into()
+            ])));
+        }
+
         match &usage.kind {
             QPtrMemUsageKind::Unused => self.spv_op_type_struct([], []),
             &QPtrMemUsageKind::StrictlyTyped(ty) | &QPtrMemUsageKind::DirectAccess(ty) => Ok(ty),
-            QPtrMemUsageKind::OffsetBase(fields) => self.spv_op_type_struct(
-                fields.iter().map(|(&field_offset, field_usage)| {
-                    Ok((field_offset, self.pointee_type_for_mem_usage(field_usage)?))
-                }),
-                [],
-            ),
+            QPtrMemUsageKind::OffsetBase(fields) => {
+                // HACK(eddyb) force the size of `OpTypeStruct`s that would be
+                // otherwise undersized (as e.g. `qptr.copy` src/dst).
+                let size_forcing_zst_tail_field = usage
+                    .max_size
+                    .filter(|&size| {
+                        let inherent_unaligned_size =
+                            fields.last_key_value().map_or(0, |(&field_offset, field_usage)| {
+                                field_offset.checked_add(field_usage.max_size.unwrap()).unwrap()
+                            });
+                        size > inherent_unaligned_size
+                    })
+                    .map(|size| Ok((size, self.spv_op_type_struct([], [])?)));
+
+                self.spv_op_type_struct(
+                    fields
+                        .iter()
+                        .map(|(&field_offset, field_usage)| {
+                            Ok((
+                                field_offset,
+                                self.pointee_type_for_mem_usage(field_usage, effective_flags)?,
+                            ))
+                        })
+                        .chain(size_forcing_zst_tail_field),
+                    [],
+                )
+            }
             QPtrMemUsageKind::DynOffsetBase { element, stride } => {
-                let element_type = self.pointee_type_for_mem_usage(element)?;
+                let element_type = self.pointee_type_for_mem_usage(element, effective_flags)?;
 
                 let fixed_len = usage
                     .max_size
@@ -623,6 +671,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                             .checked_mul(stride.get())
                             .unwrap_or(0)
                     }),
+                    flags: QPtrMemUsageFlags::empty(),
                     kind: QPtrMemUsageKind::DynOffsetBase {
                         // FIXME(eddyb) allocating `Rc` a bit wasteful here.
                         element: Rc::new(QPtrMemUsage::UNUSED),
@@ -718,6 +767,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     TypeLayout::Concrete(concrete) => QPtrUsage::Memory(QPtrMemUsage {
                         max_size: (concrete.mem_layout.dyn_unit_stride.is_none())
                             .then_some(concrete.mem_layout.fixed_base.size),
+                        flags: QPtrMemUsageFlags::empty(),
                         kind: QPtrMemUsageKind::DirectAccess(concrete.original_type),
                     }),
                 };
@@ -748,6 +798,66 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     DataInstKind::SpvInst(spv_opcode.into(), spv::InstLowering::default());
                 data_inst_def.inputs[0] = adjusted_ptr;
 
+                data_inst_def
+            }
+            &DataInstKind::QPtr(QPtrOp::Copy { size }) => {
+                let mut data_inst_def = data_inst_def.clone();
+
+                let max_size = Some(size.get());
+                // FIXME(eddyb) `QPtrMemUsageKind::Unused` might
+                // make more sense data-structure wise, but it
+                // risks potentially losing the `flags`.
+                let kind = QPtrMemUsageKind::OffsetBase(Default::default());
+
+                let (dst_adjusted_ptr, (_, dst_adjusted_pointee_layout)) = self
+                    .adjust_pointer_for_offset_and_usage(
+                        data_inst_def.inputs[0],
+                        0,
+                        &QPtrUsage::Memory(QPtrMemUsage {
+                            max_size,
+                            flags: QPtrMemUsageFlags::COPY_DST,
+                            kind: kind.clone(),
+                        }),
+                        func_at_data_inst.reborrow().at(()),
+                        insert_aux_data_inst,
+                    )?;
+
+                let (src_adjusted_ptr, (_, src_adjusted_pointee_layout)) = self
+                    .adjust_pointer_for_offset_and_usage(
+                        data_inst_def.inputs[1],
+                        0,
+                        &QPtrUsage::Memory(QPtrMemUsage {
+                            max_size,
+                            flags: QPtrMemUsageFlags::COPY_SRC,
+                            kind: kind.clone(),
+                        }),
+                        func_at_data_inst.reborrow().at(()),
+                        insert_aux_data_inst,
+                    )?;
+
+                data_inst_def.inputs[0] = dst_adjusted_ptr;
+                data_inst_def.inputs[1] = src_adjusted_ptr;
+
+                let spv_opcode = match (dst_adjusted_pointee_layout, src_adjusted_pointee_layout) {
+                    (TypeLayout::Concrete(dst_concrete), TypeLayout::Concrete(src_concrete))
+                        if dst_concrete.original_type == src_concrete.original_type
+                            && dst_concrete.mem_layout.fixed_base.size == size.get()
+                            && dst_concrete.mem_layout.dyn_unit_stride.is_none() =>
+                    {
+                        wk.OpCopyMemory
+                    }
+
+                    // TODO(eddyb) implement by expanding pointee leaves in `0..size`.
+                    _ => {
+                        data_inst_def
+                            .inputs
+                            .push(Value::Const(cx.intern(scalar::Const::from_u32(size.get()))));
+                        wk.OpCopyMemorySized
+                    }
+                };
+
+                data_inst_def.kind =
+                    DataInstKind::SpvInst(spv_opcode.into(), spv::InstLowering::default());
                 data_inst_def
             }
 
@@ -795,6 +905,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                                 TypeLayout::Concrete(concrete) => QPtrUsage::Memory(QPtrMemUsage {
                                     max_size: (concrete.mem_layout.dyn_unit_stride.is_none())
                                         .then_some(concrete.mem_layout.fixed_base.size),
+                                    flags: QPtrMemUsageFlags::empty(),
                                     kind: QPtrMemUsageKind::StrictlyTyped(concrete.original_type),
                                 }),
                             };

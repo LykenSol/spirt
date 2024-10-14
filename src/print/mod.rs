@@ -21,7 +21,9 @@ use itertools::Itertools as _;
 
 use crate::func_at::FuncAt;
 use crate::print::multiversion::Versions;
-use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
+use crate::qptr::{
+    self, QPtrAttr, QPtrMemUsage, QPtrMemUsageFlags, QPtrMemUsageKind, QPtrOp, QPtrUsage,
+};
 use crate::visit::{InnerVisit, Visit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
@@ -2324,10 +2326,33 @@ impl Print for QPtrUsage {
 impl Print for QPtrMemUsage {
     type Output = pretty::Fragment;
     fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
+        let Self { max_size, flags, kind } = self;
+
         // FIXME(eddyb) should this be a helper on `Printer`?
         let num_lit = |x: u32| printer.numeric_literal_style().apply(format!("{x}")).into();
 
-        match &self.kind {
+        let mut aspects = SmallVec::<[_; 4]>::new();
+
+        let is_copy_src = flags.contains(QPtrMemUsageFlags::COPY_SRC);
+        let is_copy_dst = flags.contains(QPtrMemUsageFlags::COPY_DST);
+        if is_copy_src || is_copy_dst {
+            // FIXME(eddyb) this isn't the cleanest possible representation.
+            let copy_kind = match (is_copy_src, is_copy_dst) {
+                (true, false) => "copy_src",
+                (false, true) => "copy_dst",
+                _ => "copy",
+            };
+            aspects.push(pretty::Fragment::new([
+                printer.declarative_keyword_style().apply(copy_kind).into(),
+                "(".into(),
+                num_lit(0),
+                "..".into(),
+                max_size.map(num_lit).unwrap_or_default(),
+                ")".into(),
+            ]));
+        }
+
+        aspects.push(match &kind {
             QPtrMemUsageKind::Unused => "_".into(),
             // FIXME(eddyb) should the distinction be noted?
             &QPtrMemUsageKind::StrictlyTyped(ty) | &QPtrMemUsageKind::DirectAccess(ty) => {
@@ -2359,16 +2384,15 @@ impl Print for QPtrMemUsage {
                 "(".into(),
                 num_lit(0),
                 "..".into(),
-                self.max_size
-                    .map(|max_size| max_size / stride.get())
-                    .map(num_lit)
-                    .unwrap_or_default(),
+                max_size.map(|max_size| max_size / stride.get()).map(num_lit).unwrap_or_default(),
                 ") × ".into(),
                 num_lit(stride.get()),
                 " => ".into(),
                 element.print(printer),
             ]),
-        }
+        });
+
+        pretty::Fragment::new(aspects.into_iter().intersperse(" & ".into()))
     }
 }
 
@@ -3344,6 +3368,19 @@ impl FuncAt<'_, DataInst> {
                             ]));
                         }
                         ("store", [extra_inputs[0].print(printer)].into_iter().collect())
+                    }
+
+                    &QPtrOp::Copy { size } => {
+                        assert_eq!(extra_inputs.len(), 1);
+                        (
+                            "copy",
+                            [
+                                extra_inputs[0].print(printer),
+                                printer.numeric_literal_style().apply(format!("{size}")).into(),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        )
                     }
                 };
 

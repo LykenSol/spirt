@@ -285,7 +285,7 @@ impl InnerVisit for QPtrUsage {
 
 impl InnerVisit for QPtrMemUsage {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { max_size: _, kind } = self;
+        let Self { max_size: _, flags: _, kind } = self;
         kind.inner_visit_with(visitor);
     }
 }
@@ -516,7 +516,8 @@ impl<'a> FuncAt<'a, Node> {
                 | QPtrOp::Offset(_)
                 | QPtrOp::DynOffset { .. }
                 | QPtrOp::Load { .. }
-                | QPtrOp::Store { .. },
+                | QPtrOp::Store { .. }
+                | QPtrOp::Copy { .. },
             ) => {}
             DataInstKind::SpvInst(_, lowering)
             | DataInstKind::SpvExtInst { ext_set: _, inst: _, lowering } => {
