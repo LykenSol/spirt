@@ -1,9 +1,11 @@
 //! [`QPtr`](crate::TypeKind::QPtr) usage analysis (for legalizing/lifting).
 
 // HACK(eddyb) sharing layout code with other modules.
-use super::{QPtrMemUsageKind, layout::*};
+use super::layout::*;
 
-use super::{QPtrAttr, QPtrMemUsage, QPtrOp, QPtrUsage, shapes};
+use super::{
+    QPtrAttr, QPtrMemUsage, QPtrMemUsageFlags, QPtrMemUsageKind, QPtrOp, QPtrUsage, shapes,
+};
 use crate::func_at::FuncAt;
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
@@ -167,6 +169,15 @@ impl UsageMerger<'_> {
         // HACK(eddyb) we require biased `a` vs `b` (see `merge_mem` method above).
         assert_eq!(max_size, a.max_size);
 
+        let mut flags = a.flags;
+        flags |= if b_offset_in_a == 0 && max_size == b.max_size {
+            b.flags
+        } else {
+            // HACK(eddyb) assuming flags-preserving nesting of `b` into `a`,
+            // with `flags |= b.flags` later used if that stops being true.
+            b.flags.propagate_outwards()
+        };
+
         // Decompose the "smaller" and/or "less strict" side (`b`) first.
         match b.kind {
             // `Unused`s are always ignored.
@@ -177,9 +188,11 @@ impl UsageMerger<'_> {
                     // only an unused offset of `0` is a true noop, otherwise
                     // there is a dead `qptr.offset` instruction which still
                     // needs a field to reference.
-                    b_offset_in_a == 0
+                    b_offset_in_a == 0 && flags.contains(b.flags)
                 } =>
             {
+                let mut a = a;
+                a.flags = flags;
                 return MergeResult::ok(a);
             }
 
@@ -190,6 +203,9 @@ impl UsageMerger<'_> {
                     // required constant-folding of `qptr.offset` in `qptr::lift`,
                     // to not need all the type nesting levels for `OpAccessChain`.
                     b_offset_in_a == 0
+                    // HACK(eddyb) this second check also avoids flattening e.g.
+                    // a smaller copy from/to offset 0 of a larger variable.
+                    && flags.contains(b.flags)
                 } =>
             {
                 // FIXME(eddyb) this whole dance only needed due to `Rc`.
@@ -200,6 +216,7 @@ impl UsageMerger<'_> {
                 };
 
                 let mut ab = a;
+                ab.flags = flags;
                 let mut all_errors = None;
                 for (b_offset, b_sub_usage) in b_entries {
                     let MergeResult { merged, error: new_error } = self.merge_mem_at(
@@ -240,12 +257,20 @@ impl UsageMerger<'_> {
 
         let kind = match a.kind {
             // `Unused`s are always ignored.
-            QPtrMemUsageKind::Unused => MergeResult::ok(b.kind),
+            QPtrMemUsageKind::Unused => {
+                // HACK(eddyb) in lieu of flags-preserving nesting of `b` into `a`.
+                flags |= b.flags;
+
+                MergeResult::ok(b.kind)
+            }
 
             // Typed leaves must support any possible usage applied to them
             // (when they match, or overtake, that usage, in size, like here),
             // with their inherent hierarchy (i.e. their array/struct nesting).
             QPtrMemUsageKind::StrictlyTyped(a_type) | QPtrMemUsageKind::DirectAccess(a_type) => {
+                // HACK(eddyb) in lieu of flags-preserving nesting of `b` into `a`.
+                flags |= b.flags;
+
                 let b_type_at_offset_0 = match b.kind {
                     QPtrMemUsageKind::StrictlyTyped(b_type)
                     | QPtrMemUsageKind::DirectAccess(b_type)
@@ -353,6 +378,9 @@ impl UsageMerger<'_> {
                         stride: a_stride,
                     })
                 } else {
+                    // HACK(eddyb) in lieu of flags-preserving nesting of `b` into `a`.
+                    flags |= b.flags;
+
                     match b.kind {
                         QPtrMemUsageKind::DynOffsetBase {
                             element: b_element,
@@ -382,6 +410,7 @@ impl UsageMerger<'_> {
                             // HACK(eddyb) needed due to `a` being moved out of.
                             let a = QPtrMemUsage {
                                 max_size: a.max_size,
+                                flags: a.flags,
                                 kind: QPtrMemUsageKind::DynOffsetBase {
                                     element: a_element,
                                     stride: a_stride,
@@ -466,11 +495,13 @@ impl UsageMerger<'_> {
                         // HACK(eddyb) needed due to `a` being moved out of.
                         let a = QPtrMemUsage {
                             max_size: a.max_size,
+                            flags: a.flags,
                             kind: QPtrMemUsageKind::OffsetBase(a_entries.clone()),
                         };
                         return MergeResult {
                             merged: QPtrMemUsage {
                                 max_size,
+                                flags,
                                 kind: QPtrMemUsageKind::OffsetBase(a_entries),
                             },
                             error: Some(AnalysisError(Diag::bug([
@@ -533,7 +564,7 @@ impl UsageMerger<'_> {
                 }
             }
         };
-        kind.map(|kind| QPtrMemUsage { max_size, kind })
+        kind.map(|kind| QPtrMemUsage { max_size, flags, kind })
     }
 
     /// Attempt to compute a `TypeLayout` for a given (SPIR-V) `Type`.
@@ -1104,6 +1135,7 @@ impl<'a> InferUsage<'a> {
                 &DataInstKind::QPtr(QPtrOp::BufferDynLen { fixed_base_size, dyn_unit_stride }) => {
                     let array_usage = QPtrMemUsage {
                         max_size: None,
+                        flags: QPtrMemUsageFlags::empty(),
                         kind: QPtrMemUsageKind::DynOffsetBase {
                             element: Rc::new(QPtrMemUsage::UNUSED),
                             stride: dyn_unit_stride,
@@ -1114,6 +1146,7 @@ impl<'a> InferUsage<'a> {
                     } else {
                         QPtrMemUsage {
                             max_size: None,
+                            flags: array_usage.flags.propagate_outwards(),
                             kind: QPtrMemUsageKind::OffsetBase(Rc::new(
                                 [(fixed_base_size, array_usage)].into(),
                             )),
@@ -1167,6 +1200,7 @@ impl<'a> InferUsage<'a> {
                                                 "Offset({offset}): size overflow ({offset}+{max_size})"
                                             ).into()]))
                                         })).transpose()?,
+                                    flags: usage.flags.propagate_outwards(),
                                     // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
                                     // to represent the one-element case, seems
                                     // quite wasteful when it's likely consumed.
@@ -1230,6 +1264,7 @@ impl<'a> InferUsage<'a> {
                                             })
                                         })
                                         .transpose()?,
+                                    flags: usage.flags.propagate_outwards(),
                                     kind: QPtrMemUsageKind::DynOffsetBase {
                                         element: Rc::new(usage),
                                         stride: *stride,
@@ -1284,6 +1319,7 @@ impl<'a> InferUsage<'a> {
                                 }
                                 TypeLayout::Concrete(concrete) => {
                                     let usage = QPtrMemUsage {
+                                        flags: QPtrMemUsageFlags::empty(),
                                         max_size: Some(concrete.mem_layout.fixed_base.size),
                                         kind: QPtrMemUsageKind::DirectAccess(access_type),
                                     };
@@ -1308,6 +1344,7 @@ impl<'a> InferUsage<'a> {
                                                     "{op_name} {{ offset: {offset} }}: size overflow ({offset}+{max_size})"
                                                 ).into()]))
                                             })).transpose()?,
+                                        flags: usage.flags.propagate_outwards(),
                                         // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
                                         // to represent the one-element case, seems
                                         // quite wasteful when it's likely consumed.
@@ -1317,6 +1354,32 @@ impl<'a> InferUsage<'a> {
                                     }))
                                 }
                             }),
+                    );
+                }
+                &DataInstKind::QPtr(QPtrOp::Copy { size }) => {
+                    let max_size = Some(size.get());
+                    // FIXME(eddyb) `QPtrMemUsageKind::Unused` might
+                    // make more sense data-structure wise, but it
+                    // risks potentially losing the `flags`.
+                    let kind = QPtrMemUsageKind::OffsetBase(Default::default());
+
+                    generate_usage(
+                        self,
+                        data_inst_def.inputs[0],
+                        Ok(QPtrUsage::Memory(QPtrMemUsage {
+                            max_size,
+                            flags: QPtrMemUsageFlags::COPY_DST,
+                            kind: kind.clone(),
+                        })),
+                    );
+                    generate_usage(
+                        self,
+                        data_inst_def.inputs[1],
+                        Ok(QPtrUsage::Memory(QPtrMemUsage {
+                            max_size,
+                            flags: QPtrMemUsageFlags::COPY_SRC,
+                            kind,
+                        })),
                     );
                 }
 
@@ -1365,6 +1428,7 @@ impl<'a> InferUsage<'a> {
                                             Ok(QPtrUsage::Memory(QPtrMemUsage {
                                                 max_size: (concrete.mem_layout.dyn_unit_stride.is_none())
                                                     .then_some(concrete.mem_layout.fixed_base.size),
+                                                flags: QPtrMemUsageFlags::empty(),
                                                 kind: QPtrMemUsageKind::StrictlyTyped(ty),
                                             }))
                                         }
