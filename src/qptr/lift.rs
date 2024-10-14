@@ -4,7 +4,9 @@
 use super::layout::*;
 
 use crate::func_at::{FuncAt, FuncAtMut};
-use crate::qptr::{QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage, shapes};
+use crate::qptr::{
+    QPtrAttr, QPtrMemUsage, QPtrMemUsageFlags, QPtrMemUsageKind, QPtrOp, QPtrUsage, shapes,
+};
 use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, ControlNode,
@@ -213,34 +215,62 @@ impl<'a> LiftToSpvPtrs<'a> {
                     }
                     QPtrMemUsageKind::OffsetBase(fields) => self.spv_op_type_struct(
                         fields.iter().map(|(&field_offset, field_usage)| {
-                            Ok((field_offset, self.pointee_type_for_mem_usage(field_usage)?))
+                            Ok((
+                                field_offset,
+                                self.pointee_type_for_mem_usage(field_usage, data_usage.flags)?,
+                            ))
                         }),
                         [attr_spv_decorate_block],
                     ),
                     QPtrMemUsageKind::StrictlyTyped(_)
                     | QPtrMemUsageKind::DirectAccess(_)
                     | QPtrMemUsageKind::DynOffsetBase { .. } => self.spv_op_type_struct(
-                        [Ok((0, self.pointee_type_for_mem_usage(data_usage)?))],
+                        [Ok((
+                            0,
+                            self.pointee_type_for_mem_usage(
+                                data_usage,
+                                QPtrMemUsageFlags::empty(),
+                            )?,
+                        ))],
                         [attr_spv_decorate_block],
                     ),
                 }
             }
-            QPtrUsage::Memory(usage) => self.pointee_type_for_mem_usage(usage),
+            QPtrUsage::Memory(usage) => {
+                self.pointee_type_for_mem_usage(usage, QPtrMemUsageFlags::empty())
+            }
         }
     }
 
-    fn pointee_type_for_mem_usage(&self, usage: &QPtrMemUsage) -> Result<Type, LiftError> {
+    fn pointee_type_for_mem_usage(
+        &self,
+        usage: &QPtrMemUsage,
+        outer_effective_flags: QPtrMemUsageFlags,
+    ) -> Result<Type, LiftError> {
+        // FIXME(eddyb) does this make sense across all flags?
+        let effective_flags = outer_effective_flags | usage.flags;
+
+        // TODO(eddyb) implement (or at least validate that there are no gaps).
+        if effective_flags.contains(QPtrMemUsageFlags::COPY_SRC_AND_DST) {
+            return Err(LiftError(Diag::bug([
+                "unimplemented `qptr.copy` src+dst (gap filling)".into()
+            ])));
+        }
+
         match &usage.kind {
             QPtrMemUsageKind::Unused => self.spv_op_type_struct([], []),
             &QPtrMemUsageKind::StrictlyTyped(ty) | &QPtrMemUsageKind::DirectAccess(ty) => Ok(ty),
             QPtrMemUsageKind::OffsetBase(fields) => self.spv_op_type_struct(
                 fields.iter().map(|(&field_offset, field_usage)| {
-                    Ok((field_offset, self.pointee_type_for_mem_usage(field_usage)?))
+                    Ok((
+                        field_offset,
+                        self.pointee_type_for_mem_usage(field_usage, effective_flags)?,
+                    ))
                 }),
                 [],
             ),
             QPtrMemUsageKind::DynOffsetBase { element, stride } => {
-                let element_type = self.pointee_type_for_mem_usage(element)?;
+                let element_type = self.pointee_type_for_mem_usage(element, effective_flags)?;
 
                 let fixed_len = usage
                     .max_size
@@ -637,6 +667,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                             .checked_mul(stride.get())
                             .unwrap_or(0)
                     }),
+                    flags: QPtrMemUsageFlags::empty(),
                     kind: QPtrMemUsageKind::DynOffsetBase {
                         // FIXME(eddyb) allocating `Rc` a bit wasteful here.
                         element: Rc::new(QPtrMemUsage::UNUSED),
@@ -738,6 +769,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     TypeLayout::Concrete(concrete) => QPtrUsage::Memory(QPtrMemUsage {
                         max_size: (concrete.mem_layout.dyn_unit_stride.is_none())
                             .then_some(concrete.mem_layout.fixed_base.size),
+                        flags: QPtrMemUsageFlags::empty(),
                         kind: QPtrMemUsageKind::DirectAccess(concrete.original_type),
                     }),
                 };
@@ -770,6 +802,21 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 });
                 data_inst_def.inputs[0] = adjusted_ptr;
 
+                data_inst_def
+            }
+            DataInstKind::QPtr(QPtrOp::Copy { size }) => {
+                let mut data_inst_def = data_inst_def.clone();
+                // TODO(eddyb) implement by expanding pointee leaves in `0..size`.
+                data_inst_def.form = cx.intern(DataInstFormDef {
+                    kind: DataInstKind::SpvInst(
+                        wk.OpCopyMemorySized.into(),
+                        spv::InstLowering::default(),
+                    ),
+                    output_types: data_inst_form_def.output_types.clone(),
+                });
+                data_inst_def
+                    .inputs
+                    .push(Value::Const(cx.intern(scalar::Const::from_u32(size.get()))));
                 data_inst_def
             }
 
@@ -815,6 +862,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                                 TypeLayout::Concrete(concrete) => QPtrUsage::Memory(QPtrMemUsage {
                                     max_size: (concrete.mem_layout.dyn_unit_stride.is_none())
                                         .then_some(concrete.mem_layout.fixed_base.size),
+                                    flags: QPtrMemUsageFlags::empty(),
                                     kind: QPtrMemUsageKind::StrictlyTyped(concrete.original_type),
                                 }),
                             };

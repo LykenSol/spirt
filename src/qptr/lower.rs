@@ -996,6 +996,38 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     ])));
                 }
             }
+        } else if spv_inst.opcode == wk.OpCopyMemorySized {
+            if disaggregated_output_or_inputs_during_lowering {
+                return Err(LowerError(Diag::bug([format!(
+                    "unexpected aggregate types in `{}`",
+                    spv_inst.opcode.name()
+                )
+                .into()])));
+            }
+
+            assert_eq!(data_inst_def.inputs.len(), 3);
+
+            let dst_ptr = data_inst_def.inputs[0];
+            let src_ptr = data_inst_def.inputs[1];
+            let size = match data_inst_def.inputs[2] {
+                Value::Const(size) => {
+                    size.as_scalar(cx).and_then(|size| size.int_as_u32()).ok_or_else(|| {
+                        LowerError(Diag::bug([
+                            "`OpCopyMemorySized` with constant, but non-`u32` size: ".into(),
+                            size.into(),
+                        ]))
+                    })?
+                }
+                // FIXME(eddyb) support dynamically sized copies.
+                _ => return Ok(Transformed::Unchanged),
+            };
+
+            // FIXME(eddyb) remove instruction if `size == 0`?
+            let size = NonZeroU32::new(size)
+                .ok_or_else(|| LowerError(Diag::bug(["`OpCopyMemorySized` of 0 bytes".into()])))?;
+
+            // FIXME(eddyb) do something similar for `OpCopyMemory` as well?
+            (QPtrOp::Copy { size }.into(), [dst_ptr, src_ptr].into_iter().collect())
         } else if spv_inst.opcode == wk.OpCopyMemory {
             if disaggregated_output_or_inputs_during_lowering {
                 return Err(LowerError(Diag::bug([format!(
@@ -1376,7 +1408,8 @@ impl Transformer for LowerFromSpvPtrInstsInFunc<'_> {
 
                                 QPtrOp::FuncLocalVar(_)
                                 | QPtrOp::Load { .. }
-                                | QPtrOp::Store { .. } => {}
+                                | QPtrOp::Store { .. }
+                                | QPtrOp::Copy { .. } => {}
                             }
 
                             if let QPtrOp::Offset(0) = op {

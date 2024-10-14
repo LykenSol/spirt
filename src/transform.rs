@@ -409,12 +409,13 @@ impl<T: InnerTransform> InnerTransform for Rc<T> {
 
 impl InnerTransform for QPtrMemUsage {
     fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
-        let Self { max_size, kind } = self;
+        let Self { max_size, flags, kind } = self;
 
         transform!({
             kind -> kind.inner_transform_with(transformer)
         } => Self {
             max_size: *max_size,
+            flags: *flags,
             kind,
         })
     }
@@ -794,7 +795,8 @@ impl InnerTransform for DataInstFormDef {
                 | QPtrOp::Offset(_)
                 | QPtrOp::DynOffset { .. }
                 | QPtrOp::Load { .. }
-                | QPtrOp::Store { .. }) => Transformed::Unchanged,
+                | QPtrOp::Store { .. }
+                | QPtrOp::Copy { .. }) => Transformed::Unchanged,
                 DataInstKind::SpvInst(spv_inst, lowering) => transform!({
                     lowering -> lowering.inner_transform_with(transformer)
                 } => DataInstKind::SpvInst(spv_inst.clone(), lowering)),
