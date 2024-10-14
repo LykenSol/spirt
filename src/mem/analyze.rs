@@ -3,7 +3,7 @@
 // TODO(eddyb) consider renaming this to `mem::typed`.
 
 use crate::func_at::FuncAt;
-use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp, shapes};
+use crate::mem::{DataHapp, DataHappFlags, DataHappKind, MemAccesses, MemAttr, MemOp, shapes};
 use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
@@ -166,6 +166,15 @@ impl AccessMerger<'_> {
         // HACK(eddyb) we require biased `a` vs `b` (see `merge_data` method above).
         assert_eq!(max_size, a.max_size);
 
+        let mut flags = a.flags;
+        flags |= if b_offset_in_a == 0 && max_size == b.max_size {
+            b.flags
+        } else {
+            // HACK(eddyb) assuming flags-preserving nesting of `b` into `a`,
+            // with `flags |= b.flags` later used if that stops being true.
+            b.flags.propagate_outwards()
+        };
+
         // Decompose the "smaller" and/or "less strict" side (`b`) first.
         match b.kind {
             // `Dead`s are always ignored.
@@ -176,9 +185,11 @@ impl AccessMerger<'_> {
                     // only an unused offset of `0` is a true noop, otherwise
                     // there is a dead `qptr.offset` instruction which still
                     // needs a field to reference.
-                    b_offset_in_a == 0
+                    b_offset_in_a == 0 && flags.contains(b.flags)
                 } =>
             {
+                let mut a = a;
+                a.flags = flags;
                 return MergeResult::ok(a);
             }
 
@@ -189,6 +200,9 @@ impl AccessMerger<'_> {
                     // required constant-folding of `qptr.offset` in `qptr::lift`,
                     // to not need all the type nesting levels for `OpAccessChain`.
                     b_offset_in_a == 0
+                    // HACK(eddyb) this second check also avoids flattening e.g.
+                    // a smaller copy from/to offset 0 of a larger variable.
+                    && flags.contains(b.flags)
                 } =>
             {
                 // FIXME(eddyb) this whole dance only needed due to `Rc`.
@@ -199,6 +213,7 @@ impl AccessMerger<'_> {
                 };
 
                 let mut ab = a;
+                ab.flags = flags;
                 let mut all_errors = None;
                 for (b_offset, b_sub_happ) in b_entries {
                     let MergeResult { merged, error: new_error } = self.merge_data_at(
@@ -239,12 +254,20 @@ impl AccessMerger<'_> {
 
         let kind = match a.kind {
             // `Dead`s are always ignored.
-            DataHappKind::Dead => MergeResult::ok(b.kind),
+            DataHappKind::Dead => {
+                // HACK(eddyb) in lieu of flags-preserving nesting of `b` into `a`.
+                flags |= b.flags;
+
+                MergeResult::ok(b.kind)
+            }
 
             // Typed leaves must support any possible accesses applied to them
             // (when they match, or overtake, that access, in size, like here),
             // with their inherent hierarchy (i.e. their array/struct nesting).
             DataHappKind::StrictlyTyped(a_type) | DataHappKind::Direct(a_type) => {
+                // HACK(eddyb) in lieu of flags-preserving nesting of `b` into `a`.
+                flags |= b.flags;
+
                 let b_type_at_offset_0 = match b.kind {
                     DataHappKind::StrictlyTyped(b_type) | DataHappKind::Direct(b_type)
                         if b_offset_in_a == 0 =>
@@ -348,6 +371,9 @@ impl AccessMerger<'_> {
                     })
                     .map(|()| DataHappKind::Repeated { element: a_element, stride: a_stride })
                 } else {
+                    // HACK(eddyb) in lieu of flags-preserving nesting of `b` into `a`.
+                    flags |= b.flags;
+
                     match b.kind {
                         DataHappKind::Repeated { element: b_element, stride: b_stride }
                             if b_offset_in_a_element == 0 && a_stride == b_stride =>
@@ -374,6 +400,7 @@ impl AccessMerger<'_> {
                             // HACK(eddyb) needed due to `a` being moved out of.
                             let a = DataHapp {
                                 max_size: a.max_size,
+                                flags: a.flags,
                                 kind: DataHappKind::Repeated {
                                     element: a_element,
                                     stride: a_stride,
@@ -461,10 +488,15 @@ impl AccessMerger<'_> {
                         // HACK(eddyb) needed due to `a` being moved out of.
                         let a = DataHapp {
                             max_size: a.max_size,
+                            flags: a.flags,
                             kind: DataHappKind::Disjoint(a_entries.clone()),
                         };
                         return MergeResult {
-                            merged: DataHapp { max_size, kind: DataHappKind::Disjoint(a_entries) },
+                            merged: DataHapp {
+                                max_size,
+                                flags,
+                                kind: DataHappKind::Disjoint(a_entries),
+                            },
                             error: Some(AnalysisError(Diag::bug([
                                 format!(
                                     "merge_data: unsupported straddling overlap \
@@ -525,7 +557,7 @@ impl AccessMerger<'_> {
                 }
             }
         };
-        kind.map(|kind| DataHapp { max_size, kind })
+        kind.map(|kind| DataHapp { max_size, flags, kind })
     }
 
     /// Attempt to compute a `TypeLayout` for a given (SPIR-V) `Type`.
@@ -1081,6 +1113,7 @@ impl<'a> GatherAccesses<'a> {
                 &DataInstKind::QPtr(QPtrOp::BufferDynLen { fixed_base_size, dyn_unit_stride }) => {
                     let array_happ = DataHapp {
                         max_size: None,
+                        flags: DataHappFlags::empty(),
                         kind: DataHappKind::Repeated {
                             element: Rc::new(DataHapp::DEAD),
                             stride: dyn_unit_stride,
@@ -1091,6 +1124,7 @@ impl<'a> GatherAccesses<'a> {
                     } else {
                         DataHapp {
                             max_size: None,
+                            flags: array_happ.flags.propagate_outwards(),
                             kind: DataHappKind::Disjoint(Rc::new(
                                 [(fixed_base_size, array_happ)].into(),
                             )),
@@ -1150,6 +1184,7 @@ impl<'a> GatherAccesses<'a> {
                                             })
                                         })
                                         .transpose()?,
+                                    flags: happ.flags.propagate_outwards(),
                                     // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
                                     // to represent the one-element case, seems
                                     // quite wasteful when it's likely consumed.
@@ -1215,6 +1250,7 @@ impl<'a> GatherAccesses<'a> {
                                             )
                                         })
                                         .transpose()?,
+                                    flags: happ.flags.propagate_outwards(),
                                     kind: DataHappKind::Repeated {
                                         element: Rc::new(happ),
                                         stride: *stride,
@@ -1274,6 +1310,7 @@ impl<'a> GatherAccesses<'a> {
                                 }
                                 TypeLayout::Concrete(concrete) => {
                                     let happ = DataHapp {
+                                        flags: DataHappFlags::empty(),
                                         max_size: Some(concrete.mem_layout.fixed_base.size),
                                         kind: DataHappKind::Direct(access_type),
                                     };
@@ -1309,6 +1346,7 @@ impl<'a> GatherAccesses<'a> {
                                                 })
                                             })
                                             .transpose()?,
+                                        flags: happ.flags.propagate_outwards(),
                                         // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
                                         // to represent the one-element case, seems
                                         // quite wasteful when it's likely consumed.
@@ -1318,6 +1356,32 @@ impl<'a> GatherAccesses<'a> {
                                     }))
                                 }
                             }),
+                    );
+                }
+                &DataInstKind::Mem(MemOp::Copy { size }) => {
+                    let max_size = Some(size.get());
+                    // FIXME(eddyb) `DataHappKind::Dead` might
+                    // make more sense data-structure wise, but it
+                    // risks potentially losing the `flags`.
+                    let kind = DataHappKind::Disjoint(Default::default());
+
+                    generate_accesses(
+                        self,
+                        data_inst_def.inputs[0],
+                        Ok(MemAccesses::Data(DataHapp {
+                            max_size,
+                            flags: DataHappFlags::COPY_DST,
+                            kind: kind.clone(),
+                        })),
+                    );
+                    generate_accesses(
+                        self,
+                        data_inst_def.inputs[1],
+                        Ok(MemAccesses::Data(DataHapp {
+                            max_size,
+                            flags: DataHappFlags::COPY_SRC,
+                            kind,
+                        })),
                     );
                 }
 
@@ -1373,6 +1437,7 @@ impl<'a> GatherAccesses<'a> {
                                                     .dyn_unit_stride
                                                     .is_none())
                                                 .then_some(concrete.mem_layout.fixed_base.size),
+                                                flags: DataHappFlags::empty(),
                                                 kind: DataHappKind::StrictlyTyped(ty),
                                             }))
                                         }
