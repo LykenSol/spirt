@@ -7,9 +7,9 @@ use super::{QPtrAttr, QPtrMemUsage, QPtrOp, QPtrUsage, shapes};
 use crate::func_at::FuncAt;
 use crate::visit::{InnerVisit, Visitor};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInst, DataInstKind,
-    DeclDef, Diag, ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind,
-    OrdAssertEq, Type, TypeKind, Value,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInstKind, DeclDef, Diag,
+    ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind, OrdAssertEq, Type,
+    TypeKind, Value,
 };
 use itertools::{Either, Itertools as _};
 use rustc_hash::FxHashMap;
@@ -799,18 +799,6 @@ impl<'a> InferUsage<'a> {
                                     &mut node_def.outputs[output_idx as usize].attrs
                                 }
                             }
-                            Value::DataInstOutput { inst, output_idx } => {
-                                let inst_def = func_def_body.at_mut(inst).def();
-
-                                // HACK(eddyb) `DataInstOutput { output_idx: !0, .. }`
-                                // may be used to attach errors to a whole `DataInst`.
-                                if output_idx == !0 {
-                                    assert!(usage.is_err());
-                                    &mut inst_def.attrs
-                                } else {
-                                    &mut inst_def.outputs[output_idx as usize].attrs
-                                }
-                            }
                         };
                         match usage {
                             Ok(usage) => {
@@ -875,7 +863,6 @@ impl<'a> InferUsage<'a> {
             }
         };
 
-        let mut data_inst_output_usages: FxHashMap<_, Option<_>> = FxHashMap::default();
         let mut node_to_per_output_usage: FxHashMap<_, SmallVec<[Option<_>; 2]>> =
             FxHashMap::default();
 
@@ -903,14 +890,7 @@ impl<'a> InferUsage<'a> {
                 }
             }
 
-            let mut generate_usage = |this: &mut Self,
-                                      usage_or_err_attrs_to_attach: &mut Vec<_>,
-                                      data_inst_output_usages: &mut FxHashMap<
-                DataInst,
-                Option<_>,
-            >,
-                                      ptr: Value,
-                                      new_usage| {
+            let mut generate_usage = |this: &mut Self, ptr: Value, new_usage| {
                 let slot = match ptr {
                     Value::Const(ct) => match cx[ct].kind {
                         ConstKind::PtrToGlobalVar(gv) => {
@@ -959,11 +939,6 @@ impl<'a> InferUsage<'a> {
                         }
                         &mut slots[i]
                     }
-                    Value::DataInstOutput { inst: ptr_inst, output_idx } => {
-                        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-                        assert_eq!(output_idx, 0);
-                        data_inst_output_usages.entry(ptr_inst).or_default()
-                    }
                 };
                 *slot = Some(match slot.take() {
                     Some(old) => old.and_then(|old| {
@@ -975,20 +950,8 @@ impl<'a> InferUsage<'a> {
                 });
             };
 
-            let block_insts = match &node_def.kind {
-                &NodeKind::Block { insts } => insts,
+            match &node_def.kind {
                 NodeKind::Select(_) => {
-                    // FIXME(eddyb) remove the need for a closure here when possible.
-                    let mut generate_usage = |this: &mut Self, ptr, new_usage| {
-                        generate_usage(
-                            this,
-                            &mut usage_or_err_attrs_to_attach,
-                            &mut data_inst_output_usages,
-                            ptr,
-                            new_usage,
-                        );
-                    };
-
                     for &case in &node_def.child_regions {
                         for (&per_case_output, usage) in
                             func_def_body.at(case).def().outputs.iter().zip(&per_output_usage)
@@ -1013,363 +976,357 @@ impl<'a> InferUsage<'a> {
                 DataInstKind::FuncCall(_)
                 | DataInstKind::QPtr(_)
                 | DataInstKind::SpvInst(_)
-                | DataInstKind::SpvExtInst { .. } => unreachable!(),
-            };
-            for func_at_inst in func_def_body.at(block_insts).into_iter().rev() {
-                let data_inst = func_at_inst.position;
-                let data_inst_def = func_at_inst.def();
-                let output_usage = data_inst_output_usages.remove(&data_inst).flatten();
+                | DataInstKind::SpvExtInst { .. } => {}
+            }
 
-                // FIXME(eddyb) remove the need for a closure here when possible.
-                let mut generate_usage = |this: &mut Self, ptr, new_usage| {
-                    generate_usage(
-                        this,
-                        &mut usage_or_err_attrs_to_attach,
-                        &mut data_inst_output_usages,
-                        ptr,
-                        new_usage,
-                    );
-                };
-                match &data_inst_def.kind {
-                    NodeKind::Block { .. }
-                    | NodeKind::Select(_)
-                    | NodeKind::Loop { .. }
-                    | NodeKind::ExitInvocation(_) => unreachable!(),
+            // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+            assert!(per_output_usage.len() <= 1);
+            let output_usage = per_output_usage.into_iter().next().flatten();
 
-                    &DataInstKind::FuncCall(callee) => {
-                        match self.infer_usage_in_func(module, callee) {
-                            FuncInferUsageState::Complete(callee_results) => {
-                                for (&arg, param_usage) in
-                                    data_inst_def.inputs.iter().zip(&callee_results.param_usages)
-                                {
-                                    if let Some(param_usage) = param_usage {
-                                        generate_usage(self, arg, param_usage.clone());
-                                    }
+            // FIXME(eddyb) merge with `match &node_def.kind` above.
+            let data_inst_def = node_def;
+            match &data_inst_def.kind {
+                NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
+                    unreachable!()
+                }
+
+                &DataInstKind::FuncCall(callee) => {
+                    match self.infer_usage_in_func(module, callee) {
+                        FuncInferUsageState::Complete(callee_results) => {
+                            for (&arg, param_usage) in
+                                data_inst_def.inputs.iter().zip(&callee_results.param_usages)
+                            {
+                                if let Some(param_usage) = param_usage {
+                                    generate_usage(self, arg, param_usage.clone());
                                 }
                             }
-                            FuncInferUsageState::InProgress => {
-                                usage_or_err_attrs_to_attach.push((
-                                    Value::DataInstOutput { inst: data_inst, output_idx: 0 },
-                                    Err(AnalysisError(Diag::bug([
-                                        "unsupported recursive call".into()
-                                    ]))),
-                                ));
-                            }
-                        };
-                        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
-                        if (data_inst_def.outputs.iter().at_most_one().ok().unwrap())
-                            .map_or(false, |o| is_qptr(o.ty))
-                        {
-                            if let Some(usage) = output_usage {
-                                usage_or_err_attrs_to_attach.push((
-                                    Value::DataInstOutput { inst: data_inst, output_idx: 0 },
-                                    usage,
-                                ));
-                            }
                         }
-                    }
-
-                    DataInstKind::QPtr(QPtrOp::FuncLocalVar(_)) => {
-                        if let Some(usage) = output_usage {
+                        FuncInferUsageState::InProgress => {
                             usage_or_err_attrs_to_attach.push((
-                                Value::DataInstOutput { inst: data_inst, output_idx: 0 },
-                                usage,
+                                Value::NodeOutput { node, output_idx: 0 },
+                                Err(AnalysisError(Diag::bug(
+                                    ["unsupported recursive call".into()],
+                                ))),
                             ));
                         }
-                    }
-                    DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
-                        generate_usage(
-                            self,
-                            data_inst_def.inputs[0],
-                            output_usage
-                                .unwrap_or_else(|| {
-                                    Err(AnalysisError(Diag::bug([
-                                        "HandleArrayIndex: unknown element".into(),
-                                    ])))
-                                })
-                                .and_then(|usage| match usage {
-                                    QPtrUsage::Handles(handle) => Ok(QPtrUsage::Handles(handle)),
-                                    QPtrUsage::Memory(_) => Err(AnalysisError(Diag::bug([
-                                        "HandleArrayIndex: cannot be used as Memory".into(),
-                                    ]))),
-                                }),
-                        );
-                    }
-                    DataInstKind::QPtr(QPtrOp::BufferData) => {
-                        generate_usage(
-                            self,
-                            data_inst_def.inputs[0],
-                            output_usage
-                                .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
-                                .and_then(|usage| {
-                                    let usage = match usage {
-                                        QPtrUsage::Handles(_) => {
-                                            return Err(AnalysisError(Diag::bug([
-                                                "BufferData: cannot be used as Handles".into(),
-                                            ])));
-                                        }
-                                        QPtrUsage::Memory(usage) => usage,
-                                    };
-                                    Ok(QPtrUsage::Handles(shapes::Handle::Buffer(
-                                        AddrSpace::Handles,
-                                        usage,
-                                    )))
-                                }),
-                        );
-                    }
-                    &DataInstKind::QPtr(QPtrOp::BufferDynLen {
-                        fixed_base_size,
-                        dyn_unit_stride,
-                    }) => {
-                        let array_usage = QPtrMemUsage {
-                            max_size: None,
-                            kind: QPtrMemUsageKind::DynOffsetBase {
-                                element: Rc::new(QPtrMemUsage::UNUSED),
-                                stride: dyn_unit_stride,
-                            },
-                        };
-                        let buf_data_usage = if fixed_base_size == 0 {
-                            array_usage
-                        } else {
-                            QPtrMemUsage {
-                                max_size: None,
-                                kind: QPtrMemUsageKind::OffsetBase(Rc::new(
-                                    [(fixed_base_size, array_usage)].into(),
-                                )),
-                            }
-                        };
-                        generate_usage(
-                            self,
-                            data_inst_def.inputs[0],
-                            Ok(QPtrUsage::Handles(shapes::Handle::Buffer(
-                                AddrSpace::Handles,
-                                buf_data_usage,
-                            ))),
-                        );
-                    }
-                    &DataInstKind::QPtr(QPtrOp::Offset(offset)) => {
-                        generate_usage(
-                            self,
-                            data_inst_def.inputs[0],
-                            output_usage
-                                .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
-                                .and_then(|usage| {
-                                    let usage = match usage {
-                                        QPtrUsage::Handles(_) => {
-                                            return Err(AnalysisError(Diag::bug([format!(
-                                                "Offset({offset}): cannot offset Handles"
-                                            ).into()])));
-                                        }
-                                        QPtrUsage::Memory(usage) => usage,
-                                    };
-                                    let offset = u32::try_from(offset).ok().ok_or_else(|| {
-                                        AnalysisError(Diag::bug([format!("Offset({offset}): negative offset").into()]))
-                                    })?;
-
-                                    // FIXME(eddyb) these should be normalized
-                                    // (e.g. constant-folded) out of existence,
-                                    // but while they exist, they should be noops.
-                                    if offset == 0 {
-                                        return Ok(QPtrUsage::Memory(usage));
-                                    }
-
-                                    Ok(QPtrUsage::Memory(QPtrMemUsage {
-                                        max_size: usage
-                                            .max_size
-                                            .map(|max_size| offset.checked_add(max_size).ok_or_else(|| {
-                                                AnalysisError(Diag::bug([format!("Offset({offset}): size overflow ({offset}+{max_size})").into()]))
-                                            })).transpose()?,
-                                        // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
-                                        // to represent the one-element case, seems
-                                        // quite wasteful when it's likely consumed.
-                                        kind: QPtrMemUsageKind::OffsetBase(Rc::new(
-                                            [(offset, usage)].into(),
-                                        )),
-                                    }))
-                                }),
-                        );
-                    }
-                    DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
-                        generate_usage(
-                            self,
-                            data_inst_def.inputs[0],
-                            output_usage
-                                .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
-                                .and_then(|usage| {
-                                    let usage = match usage {
-                                        QPtrUsage::Handles(_) => {
-                                            return Err(AnalysisError(Diag::bug(["DynOffset: cannot offset Handles".into()])));
-                                        }
-                                        QPtrUsage::Memory(usage) => usage,
-                                    };
-                                    match usage.max_size {
-                                        None => {
-                                            return Err(AnalysisError(Diag::bug(["DynOffset: unsized element".into()])));
-                                        }
-                                        // FIXME(eddyb) support this by "folding"
-                                        // the usage onto itself (i.e. applying
-                                        // `%= stride` on all offsets inside).
-                                        Some(max_size) if max_size > stride.get() => {
-                                            return Err(AnalysisError(Diag::bug(["DynOffset: element max_size exceeds stride".into()])));
-                                        }
-                                        Some(_) => {}
-                                    }
-                                    Ok(QPtrUsage::Memory(QPtrMemUsage {
-                                        // FIXME(eddyb) does the `None` case allow
-                                        // for negative offsets?
-                                        max_size: index_bounds
-                                            .as_ref()
-                                            .map(|index_bounds| {
-                                                if index_bounds.start < 0 || index_bounds.end < 0 {
-                                                    return Err(AnalysisError(
-                                                        Diag::bug([
-                                                            "DynOffset: potentially negative offset"
-                                                                .into(),
-                                                        ])
-                                                    ));
-                                                }
-                                                let index_bounds_end = u32::try_from(index_bounds.end).unwrap();
-                                                index_bounds_end.checked_mul(stride.get()).ok_or_else(|| {
-                                                     AnalysisError(Diag::bug([
-                                                        format!("DynOffset: size overflow ({index_bounds_end}*{stride})").into(),
-                                                    ]))
-                                                })
-                                            })
-                                            .transpose()?,
-                                        kind: QPtrMemUsageKind::DynOffsetBase {
-                                            element: Rc::new(usage),
-                                            stride: *stride,
-                                        },
-                                    }))
-                                }),
-                        );
-                    }
-                    DataInstKind::QPtr(op @ (QPtrOp::Load | QPtrOp::Store)) => {
-                        let (op_name, access_type) = match op {
-                            QPtrOp::Load => ("Load", data_inst_def.outputs[0].ty),
-                            QPtrOp::Store => {
-                                ("Store", func_at_inst.at(data_inst_def.inputs[1]).type_of(&cx))
-                            }
-                            _ => unreachable!(),
-                        };
-                        generate_usage(
-                            self,
-                            data_inst_def.inputs[0],
-                            self.layout_cache
-                                .layout_of(access_type)
-                                .map_err(|LayoutError(e)| AnalysisError(e))
-                                .and_then(|layout| match layout {
-                                    TypeLayout::Handle(shapes::Handle::Opaque(ty)) => {
-                                        Ok(QPtrUsage::Handles(shapes::Handle::Opaque(ty)))
-                                    }
-                                    TypeLayout::Handle(shapes::Handle::Buffer(..)) => {
-                                        Err(AnalysisError(Diag::bug([format!(
-                                            "{op_name}: cannot access whole Buffer"
-                                        )
-                                        .into()])))
-                                    }
-                                    TypeLayout::HandleArray(..) => {
-                                        Err(AnalysisError(Diag::bug([format!(
-                                            "{op_name}: cannot access whole HandleArray"
-                                        )
-                                        .into()])))
-                                    }
-                                    TypeLayout::Concrete(concrete)
-                                        if concrete.mem_layout.dyn_unit_stride.is_some() =>
-                                    {
-                                        Err(AnalysisError(Diag::bug([format!(
-                                            "{op_name}: cannot access unsized type"
-                                        )
-                                        .into()])))
-                                    }
-                                    TypeLayout::Concrete(concrete) => {
-                                        Ok(QPtrUsage::Memory(QPtrMemUsage {
-                                            max_size: Some(concrete.mem_layout.fixed_base.size),
-                                            kind: QPtrMemUsageKind::DirectAccess(access_type),
-                                        }))
-                                    }
-                                }),
-                        );
-                    }
-
-                    DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
-                        let mut has_from_spv_ptr_output_attr = false;
-                        for attr in &cx[data_inst_def.attrs].attrs {
-                            match *attr {
-                                Attr::QPtr(QPtrAttr::ToSpvPtrInput { input_idx, pointee }) => {
-                                    let ty = pointee.0;
-                                    generate_usage(
-                                        self,
-                                        data_inst_def.inputs[input_idx as usize],
-                                        self.layout_cache
-                                            .layout_of(ty)
-                                            .map_err(|LayoutError(e)| AnalysisError(e))
-                                            .and_then(|layout| match layout {
-                                                TypeLayout::Handle(handle) => {
-                                                    let handle = match handle {
-                                                        shapes::Handle::Opaque(ty) => {
-                                                            shapes::Handle::Opaque(ty)
-                                                        }
-                                                        // NOTE(eddyb) this error is important,
-                                                        // as the `Block` annotation on the
-                                                        // buffer type means the type is *not*
-                                                        // usable anywhere inside buffer data,
-                                                        // since it would conflict with our
-                                                        // own `Block`-annotated wrapper.
-                                                        shapes::Handle::Buffer(..) => {
-                                                            return Err(AnalysisError(Diag::bug(["ToSpvPtrInput: whole Buffer ambiguous (handle vs buffer data)".into()])
-                                                            ));
-                                                        }
-                                                    };
-                                                    Ok(QPtrUsage::Handles(handle))
-                                                }
-                                                // NOTE(eddyb) because we can't represent
-                                                // the original type, in the same way we
-                                                // use `QPtrMemUsageKind::StrictlyTyped`
-                                                // for non-handles, we can't guarantee
-                                                // a generated type that matches the
-                                                // desired `pointee` type.
-                                                TypeLayout::HandleArray(..) => {
-                                                    Err(AnalysisError(Diag::bug(["ToSpvPtrInput: whole handle array unrepresentable".into()])
-                                                    ))
-                                                }
-                                                TypeLayout::Concrete(concrete) => {
-                                                    Ok(QPtrUsage::Memory(QPtrMemUsage {
-                                                        max_size: if concrete
-                                                            .mem_layout
-                                                            .dyn_unit_stride
-                                                            .is_some()
-                                                        {
-                                                            None
-                                                        } else {
-                                                            Some(
-                                                                concrete.mem_layout.fixed_base.size,
-                                                            )
-                                                        },
-                                                        kind: QPtrMemUsageKind::StrictlyTyped(ty),
-                                                    }))
-                                                }
-                                            }),
-                                    );
-                                }
-                                Attr::QPtr(QPtrAttr::FromSpvPtrOutput {
-                                    addr_space: _,
-                                    pointee: _,
-                                }) => {
-                                    has_from_spv_ptr_output_attr = true;
-                                }
-                                _ => {}
-                            }
+                    };
+                    // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+                    if (data_inst_def.outputs.iter().at_most_one().ok().unwrap())
+                        .map_or(false, |o| is_qptr(o.ty))
+                    {
+                        if let Some(usage) = output_usage {
+                            usage_or_err_attrs_to_attach
+                                .push((Value::NodeOutput { node, output_idx: 0 }, usage));
                         }
+                    }
+                }
 
-                        if has_from_spv_ptr_output_attr {
-                            // FIXME(eddyb) merge with `FromSpvPtrOutput`'s `pointee`.
-                            if let Some(usage) = output_usage {
-                                usage_or_err_attrs_to_attach.push((
-                                    Value::DataInstOutput { inst: data_inst, output_idx: 0 },
+                DataInstKind::QPtr(QPtrOp::FuncLocalVar(_)) => {
+                    if let Some(usage) = output_usage {
+                        usage_or_err_attrs_to_attach
+                            .push((Value::NodeOutput { node, output_idx: 0 }, usage));
+                    }
+                }
+                DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
+                    generate_usage(
+                        self,
+                        data_inst_def.inputs[0],
+                        output_usage
+                            .unwrap_or_else(|| {
+                                Err(AnalysisError(Diag::bug([
+                                    "HandleArrayIndex: unknown element".into()
+                                ])))
+                            })
+                            .and_then(|usage| match usage {
+                                QPtrUsage::Handles(handle) => Ok(QPtrUsage::Handles(handle)),
+                                QPtrUsage::Memory(_) => Err(AnalysisError(Diag::bug([
+                                    "HandleArrayIndex: cannot be used as Memory".into(),
+                                ]))),
+                            }),
+                    );
+                }
+                DataInstKind::QPtr(QPtrOp::BufferData) => {
+                    generate_usage(
+                        self,
+                        data_inst_def.inputs[0],
+                        output_usage
+                            .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
+                            .and_then(|usage| {
+                                let usage = match usage {
+                                    QPtrUsage::Handles(_) => {
+                                        return Err(AnalysisError(Diag::bug([
+                                            "BufferData: cannot be used as Handles".into(),
+                                        ])));
+                                    }
+                                    QPtrUsage::Memory(usage) => usage,
+                                };
+                                Ok(QPtrUsage::Handles(shapes::Handle::Buffer(
+                                    AddrSpace::Handles,
                                     usage,
-                                ));
+                                )))
+                            }),
+                    );
+                }
+                &DataInstKind::QPtr(QPtrOp::BufferDynLen { fixed_base_size, dyn_unit_stride }) => {
+                    let array_usage = QPtrMemUsage {
+                        max_size: None,
+                        kind: QPtrMemUsageKind::DynOffsetBase {
+                            element: Rc::new(QPtrMemUsage::UNUSED),
+                            stride: dyn_unit_stride,
+                        },
+                    };
+                    let buf_data_usage = if fixed_base_size == 0 {
+                        array_usage
+                    } else {
+                        QPtrMemUsage {
+                            max_size: None,
+                            kind: QPtrMemUsageKind::OffsetBase(Rc::new(
+                                [(fixed_base_size, array_usage)].into(),
+                            )),
+                        }
+                    };
+                    generate_usage(
+                        self,
+                        data_inst_def.inputs[0],
+                        Ok(QPtrUsage::Handles(shapes::Handle::Buffer(
+                            AddrSpace::Handles,
+                            buf_data_usage,
+                        ))),
+                    );
+                }
+                &DataInstKind::QPtr(QPtrOp::Offset(offset)) => {
+                    generate_usage(
+                        self,
+                        data_inst_def.inputs[0],
+                        output_usage
+                            .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
+                            .and_then(|usage| {
+                                let usage = match usage {
+                                    QPtrUsage::Handles(_) => {
+                                        return Err(AnalysisError(Diag::bug([format!(
+                                            "Offset({offset}): cannot offset Handles"
+                                        )
+                                        .into()])));
+                                    }
+                                    QPtrUsage::Memory(usage) => usage,
+                                };
+                                let offset = u32::try_from(offset).ok().ok_or_else(|| {
+                                    AnalysisError(Diag::bug([format!(
+                                        "Offset({offset}): negative offset"
+                                    )
+                                    .into()]))
+                                })?;
+
+                                // FIXME(eddyb) these should be normalized
+                                // (e.g. constant-folded) out of existence,
+                                // but while they exist, they should be noops.
+                                if offset == 0 {
+                                    return Ok(QPtrUsage::Memory(usage));
+                                }
+
+                                Ok(QPtrUsage::Memory(QPtrMemUsage {
+                                    max_size: usage
+                                        .max_size
+                                        .map(|max_size| offset.checked_add(max_size).ok_or_else(|| {
+                                            AnalysisError(Diag::bug([format!(
+                                                "Offset({offset}): size overflow ({offset}+{max_size})"
+                                            ).into()]))
+                                        })).transpose()?,
+                                    // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
+                                    // to represent the one-element case, seems
+                                    // quite wasteful when it's likely consumed.
+                                    kind: QPtrMemUsageKind::OffsetBase(Rc::new(
+                                        [(offset, usage)].into(),
+                                    )),
+                                }))
+                            }),
+                    );
+                }
+                DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
+                    generate_usage(
+                        self,
+                        data_inst_def.inputs[0],
+                        output_usage
+                            .unwrap_or(Ok(QPtrUsage::Memory(QPtrMemUsage::UNUSED)))
+                            .and_then(|usage| {
+                                let usage = match usage {
+                                    QPtrUsage::Handles(_) => {
+                                        return Err(AnalysisError(Diag::bug([
+                                            "DynOffset: cannot offset Handles".into(),
+                                        ])));
+                                    }
+                                    QPtrUsage::Memory(usage) => usage,
+                                };
+                                match usage.max_size {
+                                    None => {
+                                        return Err(AnalysisError(Diag::bug([
+                                            "DynOffset: unsized element".into(),
+                                        ])));
+                                    }
+                                    // FIXME(eddyb) support this by "folding"
+                                    // the usage onto itself (i.e. applying
+                                    // `%= stride` on all offsets inside).
+                                    Some(max_size) if max_size > stride.get() => {
+                                        return Err(AnalysisError(Diag::bug([
+                                            "DynOffset: element max_size exceeds stride".into(),
+                                        ])));
+                                    }
+                                    Some(_) => {}
+                                }
+                                Ok(QPtrUsage::Memory(QPtrMemUsage {
+                                    // FIXME(eddyb) does the `None` case allow
+                                    // for negative offsets?
+                                    max_size: index_bounds
+                                        .as_ref()
+                                        .map(|index_bounds| {
+                                            if index_bounds.start < 0 || index_bounds.end < 0 {
+                                                return Err(AnalysisError(
+                                                    Diag::bug([
+                                                        "DynOffset: potentially negative offset".into(),
+                                                    ])
+                                                ));
+                                            }
+                                            let index_bounds_end = u32::try_from(index_bounds.end).unwrap();
+                                            index_bounds_end.checked_mul(stride.get()).ok_or_else(|| {
+                                                AnalysisError(Diag::bug([format!(
+                                                    "DynOffset: size overflow ({index_bounds_end}*{stride})"
+                                                ).into()]))
+                                            })
+                                        })
+                                        .transpose()?,
+                                    kind: QPtrMemUsageKind::DynOffsetBase {
+                                        element: Rc::new(usage),
+                                        stride: *stride,
+                                    },
+                                }))
+                            }),
+                        );
+                }
+                DataInstKind::QPtr(op @ (QPtrOp::Load | QPtrOp::Store)) => {
+                    let (op_name, access_type) = match op {
+                        QPtrOp::Load => ("Load", data_inst_def.outputs[0].ty),
+                        QPtrOp::Store => {
+                            ("Store", func_def_body.at(data_inst_def.inputs[1]).type_of(&cx))
+                        }
+                        _ => unreachable!(),
+                    };
+                    generate_usage(
+                        self,
+                        data_inst_def.inputs[0],
+                        self.layout_cache
+                            .layout_of(access_type)
+                            .map_err(|LayoutError(e)| AnalysisError(e))
+                            .and_then(|layout| match layout {
+                                TypeLayout::Handle(shapes::Handle::Opaque(ty)) => {
+                                    Ok(QPtrUsage::Handles(shapes::Handle::Opaque(ty)))
+                                }
+                                TypeLayout::Handle(shapes::Handle::Buffer(..)) => {
+                                    Err(AnalysisError(Diag::bug([format!(
+                                        "{op_name}: cannot access whole Buffer"
+                                    )
+                                    .into()])))
+                                }
+                                TypeLayout::HandleArray(..) => {
+                                    Err(AnalysisError(Diag::bug([format!(
+                                        "{op_name}: cannot access whole HandleArray"
+                                    )
+                                    .into()])))
+                                }
+                                TypeLayout::Concrete(concrete)
+                                    if concrete.mem_layout.dyn_unit_stride.is_some() =>
+                                {
+                                    Err(AnalysisError(Diag::bug([format!(
+                                        "{op_name}: cannot access unsized type"
+                                    )
+                                    .into()])))
+                                }
+                                TypeLayout::Concrete(concrete) => {
+                                    Ok(QPtrUsage::Memory(QPtrMemUsage {
+                                        max_size: Some(concrete.mem_layout.fixed_base.size),
+                                        kind: QPtrMemUsageKind::DirectAccess(access_type),
+                                    }))
+                                }
+                            }),
+                    );
+                }
+
+                DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
+                    let mut has_from_spv_ptr_output_attr = false;
+                    for attr in &cx[data_inst_def.attrs].attrs {
+                        match *attr {
+                            Attr::QPtr(QPtrAttr::ToSpvPtrInput { input_idx, pointee }) => {
+                                let ty = pointee.0;
+                                generate_usage(
+                                    self,
+                                    data_inst_def.inputs[input_idx as usize],
+                                    self.layout_cache
+                                        .layout_of(ty)
+                                        .map_err(|LayoutError(e)| AnalysisError(e))
+                                        .and_then(|layout| match layout {
+                                            TypeLayout::Handle(handle) => {
+                                                let handle = match handle {
+                                                    shapes::Handle::Opaque(ty) => {
+                                                        shapes::Handle::Opaque(ty)
+                                                    }
+                                                    // NOTE(eddyb) this error is important,
+                                                    // as the `Block` annotation on the
+                                                    // buffer type means the type is *not*
+                                                    // usable anywhere inside buffer data,
+                                                    // since it would conflict with our
+                                                    // own `Block`-annotated wrapper.
+                                                    shapes::Handle::Buffer(..) => {
+                                                        return Err(AnalysisError(Diag::bug([
+                                                            "ToSpvPtrInput: whole Buffer ambiguous (handle vs buffer data)".into(),
+                                                        ])));
+                                                    }
+                                                };
+                                                Ok(QPtrUsage::Handles(handle))
+                                            }
+                                            // NOTE(eddyb) because we can't represent
+                                            // the original type, in the same way we
+                                            // use `QPtrMemUsageKind::StrictlyTyped`
+                                            // for non-handles, we can't guarantee
+                                            // a generated type that matches the
+                                            // desired `pointee` type.
+                                            TypeLayout::HandleArray(..) => {
+                                                Err(AnalysisError(Diag::bug([
+                                                    "ToSpvPtrInput: whole handle array unrepresentable".into(),
+                                                ])))
+                                            }
+                                            TypeLayout::Concrete(concrete) => {
+                                                Ok(QPtrUsage::Memory(QPtrMemUsage {
+                                                    max_size: if concrete
+                                                        .mem_layout
+                                                        .dyn_unit_stride
+                                                        .is_some()
+                                                    {
+                                                        None
+                                                    } else {
+                                                        Some(
+                                                            concrete.mem_layout.fixed_base.size,
+                                                        )
+                                                    },
+                                                    kind: QPtrMemUsageKind::StrictlyTyped(ty),
+                                                }))
+                                            }
+                                        }),
+                                );
                             }
+                            Attr::QPtr(QPtrAttr::FromSpvPtrOutput {
+                                addr_space: _,
+                                pointee: _,
+                            }) => {
+                                has_from_spv_ptr_output_attr = true;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if has_from_spv_ptr_output_attr {
+                        // FIXME(eddyb) merge with `FromSpvPtrOutput`'s `pointee`.
+                        if let Some(usage) = output_usage {
+                            usage_or_err_attrs_to_attach
+                                .push((Value::NodeOutput { node, output_idx: 0 }, usage));
                         }
                     }
                 }
