@@ -966,7 +966,7 @@ impl<'a> InferUsage<'a> {
 
             let block_insts = match &node_def.kind {
                 &NodeKind::Block { insts } => insts,
-                NodeKind::Select { kind: _, scrutinee: _, cases } => {
+                NodeKind::Select { kind: _, cases } => {
                     // FIXME(eddyb) remove the need for a closure here when possible.
                     let mut generate_usage = |this: &mut Self, ptr, new_usage| {
                         generate_usage(
