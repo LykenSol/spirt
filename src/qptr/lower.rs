@@ -8,9 +8,10 @@ use crate::qptr::{QPtrAttr, QPtrOp, shapes};
 use crate::transform::{InnerInPlaceTransform, Transformed, Transformer};
 use crate::{
     AddrSpace, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst, DataInstDef,
-    DataInstKind, Diag, FuncDecl, GlobalVarDecl, Node, NodeKind, OrdAssertEq, Type, TypeKind,
-    TypeOrConst, Value, spv,
+    DataInstKind, Diag, FuncDecl, GlobalVarDecl, Node, NodeKind, NodeOutputDecl, OrdAssertEq, Type,
+    TypeKind, TypeOrConst, Value, spv,
 };
+use itertools::Itertools as _;
 use smallvec::SmallVec;
 use std::cell::Cell;
 use std::num::NonZeroU32;
@@ -396,17 +397,19 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         let func = func_at_data_inst_frozen.at(());
 
         let mut attrs = data_inst_def.attrs;
-        let output_type = data_inst_def.output_type;
 
         let spv_inst = match &data_inst_def.kind {
             DataInstKind::SpvInst(spv_inst) => spv_inst,
             _ => return Ok(Transformed::Unchanged),
         };
 
+        // FIXME(eddyb) wasteful clone? (needed due to borrowing issues)
+        let outputs = data_inst_def.outputs.clone();
+
         let replacement_kind_and_inputs = if spv_inst.opcode == wk.OpVariable {
             assert!(data_inst_def.inputs.len() <= 1);
             let (_, var_data_type) =
-                self.lowerer.as_spv_ptr_type(output_type.unwrap()).ok_or_else(|| {
+                self.lowerer.as_spv_ptr_type(outputs[0].ty).ok_or_else(|| {
                     LowerError(Diag::bug(["output type not an `OpTypePointer`".into()]))
                 })?;
             match self.lowerer.layout_of(var_data_type)? {
@@ -538,7 +541,13 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                         attrs: Default::default(),
                         kind,
                         inputs,
-                        output_type: Some(self.lowerer.qptr_type()),
+                        child_regions: [].into_iter().collect(),
+                        outputs: [NodeOutputDecl {
+                            attrs: Default::default(),
+                            ty: self.lowerer.qptr_type(),
+                        }]
+                        .into_iter()
+                        .collect(),
                     }
                     .into(),
                 );
@@ -557,14 +566,14 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     _ => unreachable!(),
                 }
 
-                ptr = Value::DataInstOutput(step_data_inst);
+                ptr = Value::DataInstOutput { inst: step_data_inst, output_idx: 0 };
             }
             final_step.into_data_inst_kind_and_inputs(ptr)
         } else if spv_inst.opcode == wk.OpBitcast {
             let input = data_inst_def.inputs[0];
             // Pointer-to-pointer casts are noops on `qptr`.
             if self.lowerer.as_spv_ptr_type(func.at(input).type_of(cx)).is_some()
-                && self.lowerer.as_spv_ptr_type(output_type.unwrap()).is_some()
+                && self.lowerer.as_spv_ptr_type(outputs[0].ty).is_some()
             {
                 // HACK(eddyb) noop cases should not use any `DataInst`s at all,
                 // but that would require the ability to replace all uses of a `Value`.
@@ -587,7 +596,8 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             attrs,
             kind: new_kind,
             inputs: new_inputs,
-            output_type,
+            child_regions: [].into_iter().collect(),
+            outputs,
         }))
     }
 
@@ -625,8 +635,9 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 );
             }
         }
-        if let Some(output_type) = data_inst_def.output_type {
-            if let Some((addr_space, pointee)) = self.lowerer.as_spv_ptr_type(output_type) {
+        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+        if let Some(output) = data_inst_def.outputs.iter().at_most_one().ok().unwrap() {
+            if let Some((addr_space, pointee)) = self.lowerer.as_spv_ptr_type(output.ty) {
                 old_and_new_attrs.get_or_insert_with(get_old_attrs).attrs.insert(
                     QPtrAttr::FromSpvPtrOutput {
                         addr_space: OrdAssertEq(addr_space),

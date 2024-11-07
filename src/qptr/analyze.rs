@@ -11,7 +11,7 @@ use crate::{
     DeclDef, Diag, ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind,
     OrdAssertEq, Type, TypeKind, Value,
 };
-use itertools::Either;
+use itertools::{Either, Itertools as _};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::mem;
@@ -799,8 +799,17 @@ impl<'a> InferUsage<'a> {
                                     &mut node_def.outputs[output_idx as usize].attrs
                                 }
                             }
-                            Value::DataInstOutput(data_inst) => {
-                                &mut func_def_body.at_mut(data_inst).def().attrs
+                            Value::DataInstOutput { inst, output_idx } => {
+                                let inst_def = func_def_body.at_mut(inst).def();
+
+                                // HACK(eddyb) `DataInstOutput { output_idx: !0, .. }`
+                                // may be used to attach errors to a whole `DataInst`.
+                                if output_idx == !0 {
+                                    assert!(usage.is_err());
+                                    &mut inst_def.attrs
+                                } else {
+                                    &mut inst_def.outputs[output_idx as usize].attrs
+                                }
                             }
                         };
                         match usage {
@@ -950,7 +959,9 @@ impl<'a> InferUsage<'a> {
                         }
                         &mut slots[i]
                     }
-                    Value::DataInstOutput(ptr_inst) => {
+                    Value::DataInstOutput { inst: ptr_inst, output_idx } => {
+                        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+                        assert_eq!(output_idx, 0);
                         data_inst_output_usages.entry(ptr_inst).or_default()
                     }
                 };
@@ -1028,25 +1039,32 @@ impl<'a> InferUsage<'a> {
                             }
                             FuncInferUsageState::InProgress => {
                                 usage_or_err_attrs_to_attach.push((
-                                    Value::DataInstOutput(data_inst),
+                                    Value::DataInstOutput { inst: data_inst, output_idx: 0 },
                                     Err(AnalysisError(Diag::bug([
                                         "unsupported recursive call".into()
                                     ]))),
                                 ));
                             }
                         };
-                        if data_inst_def.output_type.map_or(false, is_qptr) {
+                        // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
+                        if (data_inst_def.outputs.iter().at_most_one().ok().unwrap())
+                            .map_or(false, |o| is_qptr(o.ty))
+                        {
                             if let Some(usage) = output_usage {
-                                usage_or_err_attrs_to_attach
-                                    .push((Value::DataInstOutput(data_inst), usage));
+                                usage_or_err_attrs_to_attach.push((
+                                    Value::DataInstOutput { inst: data_inst, output_idx: 0 },
+                                    usage,
+                                ));
                             }
                         }
                     }
 
                     DataInstKind::QPtr(QPtrOp::FuncLocalVar(_)) => {
                         if let Some(usage) = output_usage {
-                            usage_or_err_attrs_to_attach
-                                .push((Value::DataInstOutput(data_inst), usage));
+                            usage_or_err_attrs_to_attach.push((
+                                Value::DataInstOutput { inst: data_inst, output_idx: 0 },
+                                usage,
+                            ));
                         }
                     }
                     DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
@@ -1218,7 +1236,7 @@ impl<'a> InferUsage<'a> {
                     }
                     DataInstKind::QPtr(op @ (QPtrOp::Load | QPtrOp::Store)) => {
                         let (op_name, access_type) = match op {
-                            QPtrOp::Load => ("Load", data_inst_def.output_type.unwrap()),
+                            QPtrOp::Load => ("Load", data_inst_def.outputs[0].ty),
                             QPtrOp::Store => {
                                 ("Store", func_at_inst.at(data_inst_def.inputs[1]).type_of(&cx))
                             }
@@ -1337,8 +1355,10 @@ impl<'a> InferUsage<'a> {
                         if has_from_spv_ptr_output_attr {
                             // FIXME(eddyb) merge with `FromSpvPtrOutput`'s `pointee`.
                             if let Some(usage) = output_usage {
-                                usage_or_err_attrs_to_attach
-                                    .push((Value::DataInstOutput(data_inst), usage));
+                                usage_or_err_attrs_to_attach.push((
+                                    Value::DataInstOutput { inst: data_inst, output_idx: 0 },
+                                    usage,
+                                ));
                             }
                         }
                     }
