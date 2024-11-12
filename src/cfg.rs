@@ -1312,8 +1312,9 @@ impl<'a> Structurizer<'a> {
                     // FIXME(eddyb) could it be possible to synthesize attrs
                     // from `ControlInst`s' attrs and/or `OpLoopMerge`'s?
                     attrs: AttrSet::default(),
+                    kind: NodeKind::Loop { repeat_condition },
                     inputs: initial_inputs,
-                    kind: NodeKind::Loop { body, repeat_condition },
+                    child_regions: [body].into_iter().collect(),
                     outputs: [].into_iter().collect(),
                 }
                 .into(),
@@ -1468,8 +1469,9 @@ impl<'a> Structurizer<'a> {
                         self.cx,
                         NodeDef {
                             attrs,
-                            inputs,
                             kind: NodeKind::ExitInvocation(kind),
+                            inputs,
+                            child_regions: [].into_iter().collect(),
                             outputs: [].into_iter().collect(),
                         }
                         .into(),
@@ -1777,8 +1779,9 @@ impl<'a> Structurizer<'a> {
                     this.cx,
                     NodeDef {
                         attrs,
+                        kind: NodeKind::Select(kind),
                         inputs: [scrutinee].into_iter().collect(),
-                        kind: NodeKind::Select { kind, cases },
+                        child_regions: cases,
                         outputs: [].into_iter().collect(),
                     }
                     .into(),
@@ -1946,10 +1949,8 @@ impl<'a> Structurizer<'a> {
                     for (case_idx, v) in per_case_target_input.enumerate() {
                         let v = v.unwrap_or_else(|| Value::Const(self.const_undef(ty)));
 
-                        let case_region = match &self.func_def_body.at(select_node).def().kind {
-                            NodeKind::Select { cases, .. } => cases[case_idx],
-                            _ => unreachable!(),
-                        };
+                        let case_region =
+                            self.func_def_body.at(select_node).def().child_regions[case_idx];
                         let outputs = &mut self.func_def_body.at_mut(case_region).def().outputs;
                         assert_eq!(outputs.len(), output_idx);
                         outputs.push(v);
@@ -2052,11 +2053,11 @@ impl<'a> Structurizer<'a> {
                     .map(|cond| self.materialize_lazy_cond(cond))
                     .collect();
 
-                let NodeDef { attrs: _, inputs, kind, outputs: output_decls } =
+                let NodeDef { attrs: _, kind, inputs, child_regions, outputs: output_decls } =
                     &mut *self.func_def_body.nodes[node];
                 let cases = match kind {
-                    NodeKind::Select { kind, cases } => {
-                        assert_eq!(cases.len(), per_case_conds.len());
+                    NodeKind::Select(kind) => {
+                        assert_eq!(child_regions.len(), per_case_conds.len());
 
                         if let SelectionKind::BoolCond = kind {
                             let cond = inputs[0];
@@ -2074,7 +2075,7 @@ impl<'a> Structurizer<'a> {
                             }
                         }
 
-                        cases
+                        child_regions
                     }
                     _ => unreachable!(),
                 };
