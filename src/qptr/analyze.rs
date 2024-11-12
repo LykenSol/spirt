@@ -966,7 +966,7 @@ impl<'a> InferUsage<'a> {
 
             let block_insts = match &node_def.kind {
                 &NodeKind::Block { insts } => insts,
-                NodeKind::Select { kind: _, cases } => {
+                NodeKind::Select(_) => {
                     // FIXME(eddyb) remove the need for a closure here when possible.
                     let mut generate_usage = |this: &mut Self, ptr, new_usage| {
                         generate_usage(
@@ -978,7 +978,7 @@ impl<'a> InferUsage<'a> {
                         );
                     };
 
-                    for &case in cases {
+                    for &case in &node_def.child_regions {
                         for (&per_case_output, usage) in
                             func_def_body.at(case).def().outputs.iter().zip(&per_output_usage)
                         {
