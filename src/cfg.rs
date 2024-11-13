@@ -68,7 +68,7 @@ pub enum ControlInstKind {
     SelectBranch(SelectionKind),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum ExitInvocationKind {
     SpvInst(spv::Inst),
 }
