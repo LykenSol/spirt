@@ -1009,6 +1009,11 @@ impl<'a> InferUsage<'a> {
                     continue;
                 }
                 NodeKind::ExitInvocation { .. } => continue,
+
+                DataInstKind::FuncCall(_)
+                | DataInstKind::QPtr(_)
+                | DataInstKind::SpvInst(_)
+                | DataInstKind::SpvExtInst { .. } => unreachable!(),
             };
             for func_at_inst in func_def_body.at(block_insts).into_iter().rev() {
                 let data_inst = func_at_inst.position;
@@ -1026,6 +1031,11 @@ impl<'a> InferUsage<'a> {
                     );
                 };
                 match &data_inst_def.kind {
+                    NodeKind::Block { .. }
+                    | NodeKind::Select(_)
+                    | NodeKind::Loop { .. }
+                    | NodeKind::ExitInvocation(_) => unreachable!(),
+
                     &DataInstKind::FuncCall(callee) => {
                         match self.infer_usage_in_func(module, callee) {
                             FuncInferUsageState::Complete(callee_results) => {

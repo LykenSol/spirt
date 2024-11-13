@@ -3,12 +3,11 @@
 use crate::func_at::FuncAtMut;
 use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInst, DataInstDef,
-    DataInstKind, DbgSrcLoc, DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
-    FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
-    ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region,
-    RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
-    spv,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInst, DataInstKind,
+    DbgSrcLoc, DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody,
+    FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
+    ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region, RegionDef,
+    RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg, spv,
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -634,9 +633,24 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
                     transformer.in_place_transform_data_inst_def(func_at_inst);
                 }
             }
+
+            DataInstKind::FuncCall(func) => transformer.transform_func_use(*func).apply_to(func),
+
             NodeKind::Select(SelectionKind::BoolCond | SelectionKind::SpvInst(_))
             | NodeKind::Loop { repeat_condition: _ }
-            | NodeKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(_)) => {}
+            | NodeKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(_))
+            | DataInstKind::QPtr(
+                QPtrOp::FuncLocalVar(_)
+                | QPtrOp::HandleArrayIndex
+                | QPtrOp::BufferData
+                | QPtrOp::BufferDynLen { .. }
+                | QPtrOp::Offset(_)
+                | QPtrOp::DynOffset { .. }
+                | QPtrOp::Load
+                | QPtrOp::Store,
+            )
+            | DataInstKind::SpvInst(_)
+            | DataInstKind::SpvExtInst { .. } => {}
         }
 
         for v in &mut self.reborrow().def().inputs {
@@ -673,41 +687,6 @@ impl InnerTransform for NodeOutputDecl {
             attrs,
             ty,
         })
-    }
-}
-
-impl InnerInPlaceTransform for FuncAtMut<'_, DataInst> {
-    fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let DataInstDef { attrs, kind, inputs, child_regions, outputs } = self.reborrow().def();
-
-        transformer.transform_attr_set_use(*attrs).apply_to(attrs);
-        kind.inner_in_place_transform_with(transformer);
-        for v in inputs {
-            transformer.transform_value_use(v).apply_to(v);
-        }
-        assert_eq!(child_regions.len(), 0);
-        for output in outputs {
-            output.inner_transform_with(transformer).apply_to(output);
-        }
-    }
-}
-
-impl InnerInPlaceTransform for DataInstKind {
-    fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        match self {
-            DataInstKind::FuncCall(func) => transformer.transform_func_use(*func).apply_to(func),
-            DataInstKind::QPtr(op) => match op {
-                QPtrOp::FuncLocalVar(_)
-                | QPtrOp::HandleArrayIndex
-                | QPtrOp::BufferData
-                | QPtrOp::BufferDynLen { .. }
-                | QPtrOp::Offset(_)
-                | QPtrOp::DynOffset { .. }
-                | QPtrOp::Load
-                | QPtrOp::Store => {}
-            },
-            DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
-        }
     }
 }
 
