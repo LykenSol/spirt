@@ -1,4 +1,7 @@
-//! [`QPtr`](crate::TypeKind::QPtr) lifting (e.g. to SPIR-V).
+//! [`QPtr`](crate::TypeKind::QPtr) lifting to typed memory (e.g. to SPIR-V).
+//
+// FIXME(eddyb) the `legalize`-vs-`analyze`+`lift` split can be confusing,
+// and may need more than documentation (but for now, see `qptr::legalize` docs).
 
 // HACK(eddyb) sharing layout code with other modules.
 use super::layout::*;

@@ -15,6 +15,7 @@ use std::rc::Rc;
 pub mod analyze;
 pub mod const_data;
 mod layout;
+pub mod legalize;
 pub mod lift;
 pub mod lower;
 pub mod shapes;
