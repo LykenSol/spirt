@@ -58,28 +58,62 @@ use crate::func_at::{FuncAt, FuncAtMut};
 use crate::transform::{InnerInPlaceTransform as _, Transformed, Transformer};
 use crate::visit::Visitor;
 use crate::{
-    AttrSet, Const, ConstKind, Context, DeclDef, Diag, EntityOrientedDenseMap, Func, FuncDefBody,
-    FxIndexMap, FxIndexSet, GlobalVar, Module, Node, NodeDef, NodeKind, NodeOutputDecl, Region,
-    RegionInputDecl, Type, TypeKind, Value, cfg, scalar, spv,
+    AttrSet, Const, ConstDef, ConstKind, Context, DeclDef, Diag, EntityOrientedDenseMap, Func,
+    FuncDefBody, FxIndexMap, FxIndexSet, GlobalVar, Module, Node, NodeDef, NodeKind,
+    NodeOutputDecl, Region, RegionInputDecl, Type, TypeKind, Value, cfg, scalar, spv,
 };
 use itertools::{Either, EitherOrBoth, Itertools};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::num::{NonZeroI32, NonZeroU32, NonZeroU64};
 use std::rc::Rc;
 use std::{iter, mem};
 
+// FIXME(eddyb) move this into some common utilities (or even obsolete its need).
+#[derive(Default)]
+struct ParentMap {
+    node_parent: EntityOrientedDenseMap<Node, Region>,
+    region_parent: EntityOrientedDenseMap<Region, Node>,
+}
+
+impl ParentMap {
+    fn new(func_def_body: &FuncDefBody) -> Self {
+        let mut parent_map = Self::default();
+
+        // FIXME(eddyb) adopt this style of queue-based visiting in more places.
+        let mut queue = VecDeque::new();
+        queue.push_back(func_def_body.body);
+        while let Some(region) = queue.pop_front() {
+            for func_at_node in func_def_body.at(region).at_children() {
+                parent_map.node_parent.insert(func_at_node.position, region);
+                for &child_region in &func_at_node.def().child_regions {
+                    parent_map.region_parent.insert(child_region, func_at_node.position);
+                    queue.push_back(child_region);
+                }
+            }
+        }
+
+        parent_map
+    }
+}
+
 pub struct LegalizePtrs {
     cx: Rc<Context>,
     wk: &'static spv::spec::WellKnown,
+
+    cached_qptr_type: Cell<Option<Type>>,
+    cached_null_qptr_const: Cell<Option<Const>>,
 }
 
 impl LegalizePtrs {
     pub fn new(cx: Rc<Context>) -> Self {
         Self { cx, wk: &spv::spec::Spec::get().well_known }
     }
+
+    // TODO(eddyb) also handle `GlobalVar` initializers!
     pub fn legalize_all_funcs(
         &self,
         module: &mut Module,
@@ -97,7 +131,7 @@ impl LegalizePtrs {
 
             uses_escaped_ptrs: bool,
 
-            // HACK(eddyb) `base_maps.per_func[_].loop_body_input_base_set_and_offset_shape`
+            // HACK(eddyb) `base_maps.per_func[_].loop_body_input_base_choices_and_offset_shape`
             // is only fully finalized late due to needing to handle escaped cases.
             loop_body_inputs_using_escaped_ptrs: Vec<((Region, u32), (AnyEscapedBase, Offset<()>))>,
         }
@@ -136,6 +170,9 @@ impl LegalizePtrs {
                     loop_body_inputs_using_escaped_ptrs: vec![],
                 };
 
+                // TODO(eddyb) skip canonicalization on functions where scanning
+                // resulted in an empty `summarized_ptrs`!
+
                 // FIXME(eddyb) move this into a separate method, maybe even a
                 // new type that's a whole-module `Scanner`?
                 for (ptr, PtrSummary { bases, offset_shape }) in summarized_ptrs {
@@ -143,10 +180,10 @@ impl LegalizePtrs {
                     if let Some(AnyEscapedBase) = any_escaped {
                         results.uses_escaped_ptrs = true;
 
-                        // Account for this pointer needing `BaseSet::Many` once
+                        // Account for this pointer needing `BaseChoice::Dyn` once
                         // escaped bases are also included.
-                        if let Some(&BaseSet::One(base)) = bases.as_ref().left() {
-                            func_base_map.bases.insert(base);
+                        if let Some(&BaseChoice::Fixed(base)) = bases.as_ref().left() {
+                            func_base_map.dyn_choice_bases.insert(base);
                         }
                     }
 
@@ -156,7 +193,7 @@ impl LegalizePtrs {
                     if results.parent_map.region_parent.get(region).is_none() {
                         continue;
                     }
-                    func_base_map.loop_body_input_base_set_and_offset_shape.extend(
+                    func_base_map.loop_body_input_base_choices_and_offset_shape.extend(
                         bases.left().map(|bases| ((region, input_idx), (bases, offset_shape))),
                     );
                     results.loop_body_inputs_using_escaped_ptrs.extend(
@@ -170,13 +207,20 @@ impl LegalizePtrs {
             }
         }
 
-        // After scanning all functions, `base_maps.escaped` should be complete,
-        // and can be added back to all functions that need it.
         if let Some((AnyEscapedBase, offset_shape)) = write_back_escaped_ptr_offset_shape {
             for escaped_offset_shape in base_maps.escaped.bases.values_mut() {
                 escaped_offset_shape.merge_in_place(offset_shape);
             }
         }
+
+        // FIXME(eddyb) is this step really necessary?
+        let mut any_escaped_offset_shape = Offset::Zero;
+        for &escaped_offset_shape in base_maps.escaped.bases.values() {
+            any_escaped_offset_shape.merge_in_place(escaped_offset_shape);
+        }
+
+        // After scanning all functions, `base_maps.escaped` should be complete,
+        // and can be added back to all functions that need it.
         for func in funcs.clone() {
             let Some(FuncScanResults {
                 parent_map: _,
@@ -192,39 +236,54 @@ impl LegalizePtrs {
                 continue;
             }
 
+            // TODO(eddyb) track `qptr.load`s of pointers (from `summarized_ptrs`),
+            // and generate replacement integer loads+`switch`es for each of them,
+            // so that it looks just like any other pointer-outputting `Select` node,
+            // by the time it... well, I guess it could also be done on-demand,
+            // then transformed as normal (esp. since it doesn't require rewrites).
+
             let escaped_bases = base_maps.escaped.bases.keys().copied().map(Base::Global);
             let func_base_map = &mut base_maps.per_func[func];
-            func_base_map.bases.extend(escaped_bases.clone());
-            let base_to_base_idx = |base| func_base_map.bases.get_index_of(&base).unwrap();
+            func_base_map.dyn_choice_bases.extend(escaped_bases.clone());
+            let base_to_base_idx =
+                |base| func_base_map.dyn_choice_bases.get_index_of(&base).unwrap();
 
             if loop_body_inputs_using_escaped_ptrs.is_empty() || escaped_bases.len() == 0 {
                 continue;
             }
 
-            // Precompute a `BaseSet` that already includes all escaped bases,
-            // to cheaply combine with each loop body input's own `BaseSet`.
-            let escaped_base_set = escaped_bases
-                .map(BaseSet::One)
+            // Precompute a `BaseChoice` that already includes all escaped bases,
+            // to cheaply combine with each loop body input's own `BaseChoice`.
+            let escaped_base_choices = escaped_bases
+                .map(BaseChoice::Fixed)
                 .reduce(|a, b| a.merge(b, base_to_base_idx))
                 .unwrap();
-            for (loop_body_input, (AnyEscapedBase, offset_shape)) in
+            for (loop_body_input, (AnyEscapedBase, mut offset_shape)) in
                 loop_body_inputs_using_escaped_ptrs.drain(..)
             {
+                // FIXME(eddyb) is this step really necessary?
+                offset_shape.merge_in_place(any_escaped_offset_shape);
+
                 func_base_map
-                    .loop_body_input_base_set_and_offset_shape
+                    .loop_body_input_base_choices_and_offset_shape
                     .entry(loop_body_input)
-                    .and_modify(|(base_set, merged_offset_shape)| {
+                    .and_modify(|(base_choices, merged_offset_shape)| {
                         // HACK(eddyb) stealing the existing set using a placeholder.
                         // FIXME(eddyb) ideally this could avoid cloning.
-                        *base_set = mem::replace(base_set, BaseSet::Many {
+                        *base_choices = mem::replace(base_choices, BaseChoice::Dyn {
                             base_index_bitset: SmallVec::new(),
+                            base_index_selector: (),
                         })
-                        .merge(escaped_base_set.clone(), base_to_base_idx);
+                        .merge(escaped_base_choices.clone(), base_to_base_idx);
                         merged_offset_shape.merge_in_place(offset_shape);
                     })
-                    .or_insert_with(|| (escaped_base_set.clone(), offset_shape));
+                    .or_insert_with(|| (escaped_base_choices.clone(), offset_shape));
             }
         }
+
+        // TODO(eddyb) in theory, everything in `base_maps.per_func` could be
+        // attached as attributes on the function/loop body inputs/etc.
+
         for func in funcs {
             if let DeclDef::Present(func_def_body) = &mut module.funcs[func].def {
                 let FuncScanResults {
@@ -236,13 +295,85 @@ impl LegalizePtrs {
 
                 let func_base_map = &base_maps.per_func[func];
 
+                // FIXME(eddyb) consider fusing local variables that show up in
+                // `func_base_map.bases` into one big single variable, to reduce
+                // the need for control-flow (using `summarized_ptrs` would allow
+                // grouping them together for more granularity).
+
                 CanonicalizePtrsInFunc {
                     legalizer: self,
                     parent_map: &mut parent_map,
+                    canonicalized_ptrs: FxHashMap::default(),
                     value_replacements: FxHashMap::default(),
                 }
                 .in_place_transform_region_def(func_def_body.at_mut_body());
             }
+        }
+    }
+
+    /// Get the (likely cached) `QPtr` type.
+    fn qptr_type(&self) -> Type {
+        if let Some(cached) = self.cached_qptr_type.get() {
+            return cached;
+        }
+        let ty = self.cx.intern(TypeKind::QPtr);
+        self.cached_qptr_type.set(Some(ty));
+        ty
+    }
+
+    fn null_qptr_const(&self) -> Const {
+        if let Some(cached) = self.cached_null_qptr_const.get() {
+            return cached;
+        }
+        let ct = self.cx.intern(ConstDef {
+            attrs: Default::default(),
+            ty: self.qptr_type(),
+            // FIXME(eddyb) maybe `qptr` should
+            // have its own null constant?
+            kind: ConstKind::SpvInst {
+                spv_inst_and_const_inputs: Rc::new((
+                    self.wk.OpConstantNull.into(),
+                    [].into_iter().collect(),
+                )),
+            },
+        });
+        self.cached_null_qptr_const.set(Some(ct));
+        ct
+    }
+
+    fn ptr_as_base(&self, func_at_ptr: FuncAt<'_, Value>) -> Option<Base> {
+        match func_at_ptr.position {
+            // FIXME(eddyb) implement more constant address pointers.
+            Value::Const(ct) => match &self.cx[ct].kind {
+                ConstKind::PtrToGlobalVar(_) => Some(GlobalBase::GlobalVar { ptr_to_var: ct }),
+                ConstKind::SpvInst { spv_inst_and_const_inputs } => {
+                    let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
+                    (spv_inst.opcode == self.wk.OpConstantNull && const_inputs.is_empty())
+                        .then_some(GlobalBase::Null)
+                }
+                _ => None,
+            }
+            .map(Base::Global),
+
+            Value::NodeOutput { node, output_idx: 0 } => {
+                let node_def = func_at_ptr.at(node).def();
+                match node_def.kind {
+                    NodeKind::QPtr(QPtrOp::FuncLocalVar(_)) => Some(Base::FuncLocalVar(node)),
+                    // FIXME(eddyb) implement.
+                    NodeKind::QPtr(QPtrOp::HandleArrayIndex) => None,
+                    NodeKind::QPtr(QPtrOp::BufferData) => match node_def.inputs[..] {
+                        [Value::Const(ct)]
+                            if matches!(self.cx[ct].kind, ConstKind::PtrToGlobalVar(_)) =>
+                        {
+                            Some(Base::Global(GlobalBase::BufferData { ptr_to_buffer: ct }))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+
+            _ => None,
         }
     }
 }
@@ -273,6 +404,7 @@ enum Base {
     // FIXME(eddyb) support `OpImageTexelPointer` and any other exotic pointers.
 }
 
+// FIXME(eddyb) this type doesn't do very much by itself.
 #[derive(Default)]
 struct BaseMaps {
     per_func: EntityOrientedDenseMap<Func, FuncLocalBaseMap>,
@@ -300,9 +432,8 @@ struct EscapedBaseMap {
 
 #[derive(Default)]
 struct FuncLocalBaseMap {
-    // NOTE(eddyb) `bases` doesn't automatically include `BaseSet::One` entries,
-    // *unless* they happen to get merged into a `BaseSet::Many`.
-    bases: FxIndexSet<Base>,
+    /// All possible bases that `BaseChoice::Dyn` can refer to.
+    dyn_choice_bases: FxIndexSet<Base>,
 
     /// Loop body inputs (of pointer type) are the only case where we can't rely
     /// on having legalized a definition before all of its uses, as one of the
@@ -310,8 +441,194 @@ struct FuncLocalBaseMap {
     /// which themselves can depend on previous body inputs, and this relationship
     /// forms a fixpoint-style construct that can only be handled separately.
     //
-    // FIXME(eddyb) surely `(BaseSet, Offset<_>)` should be its own type?
-    loop_body_input_base_set_and_offset_shape: FxIndexMap<(Region, u32), (BaseSet, Offset<()>)>,
+    // FIXME(eddyb) surely `(BaseChoice<_>, Offset<_>)` should be its own type?
+    loop_body_input_base_choices_and_offset_shape:
+        FxIndexMap<(Region, u32), (BaseChoice<()>, Offset<()>)>,
+}
+
+/// Non-empty set of `Base`s, carrying all dynamic information necessary to pick
+/// one specific base when multiple are possible (i.e. `BaseChoice::Dyn`), and
+/// also generic over the value type `V`, so that e.g. `BaseChoice<()>` can be
+/// used to e.g. abstractly track which bases a pointer *may* be using.
+//
+// FIXME(eddyb) support `HandleArrayIndex` as well, somehow.
+#[derive(Clone)]
+enum BaseChoice<V> {
+    Fixed(Base),
+    Dyn {
+        /// Ad-hoc bitset, with each bit index corresponding to the `Base` at
+        /// the same index in `FuncLocalBaseMap`'s `dyn_choice_bases` set.
+        //
+        // FIXME(eddyb) this may be a performance hazard above 64 bases.
+        // FIXME(eddyb) consider `Rc` for the non-small case.
+        base_index_bitset: SmallVec<[u64; 1]>,
+
+        /// Dynamic integer value (of type `u32`) choosing a base index, from
+        /// any in `base_index_bitset` (other values cause undefined behavior).
+        base_index_selector: V,
+    },
+}
+
+// FIXME(eddyb) generalize this.
+impl BaseChoice<()> {
+    fn insert(&mut self, base: Base, mut base_to_base_idx: impl FnMut(Base) -> usize) {
+        let prev_base = match self {
+            &mut BaseChoice::Fixed(prev_base) => {
+                if prev_base == base {
+                    return;
+                }
+                *self =
+                    BaseChoice::Dyn { base_index_bitset: SmallVec::new(), base_index_selector: () };
+                Some(prev_base)
+            }
+            BaseChoice::Dyn { .. } => None,
+        };
+        let BaseChoice::Dyn { base_index_bitset: chunks, base_index_selector: () } = self else {
+            unreachable!();
+        };
+        for base in prev_base.into_iter().chain([base]) {
+            let i = base_to_base_idx(base);
+            let (chunk_idx, bit_mask) = (i / 64, 1 << (i % 64));
+            if chunk_idx >= chunks.len() {
+                chunks.resize(chunk_idx + 1, 0);
+            }
+            chunks[chunk_idx] |= bit_mask;
+        }
+    }
+
+    fn merge(self, other: Self, base_to_base_idx: impl FnMut(Base) -> usize) -> Self {
+        match (self, other) {
+            (BaseChoice::Fixed(base), set) | (set, BaseChoice::Fixed(base)) => {
+                let mut merged = set;
+                merged.insert(base, base_to_base_idx);
+                merged
+            }
+
+            (
+                BaseChoice::Dyn { base_index_bitset: a, base_index_selector: () },
+                BaseChoice::Dyn { base_index_bitset: b, base_index_selector: () },
+            ) => {
+                let (mut dst, src) = if a.len() > b.len() { (a, b) } else { (b, a) };
+                for (dst, src) in dst.iter_mut().zip(src) {
+                    *dst |= src;
+                }
+                BaseChoice::Dyn { base_index_bitset: dst, base_index_selector: () }
+            }
+        }
+    }
+}
+
+/// A pointer offset (relative to some `Base`), generic over the value type `V`,
+/// so that e.g. `Offset<()>` can be used as an "offset shape".
+//
+// FIXME(eddyb) does this need a better name?
+// FIXME(eddyb) support constant offsets and/or track offset ranges as well.
+// FIXME(eddyb) should this be moved further up? (feels too chaotic)
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
+enum Offset<V> {
+    #[default]
+    Zero,
+
+    /// When applied to some pointer `ptr`, equivalent to
+    /// `QPtrOp::DynOffset { stride }` with `[ptr, index]` as inputs.
+    //
+    // FIXME(eddyb) track index bounds and/or a fixed offset, as well?
+    // FIXME(eddyb) does this need a better name? (`Dyn` is kind of overused).
+    Dyn { stride: NonZeroU32, index: V },
+}
+
+// HACK(eddyb) helper for `Offset::merge`.
+#[derive(Copy, Clone)]
+struct Scaled<V> {
+    value: V,
+    multiplier: NonZeroU32,
+}
+
+impl<V> Scaled<V> {
+    fn map_value<V2>(self, f: impl FnOnce(V) -> V2) -> Scaled<V2> {
+        let Scaled { value, multiplier } = self;
+        Scaled { value: f(value), multiplier }
+    }
+}
+
+impl<V> Offset<V> {
+    fn map_value<V2>(self, f: impl FnOnce(V) -> V2) -> Offset<V2> {
+        match self {
+            Offset::Zero => Offset::Zero,
+            Offset::Dyn { stride, index } => Offset::Dyn { stride, index: f(index) },
+        }
+    }
+
+    /// Merge `Offset`s, resolving stride conflicts between two `Offset::Dyn`s
+    /// (with strides `a` vs `b`) by computing a "common stride" `c` such that
+    /// `a` and `b` are multiples of `c`, which could be satisfied by the GCD
+    /// (greatest common divisor) of `a` and `b`, but the approach taken here
+    /// is to use the greatest common *power of two* divisor instead, which is
+    /// both cheaper to compute, and more likely to end up being (related to)
+    /// the smallest unit of access *anyway*.
+    fn merge<V2, V3>(
+        self,
+        other: Offset<V2>,
+        map_self: impl FnOnce(V) -> V3,
+        map_other: impl FnOnce(V2) -> V3,
+        merge_both: impl FnOnce(Scaled<V>, Scaled<V2>) -> V3,
+    ) -> Offset<V3> {
+        match (self, other) {
+            (Offset::Zero, Offset::Zero) => Offset::Zero,
+            (Offset::Dyn { stride, index }, Offset::Zero) => {
+                Offset::Dyn { stride, index: map_self(index) }
+            }
+            (Offset::Zero, Offset::Dyn { stride, index }) => {
+                Offset::Dyn { stride, index: map_other(index) }
+            }
+            (
+                Offset::Dyn { stride: a_stride, index: a_index },
+                Offset::Dyn { stride: b_stride, index: b_index },
+            ) => {
+                let stride = if a_stride == b_stride {
+                    a_stride
+                } else {
+                    NonZeroU32::new(1 << a_stride.trailing_zeros().min(b_stride.trailing_zeros()))
+                        .unwrap()
+                };
+                let multiplier_from = |orig_stride: NonZeroU32| {
+                    assert_eq!(orig_stride.get() % stride.get(), 0);
+                    NonZeroU32::new(orig_stride.get() / stride.get()).unwrap()
+                };
+                Offset::Dyn {
+                    stride,
+                    index: merge_both(
+                        Scaled { value: a_index, multiplier: multiplier_from(a_stride) },
+                        Scaled { value: b_index, multiplier: multiplier_from(b_stride) },
+                    ),
+                }
+            }
+        }
+    }
+}
+
+impl Offset<()> {
+    fn merge_in_place(&mut self, other: Self) {
+        *self = self.merge(other, |()| (), |()| (), |_, _| ());
+    }
+}
+
+impl<V> Offset<Option<V>> {
+    fn transpose_value(self) -> Option<Offset<V>> {
+        match self {
+            Offset::Zero => Some(Offset::Zero),
+            Offset::Dyn { stride, index } => Some(Offset::Dyn { stride, index: index? }),
+        }
+    }
+}
+
+impl<V, E> Offset<Result<V, E>> {
+    fn transpose_value(self) -> Result<Offset<V>, E> {
+        match self {
+            Offset::Zero => Ok(Offset::Zero),
+            Offset::Dyn { stride, index } => Ok(Offset::Dyn { stride, index: index? }),
+        }
+    }
 }
 
 struct ScanBasesInFunc<'a> {
@@ -327,13 +644,13 @@ struct ScanBasesInFunc<'a> {
     /// tracked here.
     write_back_escaped_ptr_offset_shape: Option<(AnyEscapedBase, Offset<()>)>,
 
-    // FIXME(eddyb) how expensive is this cache? (esp. wrt `BaseSet`)
+    // FIXME(eddyb) how expensive is this cache? (esp. wrt `BaseChoice`)
     // HACK(eddyb) this technically replicates part of `cyclotron::bruteforce`,
     // but without the fixpoint saturation (going for a more any-way traversal).
     // FIXME(eddyb) it's a shame this information gets thrown out and recomputed
     // later, but aspects like `AnyEscapedBase` would require a lot of patching.
     // HACK(eddyb) this is iterable because it's also used to generate all
-    // of `loop_body_input_base_set_and_offset_shape` after the fact, since
+    // of `loop_body_input_base_choices_and_offset_shape` after the fact, since
     // the case of *only* having `AnyEscapedBase` is not directly representable,
     // and more generally this allows detecting when this function is using any
     // escaped pointers at all (which requires including all escaped `bases`).
@@ -350,7 +667,7 @@ struct AnyEscapedBase;
 
 #[derive(Clone)]
 struct PtrSummary {
-    bases: EitherOrBoth<BaseSet, UnknownBases>,
+    bases: EitherOrBoth<BaseChoice<()>, UnknownBases>,
     offset_shape: Offset<()>,
 }
 
@@ -391,8 +708,8 @@ struct UnsupportedBases {
 }
 
 impl ScanBasesInFunc<'_> {
-    // HACK(eddyb) mutable access to the function is only for diagnostics and
-
+    // HACK(eddyb) mutable access to the function is only for attaching `Diag`s
+    // and the (artificial) `scan_ptr` vs `summarize_ptr` distinction.
     fn scan_func(&mut self, func_def_body: &mut FuncDefBody) {
         let cx = &self.legalizer.cx;
 
@@ -438,6 +755,8 @@ impl ScanBasesInFunc<'_> {
                             &mut func_def_body.regions[region].inputs[input_idx as usize].attrs
                         }
                         Value::NodeOutput { node, output_idx } => {
+                            // FIXME(eddyb) consider attaching diagnostics to
+                            // the entire `node`, in some cases.
                             &mut func_def_body.nodes[node].outputs[output_idx as usize].attrs
                         }
                     };
@@ -508,7 +827,6 @@ impl ScanBasesInFunc<'_> {
                 }
             }
 
-            // TODO(eddyb) implement
             NodeKind::QPtr(QPtrOp::Load { .. }) => {
                 if is_qptr(node_def.outputs[0].ty) {
                     self.scan_ptr(func_at_node.at(Value::NodeOutput { node, output_idx: 0 }));
@@ -533,9 +851,9 @@ impl ScanBasesInFunc<'_> {
                         assert!(loop_body_input_deps.is_empty());
                     }
                     let bases = bases.left().into_iter().flat_map(|bases| match bases {
-                        BaseSet::One(bases) => Either::Left([bases].into_iter()),
-                        BaseSet::Many { base_index_bitset } => Either::Right(
-                            // FIXME(eddyb) move this into a `BaseSet` method
+                        BaseChoice::Fixed(bases) => Either::Left([bases].into_iter()),
+                        BaseChoice::Dyn { base_index_bitset, .. } => Either::Right(
+                            // FIXME(eddyb) move this into a `BaseChoice` method
                             // (or really it should be using a `SmallBitSet`).
                             base_index_bitset
                                 .into_iter()
@@ -557,7 +875,7 @@ impl ScanBasesInFunc<'_> {
                                         r
                                     })
                                 })
-                                .map(|base_idx| self.func_base_map.bases[base_idx]),
+                                .map(|base_idx| self.func_base_map.dyn_choice_bases[base_idx]),
                         ),
                     });
                     for base in bases {
@@ -672,8 +990,12 @@ impl ScanBasesInFunc<'_> {
     }
 
     fn summarize_ptr_uncached(&mut self, func_at_ptr: FuncAt<'_, Value>) -> PtrSummary {
-        let cx = &self.legalizer.cx;
-        let wk = self.legalizer.wk;
+        if let Some(base) = self.legalizer.ptr_as_base(func_at_ptr) {
+            return PtrSummary {
+                bases: EitherOrBoth::Left(BaseChoice::Fixed(base)),
+                offset_shape: Offset::Zero,
+            };
+        }
 
         let ptr = func_at_ptr.position;
         let func = func_at_ptr.at(());
@@ -687,10 +1009,6 @@ impl ScanBasesInFunc<'_> {
             }),
             offset_shape: Offset::Zero,
         };
-        let simple_base = |base| PtrSummary {
-            bases: EitherOrBoth::Left(BaseSet::One(base)),
-            offset_shape: Offset::Zero,
-        };
         let apply_offset =
             |PtrSummary { bases, offset_shape }, new_offset: Offset<()>| PtrSummary {
                 bases,
@@ -698,23 +1016,9 @@ impl ScanBasesInFunc<'_> {
             };
 
         let (node, output_idx) = match ptr {
-            // FIXME(eddyb) implement more constant address pointers.
-            Value::Const(ct) => {
-                let ct_def = &cx[ct];
-                match &ct_def.kind {
-                    ConstKind::PtrToGlobalVar(_) => {
-                        return simple_base(Base::Global(GlobalBase::GlobalVar { ptr_to_var: ct }));
-                    }
-                    ConstKind::SpvInst { spv_inst_and_const_inputs } => {
-                        let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
-                        if spv_inst.opcode == wk.OpConstantNull && const_inputs.is_empty() {
-                            return simple_base(Base::Global(GlobalBase::Null));
-                        }
-                    }
-                    _ => {}
-                }
-                return unsupported();
-            }
+            // FIXME(eddyb) implement more constant address pointers, either
+            // here or in `ptr_as_base`.
+            Value::Const(_) => return unsupported(),
 
             Value::NodeOutput { node, output_idx } => (node, output_idx),
 
@@ -815,20 +1119,12 @@ impl ScanBasesInFunc<'_> {
             NodeKind::QPtr(op) => {
                 assert_eq!(output_idx, 0);
                 match *op {
-                    QPtrOp::FuncLocalVar(_) => {
-                        assert_eq!(output_idx, 0);
-                        simple_base(Base::FuncLocalVar(node))
+                    QPtrOp::FuncLocalVar(_) | QPtrOp::BufferData => {
+                        // Supported cases handled by `ptr_as_base`.
+                        unsupported()
                     }
-                    // FIXME(eddyb) implement.
+                    // FIXME(eddyb) implement, either here or in `ptr_as_base`.
                     QPtrOp::HandleArrayIndex => unsupported(),
-                    QPtrOp::BufferData => match node_def.inputs[..] {
-                        [Value::Const(ct)]
-                            if matches!(cx[ct].kind, ConstKind::PtrToGlobalVar(_)) =>
-                        {
-                            simple_base(Base::Global(GlobalBase::BufferData { ptr_to_buffer: ct }))
-                        }
-                        _ => unsupported(),
-                    },
                     // FIXME(eddyb) should the (Dyn)Offset handling be centralized?
                     QPtrOp::Offset(offset) => apply_offset(
                         self.summarize_ptr(func.at(node_def.inputs[0])),
@@ -883,7 +1179,9 @@ impl ScanBasesInFunc<'_> {
         }
 
         let bases = maybe_either_or_both(a_bases, b_bases).map(|ab| {
-            ab.reduce(|a, b| a.merge(b, |base| self.func_base_map.bases.insert_full(base).0))
+            ab.reduce(|a, b| {
+                a.merge(b, |base| self.func_base_map.dyn_choice_bases.insert_full(base).0)
+            })
         });
 
         let unknowns = maybe_either_or_both(a_unknowns, b_unknowns).map(|ab| {
@@ -940,459 +1238,476 @@ impl ScanBasesInFunc<'_> {
     }
 }
 
-// FIXME(eddyb) move this into some common utilities (or even obsolete its need).
-#[derive(Default)]
-struct ParentMap {
-    node_parent: EntityOrientedDenseMap<Node, Region>,
-    region_parent: EntityOrientedDenseMap<Region, Node>,
-}
-
-impl ParentMap {
-    fn new(func_def_body: &FuncDefBody) -> Self {
-        let mut parent_map = Self::default();
-
-        // FIXME(eddyb) adopt this style of queue-based visiting in more places.
-        let mut queue = VecDeque::new();
-        queue.push_back(func_def_body.body);
-        while let Some(region) = queue.pop_front() {
-            for func_at_node in func_def_body.at(region).at_children() {
-                parent_map.node_parent.insert(func_at_node.position, region);
-                for &child_region in &func_at_node.def().child_regions {
-                    parent_map.region_parent.insert(child_region, func_at_node.position);
-                    queue.push_back(child_region);
-                }
-            }
-        }
-
-        parent_map
-    }
-}
-
-/// Non-empty set of `Base`s, for tracking which bases a pointer may be using.
-#[derive(Clone)]
-enum BaseSet {
-    One(Base),
-    Many {
-        /// Ad-hoc bitset, with each bit index corresponding to the `Base` at
-        /// the same index in the function's `FuncLocalBaseMap` `bases` set.
-        //
-        // FIXME(eddyb) this may be a performance hazard above 64 bases.
-        // FIXME(eddyb) consider `Rc` for the non-small case.
-        base_index_bitset: SmallVec<[u64; 1]>,
-    },
-}
-
-impl BaseSet {
-    fn insert(&mut self, base: Base, mut base_to_base_idx: impl FnMut(Base) -> usize) {
-        let prev_base = match self {
-            &mut BaseSet::One(prev_base) => {
-                if prev_base == base {
-                    return;
-                }
-                *self = BaseSet::Many { base_index_bitset: SmallVec::new() };
-                Some(prev_base)
-            }
-            BaseSet::Many { .. } => None,
-        };
-        let BaseSet::Many { base_index_bitset: chunks } = self else {
-            unreachable!();
-        };
-        for base in prev_base.into_iter().chain([base]) {
-            let i = base_to_base_idx(base);
-            let (chunk_idx, bit_mask) = (i / 64, 1 << (i % 64));
-            if chunk_idx >= chunks.len() {
-                chunks.resize(chunk_idx + 1, 0);
-            }
-            chunks[chunk_idx] |= bit_mask;
-        }
-    }
-
-    fn merge(self, other: BaseSet, base_to_base_idx: impl FnMut(Base) -> usize) -> BaseSet {
-        match (self, other) {
-            (BaseSet::One(base), set) | (set, BaseSet::One(base)) => {
-                let mut merged = set;
-                merged.insert(base, base_to_base_idx);
-                merged
-            }
-
-            (BaseSet::Many { base_index_bitset: a }, BaseSet::Many { base_index_bitset: b }) => {
-                let (mut dst, src) = if a.len() > b.len() { (a, b) } else { (b, a) };
-                for (dst, src) in dst.iter_mut().zip(src) {
-                    *dst |= src;
-                }
-                BaseSet::Many { base_index_bitset: dst }
-            }
-        }
-    }
-}
-
-/// A pointer offset (relative to a `Base`), generic over the value type `V`,
-/// so that e.g. `Offset<()>` can be used as an "offset shape".
-//
-// FIXME(eddyb) does this need a better name?
-// FIXME(eddyb) support constant offsets and/or track offset ranges as well.
-// FIXME(eddyb) should this be moved further up? (feels too chaotic)
-#[derive(Copy, Clone, Default, PartialEq, Eq)]
-enum Offset<V> {
-    #[default]
-    Zero,
-
-    /// When applied to some pointer `ptr`, equivalent to
-    /// `QPtrOp::DynOffset { stride }` with `[ptr, index]` as inputs.
-    //
-    // FIXME(eddyb) track index bounds and/or a fixed offset, as well?
-    Dyn { stride: NonZeroU32, index: V },
-}
-
-// HACK(eddyb) helper for `Offset::merge`.
-#[derive(Copy, Clone)]
-struct Scaled<V> {
-    value: V,
-    multiplier: NonZeroU32,
-}
-
-impl<V> Offset<V> {
-    fn map_value<V2>(self, f: impl FnOnce(V) -> V2) -> Offset<V2> {
-        match self {
-            Offset::Zero => Offset::Zero,
-            Offset::Dyn { stride, index } => Offset::Dyn { stride, index: f(index) },
-        }
-    }
-
-    /// Merge `Offset`s, resolving stride conflicts between two `Offset::Dyn`s
-    /// (with strides `a` vs `b`) by computing a "common stride" `c` such that
-    /// `a` and `b` are multiples of `c`, which could be satisfied by the GCD
-    /// (greatest common divisor) of `a` and `b`, but the approach taken here
-    /// is to use the greatest common *power of two* divisor instead, which is
-    /// both cheaper to compute, and more likely to end up being (related to)
-    /// the smallest unit of access *anyway*.
-    fn merge<V2, V3>(
-        self,
-        other: Offset<V2>,
-        map_self: impl FnOnce(V) -> V3,
-        map_other: impl FnOnce(V2) -> V3,
-        merge_both: impl FnOnce(Scaled<V>, Scaled<V2>) -> V3,
-    ) -> Offset<V3> {
-        match (self, other) {
-            (Offset::Zero, Offset::Zero) => Offset::Zero,
-            (Offset::Dyn { stride, index }, Offset::Zero) => {
-                Offset::Dyn { stride, index: map_self(index) }
-            }
-            (Offset::Zero, Offset::Dyn { stride, index }) => {
-                Offset::Dyn { stride, index: map_other(index) }
-            }
-            (
-                Offset::Dyn { stride: a_stride, index: a_index },
-                Offset::Dyn { stride: b_stride, index: b_index },
-            ) => {
-                let stride = if a_stride == b_stride {
-                    a_stride
-                } else {
-                    NonZeroU32::new(1 << a_stride.trailing_zeros().min(b_stride.trailing_zeros()))
-                        .unwrap()
-                };
-                let multiplier_from = |orig_stride: NonZeroU32| {
-                    assert_eq!(orig_stride.get() % stride.get(), 0);
-                    NonZeroU32::new(orig_stride.get() / stride.get()).unwrap()
-                };
-                Offset::Dyn {
-                    stride,
-                    index: merge_both(
-                        Scaled { value: a_index, multiplier: multiplier_from(a_stride) },
-                        Scaled { value: b_index, multiplier: multiplier_from(b_stride) },
-                    ),
-                }
-            }
-        }
-    }
-}
-
-impl Offset<()> {
-    fn merge_in_place(&mut self, other: Self) {
-        *self = self.merge(other, |()| (), |()| (), |_, _| ());
-    }
-}
-
-impl<V> Offset<Option<V>> {
-    fn transpose_value(self) -> Option<Offset<V>> {
-        match self {
-            Offset::Zero => Some(Offset::Zero),
-            Offset::Dyn { stride, index } => Some(Offset::Dyn { stride, index: index? }),
-        }
-    }
-}
-
-// TODO: `stride: Stride` type to avoid `Option` hell
-// (alterantive: `Strided<Value>` where stride merging uses `Strided<()>`?)
-// TODO: "base ptr map" per-function, plus a global thing for escaped pointers,
-// and (bitset, stride) describing individiual pointers, combined maybe with
-// an "escaped" flag and integer address range (basically special-casing null)
-// TODO: merge "integer address" and "escaped"? that might be fraught though
-
-/// Canonicalized pointer value, combining any number of offsetting steps.
-///
-/// While eagerly combining offsets may be suboptimal for highly local dataflow
-/// (e.g. `p2 = if c { p.add(1) } else { p };` can be `p2 = p.add(c as usize);`,
-/// but `CanonPtr` will use `p2 = p_base.add(p_idx + (c as usize))` instead),
-/// it has the benefit of making merging two `CanonPtr`s into an O(1) operation,
-/// without having to go back and dig out
-//
-// FIXME(eddyb) canonicalize `BufferData` (and even `HandleArrayIndex`).
-#[derive(Copy, Clone)]
-struct CanonPtr {
-    /// "Irreducible" `QPtr` value used as the base pointer, typically one of:
-    /// - `ConstKind::PtrToGlobalVar`
-    /// - `QPtrOp::FuncLocalVar`
-    /// - loop body region input (before it can be replaced with a closed form)
-    ///
-    /// The above list is, however, *not exhaustive*, and `base` can, in practice,
-    /// be any pointer *other than* the result of `QPtrOp::{Offset,DynOffset}`.
-    base: Value,
-
-    offset: Offset<Value>,
-}
-
-impl CanonPtr {
-    /// Compute the `CanonPtr` representation of a pointer, while replacing any
-    /// intermediary offset operations with their canonical forms, effectively
-    /// caching the result in-place (and making subsequent calls O(1)).
-    ///
-    /// The only way to get different results is to change `offset_shape_of_uses`:
-    /// a lower value may result in additional multiplication of indices.
-    fn canonicalize(
-        cx: &Context,
-        parent_map: &ParentMap,
-        func_at_ptr: FuncAtMut<'_, Value>,
-        offset_shape_of_uses: Offset<()>,
-    ) -> Self {
-        let ptr = func_at_ptr.position;
-        Self::canonicalize_inner(cx, parent_map, func_at_ptr, offset_shape_of_uses)
-            .unwrap_or(CanonPtr { base: ptr, offset: Offset::Zero })
-    }
-
-    // HACK(eddyb) returning `None` is equivalent to `Some(CanonPtr { base: ptr, .. })`.
-    fn canonicalize_inner(
-        cx: &Context,
-        parent_map: &ParentMap,
-        func_at_ptr: FuncAtMut<'_, Value>,
-        offset_shape_of_uses: Offset<()>,
-    ) -> Option<Self> {
-        let ptr = func_at_ptr.position;
-        let Value::NodeOutput { node, output_idx: 0 } = ptr else {
-            return None;
-        };
-
-        // HACK(eddyb) this defers interning a constant too early.
-        #[derive(Copy, Clone)]
-        enum Index {
-            Dyn(Value),
-            Imm(NonZeroI32),
-        }
-
-        let mut func = func_at_ptr.at(());
-        let node_def = func.reborrow().freeze().at(node).def();
-        let original_base_ptr = node_def.inputs[0];
-
-        let (base, offset) = {
-            let offset = match node_def.kind {
-                // FIXME(eddyb) `QPtrOp::Offset(0)` should really not happen anymore.
-                NodeKind::QPtr(QPtrOp::Offset(0)) => Offset::Zero,
-                NodeKind::QPtr(QPtrOp::Offset(offset)) if offset != 0 => Offset::Dyn {
-                    stride: NonZeroU32::new(offset.unsigned_abs()).unwrap(),
-                    index: Index::Imm(NonZeroI32::new(offset.signum()).unwrap()),
-                },
-                NodeKind::QPtr(QPtrOp::DynOffset { stride, .. }) => {
-                    Offset::Dyn { stride, index: Index::Dyn(node_def.inputs[1]) }
-                }
-                _ => return None,
-            };
-
-            let merged_offset_shape =
-                offset_shape_of_uses.merge(offset, |()| (), |_| (), |_, _| ());
-            let CanonPtr { base, offset: base_offset } = Self::canonicalize(
-                cx,
-                parent_map,
-                func.reborrow().at(original_base_ptr),
-                merged_offset_shape,
-            );
-            let base_offset_or_offset_shape_of_uses = base_offset.merge(
-                merged_offset_shape,
-                Some,
-                |()| None,
-                |base_index, Scaled { value: (), multiplier: _ }| {
-                    assert_eq!(base_index.multiplier.get(), 1);
-                    Some(base_index.value)
-                },
-            );
-
-            (
-                base,
-                base_offset_or_offset_shape_of_uses
-                    .merge(
-                        offset,
-                        |maybe_base_index| maybe_base_index.map(EitherOrBoth::Left),
-                        |index| {
-                            Some(EitherOrBoth::Right(Scaled {
-                                value: index,
-                                multiplier: NonZeroU32::new(1).unwrap(),
-                            }))
-                        },
-                        |base_index, index| {
-                            assert_eq!(base_index.multiplier.get(), 1);
-                            Some(
-                                base_index.value.map_or(EitherOrBoth::Right(index), |base_index| {
-                                    EitherOrBoth::Both(base_index, index)
-                                }),
-                            )
-                        },
-                    )
-                    .transpose_value()
-                    .unwrap_or(Offset::Zero),
-            )
-        };
-
-        // Fast path: this is confirmation that `node` is already canonical.
-        // HACK(eddyb) `Index::Dyn` only required to avoid interning `Const`s every time.
-        let (stride, index_sum) = match offset {
-            Offset::Zero => return Some(CanonPtr { base, offset: Offset::Zero }),
-            Offset::Dyn {
-                stride,
-                index: EitherOrBoth::Right(Scaled { value: Index::Dyn(index), multiplier }),
-            } if multiplier.get() == 1 => {
-                if base != original_base_ptr {
-                    func.at(node).def().inputs[0] = base;
-                }
-                return Some(CanonPtr { base, offset: Offset::Dyn { stride, index } });
-            }
-            // FIXME(eddyb) not using the `Offset` methods beyond this point
-            // seems unfortunate, but `EitherOrBoth` takes over from here.
-            Offset::Dyn { stride, index: index_sum } => (stride, index_sum),
-        };
-
-        // FIXME(eddyb) treat index type mismatches as stronger errors.
-        let index_ty = {
-            let func = func.reborrow().freeze();
-            let type_of = |v| func.at(v).type_of(cx);
-            let types = index_sum.clone().map_any(type_of, |index| match index.value {
-                Index::Dyn(index) => Ok(type_of(index)),
-                Index::Imm(imm) => Err(imm),
-            });
-            match types {
-                EitherOrBoth::Right(Err(imm_index)) => {
-                    // HACK(eddyb) this is a mess mostly because of signed types,
-                    // and can only be avoided when `base_index.is_some()` because
-                    // the addition can be replaced with a subtraction instead.
-                    cx.intern(if imm_index.get() < 0 {
-                        scalar::Type::S32
-                    } else {
-                        scalar::Type::U32
-                    })
-                }
-                EitherOrBoth::Both(ty, Err(_)) | EitherOrBoth::Right(Ok(ty)) => ty,
-                EitherOrBoth::Both(a, Ok(b)) if a == b => a,
-
-                _ => return None,
-            }
-        };
-        let index_scalar_ty = index_ty.as_scalar(cx)?;
-        let const_index_try_from_i128 = |x| {
-            Some(Value::Const(cx.intern(scalar::Const::int_try_from_i128(index_scalar_ty, x)?)))
-        };
-
-        // FIXME(eddyb) constant folding could be helpful here.
-        let mut index_binop = |op, a, b| {
-            let new_node = func.nodes.define(
-                cx,
-                NodeDef {
-                    // FIXME(eddyb) copy at least debuginfo attrs from `node`.
-                    attrs: Default::default(),
-                    kind: scalar::Op::IntBinary(op).into(),
-                    inputs: [a, b].into_iter().collect(),
-                    child_regions: [].into_iter().collect(),
-                    outputs: [NodeOutputDecl { attrs: Default::default(), ty: index_ty }]
-                        .into_iter()
-                        .collect(),
-                }
-                .into(),
-            );
-            func.regions[parent_map.node_parent[node]]
-                .children
-                .insert_before(new_node, node, func.nodes);
-            Value::NodeOutput { node: new_node, output_idx: 0 }
-        };
-
-        let index_sum = index_sum.map_right(|Scaled { value: index, multiplier }| {
-            Some(match index {
-                _ if multiplier.get() == 1 => index,
-
-                Index::Dyn(index) => Index::Dyn(index_binop(
-                    scalar::IntBinOp::Mul,
-                    index,
-                    const_index_try_from_i128(multiplier.get().into())?,
-                )),
-                Index::Imm(imm) => Index::Imm(imm.checked_mul(
-                    NonZeroI32::new(i32::try_from(multiplier.get()).ok()?).unwrap(),
-                )?),
-            })
-        });
-        // HACK(eddyb) working around the lack of `.transpose()?` for `EitherOrBoth`.
-        if let Some(None) = index_sum.as_ref().right() {
-            return None;
-        }
-        let index_sum = index_sum.map_right(|x| x.unwrap());
-
-        let index = match index_sum {
-            EitherOrBoth::Left(index) | EitherOrBoth::Right(Index::Dyn(index)) => index,
-
-            EitherOrBoth::Both(base_index, Index::Dyn(index)) => {
-                index_binop(scalar::IntBinOp::Add, base_index, index)
-            }
-
-            EitherOrBoth::Right(Index::Imm(imm)) => const_index_try_from_i128(imm.get().into())?,
-            EitherOrBoth::Both(base_index, Index::Imm(imm)) => index_binop(
-                if imm.get() < 0 { scalar::IntBinOp::Sub } else { scalar::IntBinOp::Add },
-                base_index,
-                const_index_try_from_i128(imm.unsigned_abs().get().into())?,
-            ),
-        };
-        let offset = Offset::Dyn { stride, index };
-        let canon = CanonPtr { base, offset };
-
-        let node_def = func.at(node).def();
-        (node_def.kind, node_def.inputs) = canon.as_node_kind_and_inputs();
-
-        Some(canon)
-    }
-
-    fn as_node_kind_and_inputs(&self) -> (NodeKind, SmallVec<[Value; 2]>) {
-        let CanonPtr { base, offset } = *self;
-        match offset {
-            Offset::Dyn { stride, index } => (
-                QPtrOp::DynOffset {
-                    stride,
-                    // FIXME(eddyb) this is lossy and can frustrate type recovery.
-                    index_bounds: None,
-                }
-                .into(),
-                [base, index].into_iter().collect(),
-            ),
-
-            // HACK(eddyb) this might actually be bad if not actually handled.
-            Offset::Zero => (QPtrOp::Offset(0).into(), [base].into_iter().collect()),
-        }
-    }
-}
-
 struct CanonicalizePtrsInFunc<'a> {
     legalizer: &'a LegalizePtrs,
 
     parent_map: &'a mut ParentMap,
+
+    canonicalized_ptrs: FxHashMap<Value, Result<CanonPtr, CanonError>>,
 
     // FIXME(eddyb) make this more specific to what it's used for?
     // (see also comment in `transform_value_use`)
     value_replacements: FxHashMap<Value, Value>,
 }
 
+/// Canonicalized pointer value, combining any number of offsetting steps, on
+/// top of a `base` that (when `BaseChoice::Dyn`) respects `FuncLocalBaseMap`.
+///
+/// While eagerly combining offsets may be suboptimal for highly local dataflow
+/// (e.g. `p2 = if c { p.add(1) } else { p };` can be `p2 = p.add(c as usize);`,
+/// but `CanonPtr` will use `p2 = p_base.add(p_idx + (c as usize))` instead),
+/// it has the benefit of making merging two `CanonPtr`s into an O(1) operation,
+/// without having to go back and dig out some kind of "closest common base".
+//
+// FIXME(eddyb) reduce duplication between `PtrSummary` and this.
+// FIXME(eddyb) canonicalize `HandleArrayIndex`.
+#[derive(Clone)]
+struct CanonPtr {
+    base: BaseChoice<Value>,
+
+    offset: Offset<Value>,
+
+    // HACK(eddyb) if `base` is `BaseChoice::Fixed(GlobalBase::BufferData)`,
+    // this is an existing `QPtrOp::BufferData` node for that buffer, that can
+    // be used directly.
+    reuse_buffer_data: Option<Node>,
+
+    // HACK(eddyb) if `base` is `BaseChoice::Fixed(_)`, this is an existing
+    // `QPtrOp::DynIndex` node for its final value, that can be used directly.
+    reuse_final_ptr: Option<Node>,
+}
+
+/// Error marker type during canonicalization, indicating a diagnostic has been
+/// attached already (either earlier, i.e. `UnsupportedBases` during scanning,
+/// or `IndexError`s during canonicalization)
+///
+/// Failure *must* be eagerly propagated (i.e. no merging successes and errors
+/// into `CanonPtr` `bases` and/or `offset` should happen), to avoid accidentally
+/// discarding the attached diagnostics. (which risks replacing errors with UB).
+// HACK(eddyb) the name doesn't contain `Error` for the sake of brevity.
+#[derive(Copy, Clone)]
+struct CanonError;
+
+/// Errors specific to the types/consts/computation of `Offset::Dyn` indices,
+/// that had been ignored during scanning, only to be hit by canonicalization.
+#[derive(Clone)]
+struct IndexError(Diag);
+
+impl CanonicalizePtrsInFunc<'_> {
+    /// Compute the `CanonPtr` representation of a pointer, reusing as much as
+    /// possible (e.g. a `QPtrOp::DynIndex` node that still produces the same
+    /// pointer value, at least as long as the `base` is `BaseChoice::Fixed`).
+    ///
+    /// **Note**: this on-demand approach (instead of only local transformations
+    /// during traversal) is required due to uses of already-legal pointers
+    /// (which would otherwise be left untouched), from e.g. pointer-typed
+    /// `Select` outputs that themelves require legalization.
+    //
+    // FIXME(eddyb) reduce the mountains of duplication... the only part
+    // that can't theoretically be done during the scanning step is taking
+    // into account the complete set of escaped bases (hence a split design).
+    fn canonicalize_ptr(
+        &mut self,
+        func_at_ptr: FuncAtMut<'_, Value>,
+    ) -> Result<CanonPtr, CanonError> {
+        let ptr = func_at_ptr.position;
+        if let Some(cached) = self.canonicalized_ptrs.get(&ptr) {
+            return cached.clone();
+        }
+
+        let canon = self.canonicalize_ptr_uncached(func_at_ptr);
+        self.canonicalized_ptrs.insert(ptr, canon.clone());
+        canon
+    }
+
+    fn canonicalize_ptr_uncached(
+        &mut self,
+        func_at_ptr: FuncAtMut<'_, Value>,
+    ) -> Result<CanonPtr, CanonError> {
+        let cx = &self.legalizer.cx;
+        let wk = self.legalizer.wk;
+
+        let ptr = func_at_ptr.position;
+        let mut func = func_at_ptr.at(());
+
+        if let Some(base) = self.legalizer.ptr_as_base(func.reborrow().freeze().at(ptr)) {
+            let reuse_final_ptr = match ptr {
+                // FIXME(eddyb) should `reuse_final_ptr` include constants, too?
+                Value::Const(_) => None,
+                Value::NodeOutput { node, output_idx: 0 } => Some(node),
+                _ => unreachable!(),
+            };
+            return Ok(CanonPtr {
+                base: BaseChoice::Fixed(base),
+                offset: Offset::Zero,
+                reuse_buffer_data: reuse_final_ptr
+                    .filter(|_| matches!(base, Base::Global(GlobalBase::BufferData { .. }))),
+                reuse_final_ptr,
+            });
+        }
+
+        let (node, output_idx) = match ptr {
+            // FIXME(eddyb) implement more constant address pointers, either
+            // here or in `ptr_as_base`.
+            Value::Const(_) => return unsupported(),
+
+            Value::NodeOutput { node, output_idx } => (node, output_idx),
+
+            // Loop body inputs are the only values with inherently cyclic sources
+            // (i.e. they can, and often do, depend on the previous loop iteration),
+            // and as such they require a more free-form "saturating" algorithm.
+            Value::RegionInput { region, input_idx } => {
+                unreachable!("TODO visit order error (check for qptr type as well?)")
+            }
+        };
+
+        let Value::NodeOutput { node, output_idx: 0 } = ptr else {
+            return Err(CanonError);
+        };
+
+        // HACK(eddyb) this defers interning a constant too early.
+        #[derive(Copy, Clone)]
+        enum Index {
+            Dyn(Value),
+            One,
+            MinusOne,
+        }
+
+        let node_def = func.reborrow().freeze().at(node).def();
+        match &node_def.kind {
+            NodeKind::Select(_) => {
+                unreachable!("TODO visit order error (check for qptr type as well?)")
+            }
+
+            // FIXME(eddyb) should these generate `Diag::bug` instead?
+            NodeKind::Loop { .. } | NodeKind::Scalar(_) | NodeKind::Vector(_) => unreachable!(),
+
+            NodeKind::FuncCall { .. } => {
+                // FIXME(eddyb) support passing pointers through function calls.
+                unsupported()
+            }
+            NodeKind::QPtr(op) => {
+                assert_eq!(output_idx, 0);
+                match *op {
+                    QPtrOp::FuncLocalVar(_) | QPtrOp::BufferData => {
+                        // Supported cases handled by `ptr_as_base`.
+                        unsupported()
+                    }
+                    // FIXME(eddyb) implement, either here or in `ptr_as_base`.
+                    QPtrOp::HandleArrayIndex => unsupported(),
+                    // FIXME(eddyb) should the (Dyn)Offset handling be centralized?
+                    QPtrOp::Offset(offset) => apply_offset(
+                        self.summarize_ptr(func.at(node_def.inputs[0])),
+                        NonZeroU32::new(offset.unsigned_abs())
+                            .map_or(Offset::Zero, |stride| Offset::Dyn { stride, index: () }),
+                    ),
+                    // FIXME(eddyb) ignoring `index_bounds` (and later setting it to
+                    // `None`) is lossy and can frustrate e.g. type recovery.
+                    QPtrOp::DynOffset { stride, index_bounds: _ } => {
+                        apply_offset(self.summarize_ptr(func.at(node_def.inputs[0])), Offset::Dyn {
+                            stride,
+                            index: (),
+                        })
+                    }
+                    QPtrOp::Load { .. } => PtrSummary {
+                        bases: EitherOrBoth::Right(UnknownBases {
+                            any_escaped: Some(AnyEscapedBase),
+                            loop_body_input_deps: [].into_iter().collect(),
+                            unsupported: None,
+                        }),
+                        offset_shape: Offset::Zero,
+                    },
+
+                    // FIXME(eddyb) should these generate `Diag::bug` instead?
+                    QPtrOp::BufferDynLen { .. } | QPtrOp::Store { .. } | QPtrOp::Copy { .. } => {
+                        unreachable!()
+                    }
+                }
+            }
+
+            NodeKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(_))
+            | NodeKind::SpvInst(..)
+            | NodeKind::SpvExtInst { .. } => unsupported(),
+        }
+
+        let offset = match node_def.kind {
+            NodeKind::QPtr(op) => match op {
+                QPtrOp::FuncLocalVar(_) | QPtrOp::BufferData => {
+                    // Supported cases handled by `ptr_as_base`.
+                    return Err(CanonError);
+                }
+                // FIXME(eddyb) implement, either here or in `ptr_as_base`.
+                QPtrOp::HandleArrayIndex => return Err(CanonError),
+
+                QPtrOp::Offset(offset) => {
+                    NonZeroU32::new(offset.unsigned_abs()).map_or(Offset::Zero, |stride| {
+                        Offset::Dyn {
+                            stride,
+                            index: if offset < 0 { Index::MinusOne } else { Index::One },
+                        }
+                    })
+                }
+                QPtrOp::DynOffset { stride, .. } => {
+                    Offset::Dyn { stride, index: Index::Dyn(node_def.inputs[1]) }
+                }
+            },
+            _ => return Err(CanonError),
+        };
+
+        // HACK(eddyb) to avoid terminology issues (since "base" is very taken),
+        // `obi_` (short for "offset base input") is used here to refer to the
+        // (pointer) input of the offsetting operation and any aspects of it.
+        let original_obi_ptr = node_def.inputs[0];
+
+        let CanonPtr {
+            base,
+            offset: obi_offset,
+            mut reuse_buffer_data,
+            reuse_final_ptr: reuse_obi_ptr,
+        } = self.canonicalize_ptr(func.reborrow().at(original_obi_ptr))?;
+
+        let offset_or_index_error = obi_offset.merge(
+            offset,
+            Ok,
+            |index| {
+                match index {
+                    Index::Dyn(index) => Ok(index),
+
+                    // FIXME(eddyb) this can lead to index conflicts down the line.
+                    Index::One => Ok(Value::Const(cx.intern(scalar::Const::from_u32(0)))),
+
+                    // Directly applying a negative offset onto a base is
+                    // *never* legal, as it would *always* leave the bounds.
+                    Index::MinusOne => {
+                        return Err(IndexError(Diag::bug(["illegal negative offset".into()])));
+                    }
+                }
+            },
+            |obi_index, index| {
+                let index_ty = {
+                    let func = func.reborrow().freeze();
+                    let type_of = |v| func.at(v).type_of(cx);
+                    let obi_index_ty = type_of(obi_index.value);
+                    match index.value {
+                        Index::Dyn(index) => {
+                            let index_ty = type_of(index);
+                            if obi_index_ty != index_ty {
+                                // FIXME(eddyb) pick the larger type and then
+                                // zero-extend the smaller one's value.
+                                return Err(IndexError(Diag::bug([
+                                    "index type mismatch: `".into(),
+                                    obi_index_ty.into(),
+                                    "` vs `".into(),
+                                    index_ty.into(),
+                                    "`".into(),
+                                ])));
+                            }
+                        }
+                        Index::One | Index::MinusOne => {}
+                    }
+                    obi_index_ty
+                };
+                let const_index_one = index_ty
+                    .as_scalar(cx)
+                    .and_then(|ty| scalar::Const::int_try_from_i128(ty, 1))
+                    .ok_or_else(|| {
+                        IndexError(Diag::bug([
+                            "index type `".into(),
+                            index_ty.into(),
+                            "` not an integer".into(),
+                        ]))
+                    })?;
+
+                let add_or_sub = match index.value {
+                    Index::Dyn(_) | Index::One => scalar::IntBinOp::Add,
+                    Index::MinusOne => scalar::IntBinOp::Sub,
+                };
+                let index = index.map_value(|index| match index {
+                    Index::Dyn(index) => index,
+                    Index::One | Index::MinusOne => Value::Const(cx.intern(const_index_one)),
+                });
+
+                let obi_index = self.materialize_scaled_index(func.reborrow().at(obi_index))?;
+                let index = self.materialize_scaled_index(func.reborrow().at(index))?;
+
+                // FIXME(eddyb) constant folding could be helpful here.
+                let new_node = func.nodes.define(
+                    cx,
+                    NodeDef {
+                        // FIXME(eddyb) copy at least debuginfo attrs from `node`.
+                        attrs: Default::default(),
+                        kind: scalar::Op::IntBinary(add_or_sub).into(),
+                        inputs: [obi_index, index].into_iter().collect(),
+                        child_regions: [].into_iter().collect(),
+                        outputs: [NodeOutputDecl { attrs: Default::default(), ty: index_ty }]
+                            .into_iter()
+                            .collect(),
+                    }
+                    .into(),
+                );
+                // FIXME(eddyb) automate all of this with some kind of "insertion cursor".
+                let parent_region = self.parent_map.node_parent[node];
+                func.regions[parent_region].children.insert_before(new_node, node, func.nodes);
+                self.parent_map.node_parent.insert(new_node, parent_region);
+                Ok(Value::NodeOutput { node: new_node, output_idx: 0 })
+            },
+        );
+        let offset = offset_or_index_error.transpose_value().map_err(|IndexError(err)| {
+            func.reborrow().at(node).def().attrs.push_diag(cx, err);
+            CanonError
+        })?;
+
+        let reuse_final_ptr = match (&base, offset) {
+            (_, Offset::Zero) => reuse_obi_ptr.or(Some(node)),
+            (&BaseChoice::Fixed(base), Offset::Dyn { stride, index }) => {
+                let base_ptr = match base {
+                    Base::FuncLocalVar(node) => Value::NodeOutput { node, output_idx: 0 },
+                    Base::Global(global_base) => match global_base {
+                        GlobalBase::Null => Value::Const(self.legalizer.null_qptr_const()),
+                        GlobalBase::GlobalVar { ptr_to_var } => Value::Const(ptr_to_var),
+                        GlobalBase::BufferData { ptr_to_buffer } => {
+                            let buffer_data_node = *reuse_buffer_data.get_or_insert_with(|| {
+                                let new_node = func.nodes.define(
+                                    cx,
+                                    NodeDef {
+                                        // FIXME(eddyb) copy at least debuginfo attrs from `node`.
+                                        attrs: Default::default(),
+                                        kind: QPtrOp::BufferData.into(),
+                                        inputs: [Value::Const(ptr_to_buffer)].into_iter().collect(),
+                                        child_regions: [].into_iter().collect(),
+                                        outputs: [NodeOutputDecl {
+                                            attrs: Default::default(),
+                                            ty: self.legalizer.qptr_type(),
+                                        }]
+                                        .into_iter()
+                                        .collect(),
+                                    }
+                                    .into(),
+                                );
+                                // FIXME(eddyb) automate all of this with some kind of "insertion cursor".
+                                let parent_region = self.parent_map.node_parent[node];
+                                func.regions[parent_region]
+                                    .children
+                                    .insert_before(new_node, node, func.nodes);
+                                self.parent_map.node_parent.insert(new_node, parent_region);
+                                new_node
+                            });
+                            Value::NodeOutput { node: buffer_data_node, output_idx: 0 }
+                        }
+                    },
+                };
+
+                let node_def = func.at(node).def();
+                (node_def.kind, node_def.inputs) = (
+                    QPtrOp::DynOffset {
+                        stride,
+                        // FIXME(eddyb) this is lossy and can frustrate type recovery.
+                        index_bounds: None,
+                    }
+                    .into(),
+                    [base_ptr, index].into_iter().collect(),
+                );
+
+                Some(node)
+            }
+            (BaseChoice::Dyn { .. }, _) => None,
+        };
+
+        Ok(CanonPtr { base, offset, reuse_buffer_data, reuse_final_ptr })
+    }
+
+    // FIXME(eddyb) consider memoizing this (esp. for reusing int mul nodes).
+    fn materialize_scaled_index(
+        &mut self,
+        func_at_scaled_index: FuncAtMut<'_, Scaled<Value>>,
+    ) -> Result<Value, IndexError> {
+        let cx = &self.legalizer.cx;
+
+        let Scaled { value: index, multiplier } = func_at_scaled_index.position;
+        let mut func = func_at_scaled_index.at(());
+
+        let (parent_region, insert_after) = match index {
+            _ if multiplier.get() == 1 => return Ok(index),
+
+            // FIXME(eddyb) recategorize some `Diag`s as user errors, not just bugs.
+            Value::Const(ct) => {
+                let (ty, index) = ct
+                    .as_scalar(cx)
+                    .and_then(|ct| Some((ct.ty(), ct.int_as_u128()?)))
+                    .ok_or_else(|| {
+                        IndexError(Diag::bug([
+                            "index `".into(),
+                            ct.into(),
+                            "` not a positive integer".into(),
+                        ]))
+                    })?;
+
+                let r = index
+                    .checked_mul(multiplier.get().into())
+                    .and_then(|r| scalar::Const::int_try_from_i128(ty, r.try_into().ok()?))
+                    .ok_or_else(|| {
+                        IndexError(Diag::bug([
+                            "index multiplication `".into(),
+                            ct.into(),
+                            format!(" * {multiplier}` overflowed").into(),
+                        ]))
+                    })?;
+                return Ok(Value::Const(cx.intern(r)));
+            }
+
+            Value::RegionInput { region, input_idx: _ } => (region, None),
+            Value::NodeOutput { node, output_idx: _ } => {
+                (self.parent_map.node_parent[node], Some(node))
+            }
+        };
+
+        let index_ty = func.reborrow().freeze().at(index).type_of(cx);
+
+        let multiplier = Value::Const(
+            cx.intern(
+                index_ty
+                    .as_scalar(cx)
+                    .and_then(|ty| scalar::Const::int_try_from_i128(ty, multiplier.get().into()))
+                    .ok_or_else(|| {
+                        IndexError(Diag::bug([
+                            format!("index type `").into(),
+                            index_ty.into(),
+                            format!("` can't represent `{multiplier}`").into(),
+                        ]))
+                    })?,
+            ),
+        );
+
+        let new_node = func.nodes.define(
+            cx,
+            NodeDef {
+                // FIXME(eddyb) copy at least debuginfo attrs.
+                attrs: Default::default(),
+                kind: scalar::Op::IntBinary(scalar::IntBinOp::Mul).into(),
+                inputs: [index, multiplier].into_iter().collect(),
+                child_regions: [].into_iter().collect(),
+                outputs: [NodeOutputDecl { attrs: Default::default(), ty: index_ty }]
+                    .into_iter()
+                    .collect(),
+            }
+            .into(),
+        );
+        // FIXME(eddyb) automate all of this with some kind of "insertion cursor".
+        let parent_region_children = &mut func.regions[parent_region].children;
+        if let Some(node) = insert_after {
+            parent_region_children.insert_after(new_node, node, func.nodes);
+        } else {
+            parent_region_children.insert_first(new_node, func.nodes);
+        }
+        self.parent_map.node_parent.insert(new_node, parent_region);
+        Ok(Value::NodeOutput { node: new_node, output_idx: 0 })
+    }
+}
+
+// TODO(eddyb) canonicalize `Offset`/`DynOffset` instructions that chain off of
+// eachother in ways that couldn't possibly be legal (may require range info?),
+// and maybe use it in recursion emulation? (but recursion emulation also wants
+// legalized pointers... should recursion re-run legalization *afterwards*?)
 impl Transformer for CanonicalizePtrsInFunc<'_> {
     fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
         if let Value::Const(_) = v {
