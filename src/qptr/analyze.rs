@@ -9,7 +9,7 @@ use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInstKind, DeclDef, Diag,
     ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind, OrdAssertEq, Type,
-    TypeKind, Value,
+    TypeKind, Value, VarKind,
 };
 use itertools::{Either, Itertools as _};
 use rustc_hash::FxHashMap;
@@ -783,11 +783,11 @@ impl<'a> InferUsage<'a> {
                     for (v, usage) in usage_or_err_attrs_to_attach {
                         let attrs = match v {
                             Value::Const(_) => unreachable!(),
-                            Value::RegionInput { region, input_idx } => {
+                            Value::Var(VarKind::RegionInput { region, input_idx }) => {
                                 &mut func_def_body.at_mut(region).def().inputs[input_idx as usize]
                                     .attrs
                             }
-                            Value::NodeOutput { node, output_idx } => {
+                            Value::Var(VarKind::NodeOutput { node, output_idx }) => {
                                 let node_def = func_def_body.at_mut(node).def();
 
                                 // HACK(eddyb) `NodeOutput { output_idx: !0, .. }`
@@ -883,7 +883,8 @@ impl<'a> InferUsage<'a> {
                 // on top of propagating them from uses to definitions.
                 // FIXME(eddyb) do this for more than just `Select` nodes.
                 for (i, usage) in per_output_usage.iter().enumerate() {
-                    let output = Value::NodeOutput { node, output_idx: i.try_into().unwrap() };
+                    let output =
+                        Value::Var(VarKind::NodeOutput { node, output_idx: i.try_into().unwrap() });
                     if let Some(usage) = usage {
                         usage_or_err_attrs_to_attach.push((output, Clone::clone(usage)));
                     }
@@ -899,14 +900,16 @@ impl<'a> InferUsage<'a> {
                         // FIXME(eddyb) may be relevant?
                         _ => unreachable!(),
                     },
-                    Value::RegionInput { region, input_idx } if region == func_def_body.body => {
+                    Value::Var(VarKind::RegionInput { region, input_idx })
+                        if region == func_def_body.body =>
+                    {
                         &mut param_usages[input_idx as usize]
                     }
                     // FIXME(eddyb) implement `qptr.usage` propagation across
                     // loop state (will likely require computing the effect
                     // of the body in terms of its inputs, then somehow taking
                     // the fixpoint of that without risking infinite unfolding).
-                    Value::RegionInput { .. } => {
+                    Value::Var(VarKind::RegionInput { .. }) => {
                         match new_usage {
                             Ok(usage) => {
                                 usage_or_err_attrs_to_attach.push((
@@ -931,7 +934,7 @@ impl<'a> InferUsage<'a> {
                         }
                         return;
                     }
-                    Value::NodeOutput { node: ptr_node, output_idx } => {
+                    Value::Var(VarKind::NodeOutput { node: ptr_node, output_idx }) => {
                         let i = output_idx as usize;
                         let slots = node_to_per_output_usage.entry(ptr_node).or_default();
                         if i >= slots.len() {
@@ -1003,7 +1006,7 @@ impl<'a> InferUsage<'a> {
                         }
                         FuncInferUsageState::InProgress => {
                             usage_or_err_attrs_to_attach.push((
-                                Value::NodeOutput { node, output_idx: 0 },
+                                Value::Var(VarKind::NodeOutput { node, output_idx: 0 }),
                                 Err(AnalysisError(Diag::bug(
                                     ["unsupported recursive call".into()],
                                 ))),
@@ -1015,8 +1018,10 @@ impl<'a> InferUsage<'a> {
                         .is_some_and(|o| is_qptr(o.ty))
                     {
                         if let Some(usage) = output_usage {
-                            usage_or_err_attrs_to_attach
-                                .push((Value::NodeOutput { node, output_idx: 0 }, usage));
+                            usage_or_err_attrs_to_attach.push((
+                                Value::Var(VarKind::NodeOutput { node, output_idx: 0 }),
+                                usage,
+                            ));
                         }
                     }
                 }
@@ -1024,7 +1029,7 @@ impl<'a> InferUsage<'a> {
                 DataInstKind::QPtr(QPtrOp::FuncLocalVar(_)) => {
                     if let Some(usage) = output_usage {
                         usage_or_err_attrs_to_attach
-                            .push((Value::NodeOutput { node, output_idx: 0 }, usage));
+                            .push((Value::Var(VarKind::NodeOutput { node, output_idx: 0 }), usage));
                     }
                 }
                 DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
@@ -1325,8 +1330,10 @@ impl<'a> InferUsage<'a> {
                     if has_from_spv_ptr_output_attr {
                         // FIXME(eddyb) merge with `FromSpvPtrOutput`'s `pointee`.
                         if let Some(usage) = output_usage {
-                            usage_or_err_attrs_to_attach
-                                .push((Value::NodeOutput { node, output_idx: 0 }, usage));
+                            usage_or_err_attrs_to_attach.push((
+                                Value::Var(VarKind::NodeOutput { node, output_idx: 0 }),
+                                usage,
+                            ));
                         }
                     }
                 }
