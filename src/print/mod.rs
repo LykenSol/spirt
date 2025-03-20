@@ -194,10 +194,7 @@ enum Use {
 
     RegionLabel(Region),
 
-    // FIXME(eddyb) these are `Value`'s variants except `Const`, maybe `Use`
-    // should just use `Value` and assert it's never `Const`?
-    RegionInput { region: Region, input_idx: u32 },
-    NodeOutput { node: Node, output_idx: u32 },
+    Var(VarKind),
 
     // NOTE(eddyb) these overlap somewhat with other cases, but they're always
     // generated, even when there is no "use", for `multiversion` alignment.
@@ -209,12 +206,7 @@ impl From<Value> for Use {
     fn from(value: Value) -> Self {
         match value {
             Value::Const(ct) => Use::CxInterned(CxInterned::Const(ct)),
-            Value::Var(VarKind::RegionInput { region, input_idx }) => {
-                Use::RegionInput { region, input_idx }
-            }
-            Value::Var(VarKind::NodeOutput { node, output_idx }) => {
-                Use::NodeOutput { node, output_idx }
-            }
+            Value::Var(v) => Use::Var(v),
         }
     }
 }
@@ -230,9 +222,7 @@ impl Use {
             Self::PlanItem(item) => item.keyword_and_name_prefix().unwrap(),
             Self::CxInterned(interned) => interned.keyword_and_name_prefix(),
             Self::RegionLabel(_) => ("label", "L"),
-
-            Self::RegionInput { .. } | Self::NodeOutput { .. } => ("", "v"),
-
+            Self::Var(_) => ("", "v"),
             Self::AlignmentAnchorForRegion(_) | Self::AlignmentAnchorForNode(_) => {
                 ("", Self::ANCHOR_ALIGNMENT_NAME_PREFIX)
             }
@@ -746,9 +736,7 @@ impl<'a> Printer<'a> {
             .iter()
             .map(|(&use_kind, &use_count)| {
                 // HACK(eddyb) these are assigned later.
-                if let Use::RegionLabel(_) | Use::RegionInput { .. } | Use::NodeOutput { .. } =
-                    use_kind
-                {
+                if let Use::RegionLabel(_) | Use::Var(_) = use_kind {
                     return (use_kind, UseStyle::Inline);
                 }
 
@@ -779,8 +767,7 @@ impl<'a> Printer<'a> {
                         }
                     }
                     Use::RegionLabel(_)
-                    | Use::RegionInput { .. }
-                    | Use::NodeOutput { .. }
+                    | Use::Var(_)
                     | Use::AlignmentAnchorForRegion(_)
                     | Use::AlignmentAnchorForNode(_) => unreachable!(),
                 }
@@ -851,8 +838,7 @@ impl<'a> Printer<'a> {
                     Use::PlanItem(_) => false,
 
                     Use::RegionLabel(_)
-                    | Use::RegionInput { .. }
-                    | Use::NodeOutput { .. }
+                    | Use::Var(_)
                     | Use::AlignmentAnchorForRegion(_)
                     | Use::AlignmentAnchorForNode(_) => {
                         unreachable!()
@@ -874,8 +860,7 @@ impl<'a> Printer<'a> {
                             | PlanItem::ModuleDebugInfo,
                         )
                         | Use::RegionLabel(_)
-                        | Use::RegionInput { .. }
-                        | Use::NodeOutput { .. }
+                        | Use::Var(_)
                         | Use::AlignmentAnchorForRegion(_)
                         | Use::AlignmentAnchorForNode(_) => {
                             unreachable!()
@@ -940,7 +925,10 @@ impl<'a> Printer<'a> {
 
                     for (i, input_decl) in inputs.iter().enumerate() {
                         define(
-                            Use::RegionInput { region, input_idx: i.try_into().unwrap() },
+                            Use::Var(VarKind::RegionInput {
+                                region,
+                                input_idx: i.try_into().unwrap(),
+                            }),
                             Some(input_decl.attrs),
                         );
                     }
@@ -955,7 +943,10 @@ impl<'a> Printer<'a> {
 
                         for (i, output_decl) in outputs.iter().enumerate() {
                             define(
-                                Use::NodeOutput { node, output_idx: i.try_into().unwrap() },
+                                Use::Var(VarKind::NodeOutput {
+                                    node,
+                                    output_idx: i.try_into().unwrap(),
+                                }),
                                 Some(output_decl.attrs),
                             );
                         }
@@ -994,9 +985,7 @@ impl<'a> Printer<'a> {
                         (&mut region_label_counter, use_styles.get_mut(&use_kind))
                     }
 
-                    Use::RegionInput { .. } | Use::NodeOutput { .. } => {
-                        (&mut value_counter, use_styles.get_mut(&use_kind))
-                    }
+                    Use::Var(_) => (&mut value_counter, use_styles.get_mut(&use_kind)),
 
                     Use::AlignmentAnchorForRegion(_) | Use::AlignmentAnchorForNode(_) => (
                         &mut alignment_anchor_counter,
@@ -1536,9 +1525,7 @@ impl Use {
                         item.keyword_and_name_prefix().map_or_else(|s| s, |(s, _)| s)
                     ))
                     .into(),
-                Self::RegionLabel(_) | Self::RegionInput { .. } | Self::NodeOutput { .. } => {
-                    "_".into()
-                }
+                Self::RegionLabel(_) | Self::Var(_) => "_".into(),
 
                 Self::AlignmentAnchorForRegion(_) | Self::AlignmentAnchorForNode(_) => {
                     unreachable!()
@@ -3143,8 +3130,8 @@ impl FuncAt<'_, DataInst> {
             None
         };
 
-        let mut output_use_to_print_as_lhs =
-            output_type.map(|_| Use::NodeOutput { node: self.position, output_idx: 0 });
+        let mut output_use_to_print_as_lhs = output_type
+            .map(|_| Use::Var(VarKind::NodeOutput { node: self.position, output_idx: 0 }));
 
         let mut output_type_to_print = output_type;
 
