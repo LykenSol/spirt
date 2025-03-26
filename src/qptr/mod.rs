@@ -53,9 +53,8 @@ pub enum QPtrAttr {
         pointee: OrdAssertEq<Type>,
     },
 
-    /// When applied to a `QPtr`-typed `GlobalVar`, `DataInst`,
-    /// `RegionInputDecl` or `NodeOutputDecl`, this tracks all the
-    /// ways in which the pointer may be used (see `QPtrUsage`).
+    /// When applied to a `QPtr`-typed `GlobalVar` or `VarDecl`, this tracks
+    /// all the ways in which the pointer may be used (see `QPtrUsage`).
     Usage(OrdAssertEq<QPtrUsage>),
 }
 

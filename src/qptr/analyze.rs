@@ -9,7 +9,7 @@ use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInstKind, DeclDef, Diag,
     ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind, OrdAssertEq, Type,
-    TypeKind, Value, VarKind,
+    TypeKind, Value, Var, VarKind,
 };
 use itertools::{Either, Itertools as _};
 use rustc_hash::FxHashMap;
@@ -664,7 +664,7 @@ impl MemTypeLayout {
 
 #[derive(Copy, Clone)]
 enum AttrTarget {
-    Var(VarKind),
+    Var(Var),
     Node(Node),
 }
 
@@ -788,14 +788,7 @@ impl<'a> InferUsage<'a> {
 
                     for (v, usage) in usage_or_err_attrs_to_attach {
                         let attrs = match v {
-                            AttrTarget::Var(VarKind::RegionInput { region, input_idx }) => {
-                                &mut func_def_body.at_mut(region).def().inputs[input_idx as usize]
-                                    .attrs
-                            }
-                            AttrTarget::Var(VarKind::NodeOutput { node, output_idx }) => {
-                                &mut func_def_body.at_mut(node).def().outputs[output_idx as usize]
-                                    .attrs
-                            }
+                            AttrTarget::Var(v) => &mut func_def_body.at_mut(v).decl().attrs,
                             AttrTarget::Node(node) => {
                                 assert!(usage.is_err());
 
@@ -884,11 +877,10 @@ impl<'a> InferUsage<'a> {
                 // Always attach attributes to `qptr`-typed outputs,
                 // on top of propagating them from uses to definitions.
                 // FIXME(eddyb) do this for more than just `Select` nodes.
-                for (i, usage) in per_output_usage.iter().enumerate() {
-                    let output = VarKind::NodeOutput { node, output_idx: i.try_into().unwrap() };
+                for (&output_var, usage) in node_def.outputs.iter().zip(&per_output_usage) {
                     if let Some(usage) = usage {
                         usage_or_err_attrs_to_attach
-                            .push((AttrTarget::Var(output), Clone::clone(usage)));
+                            .push((AttrTarget::Var(output_var), Clone::clone(usage)));
                     }
                 }
             }
@@ -902,48 +894,50 @@ impl<'a> InferUsage<'a> {
                         // FIXME(eddyb) may be relevant?
                         _ => unreachable!(),
                     },
-                    Value::Var(VarKind::RegionInput { region, input_idx })
-                        if region == func_def_body.body =>
-                    {
-                        &mut param_usages[input_idx as usize]
-                    }
-                    // FIXME(eddyb) implement `qptr.usage` propagation across
-                    // loop state (will likely require computing the effect
-                    // of the body in terms of its inputs, then somehow taking
-                    // the fixpoint of that without risking infinite unfolding).
-                    Value::Var(ptr @ VarKind::RegionInput { .. }) => {
-                        match new_usage {
-                            Ok(usage) => {
-                                usage_or_err_attrs_to_attach.push((
-                                    AttrTarget::Var(ptr),
-                                    Err(AnalysisError(Diag::bug([
-                                        "unsupported loop state qptr.usage: ".into(),
-                                        crate::DiagMsgPart::from(usage),
-                                    ]))),
-                                ));
-                            }
-                            Err(err) => {
-                                usage_or_err_attrs_to_attach.extend([
-                                    (AttrTarget::Var(ptr), Err(err)),
-                                    (
+                    Value::Var(ptr) => match func_def_body.at(ptr).decl().kind() {
+                        VarKind::RegionInput { region, input_idx }
+                            if region == func_def_body.body =>
+                        {
+                            &mut param_usages[input_idx as usize]
+                        }
+                        // FIXME(eddyb) implement `qptr.usage` propagation across
+                        // loop state (will likely require computing the effect
+                        // of the body in terms of its inputs, then somehow taking
+                        // the fixpoint of that without risking infinite unfolding).
+                        VarKind::RegionInput { .. } => {
+                            match new_usage {
+                                Ok(usage) => {
+                                    usage_or_err_attrs_to_attach.push((
                                         AttrTarget::Var(ptr),
                                         Err(AnalysisError(Diag::bug([
-                                            "unsupported loop state qptr".into(),
+                                            "unsupported loop state qptr.usage: ".into(),
+                                            crate::DiagMsgPart::from(usage),
                                         ]))),
-                                    ),
-                                ]);
+                                    ));
+                                }
+                                Err(err) => {
+                                    usage_or_err_attrs_to_attach.extend([
+                                        (AttrTarget::Var(ptr), Err(err)),
+                                        (
+                                            AttrTarget::Var(ptr),
+                                            Err(AnalysisError(Diag::bug([
+                                                "unsupported loop state qptr".into(),
+                                            ]))),
+                                        ),
+                                    ]);
+                                }
                             }
+                            return;
                         }
-                        return;
-                    }
-                    Value::Var(VarKind::NodeOutput { node: ptr_node, output_idx }) => {
-                        let i = output_idx as usize;
-                        let slots = node_to_per_output_usage.entry(ptr_node).or_default();
-                        if i >= slots.len() {
-                            slots.extend((slots.len()..=i).map(|_| None));
+                        VarKind::NodeOutput { node: ptr_node, output_idx } => {
+                            let i = output_idx as usize;
+                            let slots = node_to_per_output_usage.entry(ptr_node).or_default();
+                            if i >= slots.len() {
+                                slots.extend((slots.len()..=i).map(|_| None));
+                            }
+                            &mut slots[i]
                         }
-                        &mut slots[i]
-                    }
+                    },
                 };
                 *slot = Some(match slot.take() {
                     Some(old) => old.and_then(|old| {
@@ -1017,23 +1011,19 @@ impl<'a> InferUsage<'a> {
                     };
                     // HACK(eddyb) multi-output instructions don't exist pre-disaggregate.
                     if (data_inst_def.outputs.iter().at_most_one().ok().unwrap())
-                        .is_some_and(|o| is_qptr(o.ty))
+                        .is_some_and(|&o| is_qptr(func_def_body.at(o).decl().ty))
                     {
                         if let Some(usage) = output_usage {
-                            usage_or_err_attrs_to_attach.push((
-                                AttrTarget::Var(VarKind::NodeOutput { node, output_idx: 0 }),
-                                usage,
-                            ));
+                            usage_or_err_attrs_to_attach
+                                .push((AttrTarget::Var(data_inst_def.outputs[0]), usage));
                         }
                     }
                 }
 
                 DataInstKind::QPtr(QPtrOp::FuncLocalVar(_)) => {
                     if let Some(usage) = output_usage {
-                        usage_or_err_attrs_to_attach.push((
-                            AttrTarget::Var(VarKind::NodeOutput { node, output_idx: 0 }),
-                            usage,
-                        ));
+                        usage_or_err_attrs_to_attach
+                            .push((AttrTarget::Var(data_inst_def.outputs[0]), usage));
                     }
                 }
                 DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
@@ -1213,7 +1203,9 @@ impl<'a> InferUsage<'a> {
                 }
                 DataInstKind::QPtr(op @ (QPtrOp::Load | QPtrOp::Store)) => {
                     let (op_name, access_type) = match op {
-                        QPtrOp::Load => ("Load", data_inst_def.outputs[0].ty),
+                        QPtrOp::Load => {
+                            ("Load", func_def_body.at(data_inst_def.outputs[0]).decl().ty)
+                        }
                         QPtrOp::Store => {
                             ("Store", func_def_body.at(data_inst_def.inputs[1]).type_of(&cx))
                         }
@@ -1334,10 +1326,8 @@ impl<'a> InferUsage<'a> {
                     if has_from_spv_ptr_output_attr {
                         // FIXME(eddyb) merge with `FromSpvPtrOutput`'s `pointee`.
                         if let Some(usage) = output_usage {
-                            usage_or_err_attrs_to_attach.push((
-                                AttrTarget::Var(VarKind::NodeOutput { node, output_idx: 0 }),
-                                usage,
-                            ));
+                            usage_or_err_attrs_to_attach
+                                .push((AttrTarget::Var(data_inst_def.outputs[0]), usage));
                         }
                     }
                 }
