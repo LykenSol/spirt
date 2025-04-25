@@ -14,7 +14,7 @@ use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInstKind, DeclDef, Diag,
     ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind, OrdAssertEq, Type,
-    TypeKind, Value, Var, VarKind,
+    TypeKind, Value, Var, VarKind, scalar,
 };
 use itertools::Either;
 use rustc_hash::FxHashMap;
@@ -28,6 +28,7 @@ use std::rc::Rc;
 struct AnalysisError(Diag);
 
 struct UsageMerger<'a> {
+    cx: &'a Context,
     layout_cache: &'a LayoutCache<'a>,
 }
 
@@ -137,7 +138,11 @@ impl UsageMerger<'_> {
                 #[derive(PartialEq, Eq, PartialOrd, Ord)]
                 enum TypeStrictness {
                     Any,
-                    Array,
+                    Array {
+                        // HACK(eddyb) this allows ending up with the larger stride
+                        // on the left.
+                        stride: NonZeroU32,
+                    },
                     Exact,
                 }
                 #[allow(clippy::match_same_arms)]
@@ -146,7 +151,9 @@ impl UsageMerger<'_> {
                         TypeStrictness::Any
                     }
 
-                    QPtrMemUsageKind::DynOffsetBase { .. } => TypeStrictness::Array,
+                    QPtrMemUsageKind::DynOffsetBase { stride, .. } => {
+                        TypeStrictness::Array { stride }
+                    }
 
                     // FIXME(eddyb) this should be `Any`, even if in theory it
                     // could contain arrays or structs that need decomposition
@@ -301,11 +308,13 @@ impl UsageMerger<'_> {
                 let ty = if Some(a_type) == b_type_at_offset_0 {
                     MergeResult::ok(a_type)
                 } else {
-                    // Returns `Some(MergeResult::ok(ty))` iff `usage` is valid
-                    // for type `ty`, and `None` iff invalid w/o layout errors
-                    // (see `mem_layout_supports_usage_at_offset` for more details).
-                    let type_supporting_usage_at_offset = |ty, usage_offset, usage| {
-                        let supports_usage = match self.layout_of(ty) {
+                    let type_supporting_usage_at_offset = |a: &QPtrMemUsage, b_offset_in_a, b| {
+                        let (a_type, a_is_strict) = match a.kind {
+                            QPtrMemUsageKind::StrictlyTyped(ty) => (ty, true),
+                            QPtrMemUsageKind::DirectAccess(ty) => (ty, false),
+                            _ => unreachable!(),
+                        };
+                        match self.layout_of(a_type) {
                             // FIXME(eddyb) should this be `unreachable!()`? also, is
                             // it possible to end up with `ty` being an `OpTypeStruct`
                             // decorated with `Block`, showing up as a `Buffer` handle?
@@ -318,25 +327,28 @@ impl UsageMerger<'_> {
                                     "merge_mem: impossible handle type for QPtrMemUsage".into(),
                                 ])))
                             }
-                            Ok(TypeLayout::Concrete(concrete)) => {
-                                Ok(concrete.supports_usage_at_offset(usage_offset, usage))
-                            }
+                            Ok(TypeLayout::Concrete(concrete)) => Ok(
+                                concrete.type_supporting_usage_at_offset(self.cx, b_offset_in_a, b)
+                            ),
 
                             Err(e) => Err(e),
-                        };
-                        match supports_usage {
-                            Ok(false) => None,
-                            Ok(true) | Err(_) => {
-                                Some(MergeResult { merged: ty, error: supports_usage.err() })
-                            }
                         }
+                        .transpose()
+                        .and_then(|ty_or_err| {
+                            let ty = ty_or_err.as_ref().ok().copied().unwrap_or(a_type);
+
+                            if a_is_strict && ty != a_type {
+                                return None;
+                            }
+
+                            Some(MergeResult { merged: ty, error: ty_or_err.err() })
+                        })
                     };
 
-                    type_supporting_usage_at_offset(a_type, b_offset_in_a, &b)
+                    type_supporting_usage_at_offset(&a, b_offset_in_a, &b)
                         .or_else(|| {
-                            b_type_at_offset_0.and_then(|b_type_at_offset_0| {
-                                type_supporting_usage_at_offset(b_type_at_offset_0, 0, &a)
-                            })
+                            b_type_at_offset_0
+                                .and_then(|_| type_supporting_usage_at_offset(&b, 0, &a))
                         })
                         .unwrap_or_else(|| {
                             MergeResult {
@@ -372,13 +384,31 @@ impl UsageMerger<'_> {
             QPtrMemUsageKind::DynOffsetBase { element: mut a_element, stride: a_stride } => {
                 let b_offset_in_a_element = b_offset_in_a % a_stride;
 
+                let mut b = b;
+                let b_fits_in_a_element = b
+                    .max_size
+                    .and_then(|b_max_size| b_max_size.checked_add(b_offset_in_a_element))
+                    .is_some_and(|b_in_a_max_size| b_in_a_max_size <= a_stride.get())
+                    || match b.kind {
+                        // HACK(eddyb) special-case for when a whole number N
+                        // of `b_element`s fit in each `a_element` (which does
+                        // complicate lifting, needing new `/ N` and `% N` ops,
+                        // but it's better than no support at all).
+                        QPtrMemUsageKind::DynOffsetBase { element: _, stride: b_stride }
+                            if b_offset_in_a_element == 0
+                                && a_stride > b_stride
+                                && a_stride.get() % b_stride == 0 =>
+                        {
+                            b.max_size = Some(a_stride.get());
+                            true
+                        }
+                        _ => false,
+                    };
+
                 // Array-like dynamic offsetting needs to always merge any usage that
                 // fits inside the stride, with its "element" usage, no matter how
                 // complex it may be (notably, this is needed for nested arrays).
-                if b.max_size
-                    .and_then(|b_max_size| b_max_size.checked_add(b_offset_in_a_element))
-                    .is_some_and(|b_in_a_max_size| b_in_a_max_size <= a_stride.get())
-                {
+                if b_fits_in_a_element {
                     // FIXME(eddyb) this in-place merging dance only needed due to `Rc`.
                     ({
                         let a_element_mut = Rc::make_mut(&mut a_element);
@@ -416,10 +446,6 @@ impl UsageMerger<'_> {
                             })
                         }
                         _ => {
-                            // FIXME(eddyb) implement somehow (by adjusting stride?).
-                            // NOTE(eddyb) with `b` as an `DynOffsetBase`/`OffsetBase`, it could
-                            // also be possible to superimpose its offset patterns onto `a`,
-                            // though that's easier for `OffsetBase` than `DynOffsetBase`.
                             // HACK(eddyb) needed due to `a` being moved out of.
                             let a = QPtrMemUsage {
                                 max_size: a.max_size,
@@ -429,6 +455,43 @@ impl UsageMerger<'_> {
                                     stride: a_stride,
                                 },
                             };
+
+                            // FIXME(eddyb) implement somehow (by adjusting stride?).
+                            // NOTE(eddyb) with `b` as an `DynOffsetBase`/`OffsetBase`, it could
+                            // also be possible to superimpose its offset patterns onto `a`,
+                            // though that's easier for `OffsetBase` than `DynOffsetBase`.
+
+                            // HACK(eddyb) special-case "small element" indexing
+                            // vs a single "large element", by indexing the latter.
+                            let max_size_and_stride_for_repeating_b = b
+                                .max_size
+                                .and_then(|b_max_size| {
+                                    Some((a.max_size, NonZeroU32::new(b_max_size)?))
+                                })
+                                .filter(|&(max_size, stride)| {
+                                    match b.kind {
+                                        // HACK(eddyb) refuse nesting `DynOffsetBase`s.
+                                        QPtrMemUsageKind::DynOffsetBase { .. } => false,
+
+                                        _ => {
+                                            b_offset_in_a_element == 0
+                                                && max_size.is_none_or(|size| {
+                                                    size >= stride.get() && size % stride == 0
+                                                })
+                                        }
+                                    }
+                                });
+                            if let Some((max_size, stride)) = max_size_and_stride_for_repeating_b {
+                                return self.merge_mem(a, QPtrMemUsage {
+                                    max_size,
+                                    flags: b.flags.propagate_outwards(),
+                                    kind: QPtrMemUsageKind::DynOffsetBase {
+                                        element: Rc::new(b),
+                                        stride,
+                                    },
+                                });
+                            }
+
                             MergeResult {
                                 merged: a.kind.clone(),
                                 error: Some(AnalysisError(Diag::bug([
@@ -582,16 +645,25 @@ impl UsageMerger<'_> {
 }
 
 impl MemTypeLayout {
-    /// Determine if this layout is compatible with `usage` at `usage_offset`.
+    /// Determine if this layout is compatible with `usage` at `usage_offset`,
+    /// returning `Some(compatible_type)` if so.
     ///
     /// That is, all typed leaves of `usage` must be found inside `self`, at
     /// their respective offsets, and all [`QPtrMemUsageKind::DynOffsetBase`]s
     /// must find a same-stride array inside `self` (to allow dynamic indexing).
+    ///
+    /// The returned `compatible_type` can be either `self.original_type`, or
+    /// a "similarly shaped" type (e.g. `f32` -> `u32`) improving compatibility.
     //
     // FIXME(eddyb) consider using `Result` to make it unambiguous.
-    fn supports_usage_at_offset(&self, usage_offset: u32, usage: &QPtrMemUsage) -> bool {
+    fn type_supporting_usage_at_offset(
+        &self,
+        cx: &Context,
+        usage_offset: u32,
+        usage: &QPtrMemUsage,
+    ) -> Option<Type> {
         if let QPtrMemUsageKind::Unused = usage.kind {
-            return true;
+            return Some(self.original_type);
         }
 
         // "Fast accept" based on type alone (expected as recursion base case).
@@ -599,7 +671,7 @@ impl MemTypeLayout {
         | QPtrMemUsageKind::DirectAccess(usage_type) = usage.kind
         {
             if usage_offset == 0 && self.original_type == usage_type {
-                return true;
+                return Some(self.original_type);
             }
         }
 
@@ -616,7 +688,7 @@ impl MemTypeLayout {
                     .then_some(self.mem_layout.fixed_base.size),
             };
             if !extent.includes(&usage_extent) {
-                return false;
+                return None;
             }
         }
 
@@ -631,40 +703,76 @@ impl MemTypeLayout {
                 match &self.components {
                     Components::Scalar => unreachable!(),
                     Components::Elements { stride, elem, .. } => {
-                        elem.supports_usage_at_offset(usage_offset % stride.get(), usage)
+                        // FIXME(eddyb) support rebuilding an array type.
+                        elem.type_supporting_usage_at_offset(cx, usage_offset % stride.get(), usage)
+                            == Some(elem.original_type)
                     }
                     Components::Fields { offsets, layouts, .. } => {
-                        layouts[idx].supports_usage_at_offset(usage_offset - offsets[idx], usage)
+                        // FIXME(eddyb) support rebuilding a struct type.
+                        let field = &layouts[idx];
+                        field.type_supporting_usage_at_offset(
+                            cx,
+                            usage_offset - offsets[idx],
+                            usage,
+                        ) == Some(field.original_type)
                     }
                 }
             })
         };
         match &usage.kind {
-            _ if any_component_supports(usage_offset, usage) => true,
+            _ if any_component_supports(usage_offset, usage) => Some(self.original_type),
 
             QPtrMemUsageKind::Unused => unreachable!(),
 
-            QPtrMemUsageKind::StrictlyTyped(_) | QPtrMemUsageKind::DirectAccess(_) => false,
+            &QPtrMemUsageKind::StrictlyTyped(usage_type)
+            | &QPtrMemUsageKind::DirectAccess(usage_type) => {
+                if usage_type.as_scalar(cx).is_some() {
+                    let original_scalar_type = self.original_type.as_scalar(cx)?;
+                    match original_scalar_type {
+                        // FIXME(eddyb) not sure if this even a realistic situation.
+                        scalar::Type::Bool => return None,
+
+                        // HACK(eddyb) only unsigned integers are easy to support
+                        // directly, without incurring extra bit-shifts, though
+                        // any other type that allows bitcasting, could also work.
+                        scalar::Type::UInt(_) => {
+                            return Some(self.original_type);
+                        }
+
+                        scalar::Type::SInt(_) | scalar::Type::Float(_) => {}
+                    }
+                    return Some(cx.intern(scalar::Type::UInt(scalar::IntWidth::try_from_bits(
+                        original_scalar_type.bit_width(),
+                    )?)));
+                }
+
+                None
+            }
 
             QPtrMemUsageKind::OffsetBase(entries) => {
-                entries.iter().all(|(&sub_offset, sub_usage)| {
-                    // FIXME(eddyb) maybe this overflow should be propagated up,
-                    // as a sign that `usage` is malformed?
-                    usage_offset.checked_add(sub_offset).is_some_and(|combined_offset| {
-                        // NOTE(eddyb) the reason this is only applicable to
-                        // offset `0` is that *in all other cases*, every
-                        // individual `OffsetBase` requires its own type, to
-                        // allow performing offsets *in steps* (even if the
-                        // offsets could easily be constant-folded, they'd
-                        // *have to* be constant-folded *before* analysis,
-                        // to ensure there is no need for the intermediaries).
-                        if combined_offset == 0 {
-                            self.supports_usage_at_offset(0, sub_usage)
-                        } else {
-                            any_component_supports(combined_offset, sub_usage)
-                        }
+                entries
+                    .iter()
+                    .all(|(&sub_offset, sub_usage)| {
+                        // FIXME(eddyb) maybe this overflow should be propagated up,
+                        // as a sign that `usage` is malformed?
+                        usage_offset.checked_add(sub_offset).is_some_and(|combined_offset| {
+                            // NOTE(eddyb) the reason this is only applicable to
+                            // offset `0` is that *in all other cases*, every
+                            // individual `OffsetBase` requires its own type, to
+                            // allow performing offsets *in steps* (even if the
+                            // offsets could easily be constant-folded, they'd
+                            // *have to* be constant-folded *before* analysis,
+                            // to ensure there is no need for the intermediaries).
+                            if combined_offset == 0 {
+                                // FIXME(eddyb) support rebuilding a struct type.
+                                self.type_supporting_usage_at_offset(cx, 0, sub_usage)
+                                    == Some(self.original_type)
+                            } else {
+                                any_component_supports(combined_offset, sub_usage)
+                            }
+                        })
                     })
-                })
+                    .then_some(self.original_type)
             }
 
             // Finding an array entirely nested in a component was handled above,
@@ -686,7 +794,30 @@ impl MemTypeLayout {
                     // Dynamic offsetting into non-arrays is not supported, and it'd
                     // only make sense for legalization (or small-length arrays where
                     // selecting elements based on the index may be a practical choice).
-                    Components::Scalar | Components::Fields { .. } => false,
+                    Components::Scalar | Components::Fields { .. } => {
+                        // HACK(eddyb) as per the comment above: this is really
+                        // only here as a form of legalization.
+                        usage_fixed_len
+                            .ok()
+                            .flatten()
+                            .is_some_and(|usage_fixed_len| {
+                                (0..usage_fixed_len.get()).all(|i| {
+                                    let elem_offset = i.checked_mul(usage_stride.get()).unwrap();
+                                    // FIXME(eddyb) maybe this overflow should be propagated up,
+                                    // as a sign that `usage` is malformed?
+                                    usage_offset.checked_add(elem_offset).is_some_and(
+                                        |combined_offset| {
+                                            self.type_supporting_usage_at_offset(
+                                                cx,
+                                                combined_offset,
+                                                usage_elem,
+                                            ) == Some(self.original_type)
+                                        },
+                                    )
+                                })
+                            })
+                            .then_some(self.original_type)
+                    }
 
                     Components::Elements {
                         stride: layout_stride,
@@ -714,12 +845,19 @@ impl MemTypeLayout {
                         // FIXME(eddyb) this could maybe be allowed if there is still
                         // some kind of divisibility relation between the strides.
                         if ext_usage_offset != 0 {
-                            return false;
+                            return None;
                         }
 
-                        layout_stride == usage_stride
+                        if layout_stride == usage_stride
                             && Ok(*layout_fixed_len) == ext_usage_fixed_len
-                            && layout_elem.supports_usage_at_offset(0, usage_elem)
+                        {
+                            // FIXME(eddyb) support rebuilding an array type.
+                            (layout_elem.type_supporting_usage_at_offset(cx, 0, usage_elem)
+                                == Some(layout_elem.original_type))
+                            .then_some(self.original_type)
+                        } else {
+                            None
+                        }
                     }
                 }
             }
@@ -1036,7 +1174,7 @@ impl<'a> InferUsage<'a> {
                 };
                 *slot = Some(match slot.take() {
                     Some(old) => old.and_then(|old| {
-                        UsageMerger { layout_cache: &this.layout_cache }
+                        UsageMerger { cx: &this.cx, layout_cache: &this.layout_cache }
                             .merge(old, new_usage?)
                             .into_result()
                     }),
@@ -1284,7 +1422,7 @@ impl<'a> InferUsage<'a> {
                                 // of `usage`, by demanding it *also* support
                                 // dynamic indexing with `stride`.
                                 let strided_usage =
-                                    UsageMerger { layout_cache: &self.layout_cache }
+                                    UsageMerger { cx: &self.cx, layout_cache: &self.layout_cache }
                                         .merge_mem(
                                             usage,
                                             QPtrMemUsage {
@@ -1298,16 +1436,19 @@ impl<'a> InferUsage<'a> {
                                             },
                                         )
                                         .into_result()?;
-                                let intra_stride_usage = match strided_usage.kind {
+                                // HACK(eddyb) `merged_stride > stride` is now
+                                // possible, with `qptr::lift` being expected to
+                                // emulate finer-grained offsetting in that case.
+                                let flags = match &strided_usage.kind {
                                     QPtrMemUsageKind::DynOffsetBase {
                                         element,
                                         stride: merged_stride,
-                                    } if merged_stride == stride
+                                    } if *merged_stride >= stride
                                         && element
                                             .max_size
-                                            .is_some_and(|s| s <= stride.get()) =>
+                                            .is_some_and(|s| s <= merged_stride.get()) =>
                                     {
-                                        element
+                                        element.flags.propagate_outwards()
                                     }
 
                                     _ => {
@@ -1322,11 +1463,8 @@ impl<'a> InferUsage<'a> {
 
                                 Ok(QPtrUsage::Memory(QPtrMemUsage {
                                     max_size,
-                                    flags: intra_stride_usage.flags.propagate_outwards(),
-                                    kind: QPtrMemUsageKind::DynOffsetBase {
-                                        element: intra_stride_usage,
-                                        stride,
-                                    },
+                                    flags,
+                                    kind: strided_usage.kind,
                                 }))
                             }),
                     );
