@@ -583,6 +583,29 @@ impl Module {
                 id_defs.insert(id, IdDef::Type(ty));
 
                 Seq::TypeConstOrGlobalVar
+            } else if opcode == wk.OpConstantFunctionPointerINTEL {
+                let id = inst.result_id.unwrap();
+
+                let func_id = inst.ids[0];
+                let func = match id_defs.get(&func_id) {
+                    Some(&IdDef::Func(func)) => Ok(func),
+                    Some(id_def) => Err(id_def.descr(&cx)),
+                    None => Err(format!("a forward reference to %{func_id}")),
+                }
+                .map_err(|descr| {
+                    invalid(&format!(
+                        "unsupported use of {descr} as the `OpConstantFunctionPointerINTEL` operand"
+                    ))
+                })?;
+
+                let ct = cx.intern(ConstDef {
+                    attrs: mem::take(&mut attrs),
+                    ty: result_type.unwrap(),
+                    kind: ConstKind::PtrToFunc(func),
+                });
+                id_defs.insert(id, IdDef::Const(ct));
+
+                Seq::TypeConstOrGlobalVar
             } else if inst_category == spec::InstructionCategory::Const || opcode == wk.OpUndef {
                 let id = inst.result_id.unwrap();
                 let const_inputs = inst
