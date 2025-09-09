@@ -1080,25 +1080,14 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     ])));
                 }
 
-                let valid_partial_access = valid_bitwrangling_access
-                    .filter(|bw| bw.pointee_uint_width > bw.access_scalar_width);
-
-                let Some(bw) = valid_partial_access else {
-                    if valid_bitwrangling_access.is_some() {
-                        return Err(LiftError(Diag::bug([
-                            "unimplemented bitcasting between access type `".into(),
-                            access_type.into(),
-                            "` and pointee type `".into(),
-                            pointee_type.into(),
-                            "`".into(),
-                        ])));
-                    }
-
+                let Some(bw) = valid_bitwrangling_access else {
                     data_inst_def.kind = access_op.into();
                     data_inst_def.inputs[0] = adjusted_ptr;
 
                     return Ok(Transformed::Changed(data_inst_def));
                 };
+
+                let is_partial = bw.pointee_uint_width > bw.access_scalar_width;
 
                 let inst_for_access_type_to_uint = |v, uint_ty| {
                     match bw.access_scalar_type {
@@ -1147,29 +1136,81 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 // NOTE(eddyb) all partial accesses require loading the whole
                 // pointee value, even when storing (as the store must combine
                 // both the old pointee value and the newly stored value).
-                let load_pointee_inst = insert_aux_data_inst(
-                    self,
-                    func.reborrow(),
-                    DataInstDef {
-                        attrs: Default::default(),
-                        kind: DataInstKind::Mem(MemOp::Load { offset: None }),
-                        inputs: [adjusted_ptr].into_iter().collect(),
-                        child_regions: [].into_iter().collect(),
-                        outputs: [].into_iter().collect(),
-                    },
-                );
-                let loaded_pointee = func.vars.define(
-                    cx,
-                    VarDecl {
-                        attrs: Default::default(),
-                        ty: pointee_type,
-                        def_parent: Either::Right(load_pointee_inst),
-                        def_idx: 0,
-                    },
-                );
-                func.nodes[load_pointee_inst].outputs.push(loaded_pointee);
-                let loaded_pointee = Value::Var(loaded_pointee);
+                let loaded_pointee = (stored_value.is_none() || is_partial).then(|| {
+                    let load_pointee_inst = insert_aux_data_inst(
+                        self,
+                        func.reborrow(),
+                        DataInstDef {
+                            attrs: Default::default(),
+                            kind: DataInstKind::Mem(MemOp::Load { offset: None }),
+                            inputs: [adjusted_ptr].into_iter().collect(),
+                            child_regions: [].into_iter().collect(),
+                            outputs: [].into_iter().collect(),
+                        },
+                    );
+                    let loaded_pointee = func.vars.define(
+                        cx,
+                        VarDecl {
+                            attrs: Default::default(),
+                            ty: pointee_type,
+                            def_parent: Either::Right(load_pointee_inst),
+                            def_idx: 0,
+                        },
+                    );
+                    func.nodes[load_pointee_inst].outputs.push(loaded_pointee);
+                    Value::Var(loaded_pointee)
+                });
 
+                let loaded_pointee = match (loaded_pointee, stored_value) {
+                    // HACK(eddyb) handled below (unify)?
+                    (Some(loaded_pointee), _) if is_partial => loaded_pointee,
+
+                    (Some(loaded_pointee), None) => {
+                        assert!(!is_partial);
+
+                        // FIXME(eddyb) SPIR-T should have its own bitcast.
+                        (data_inst_def.kind, data_inst_def.inputs) =
+                            inst_for_int_to_access_type(loaded_pointee, bw.pointee_scalar_type);
+                        return Ok(Transformed::Changed(data_inst_def));
+                    }
+                    (None, Some(stored_value)) => {
+                        assert!(!is_partial);
+
+                        let (cast_kind, cast_inputs) =
+                            inst_for_access_type_to_uint(stored_value, bw.pointee_scalar_type);
+                        let cast_stored_value_inst = insert_aux_data_inst(
+                            self,
+                            func.reborrow(),
+                            DataInstDef {
+                                attrs: Default::default(),
+                                kind: cast_kind,
+                                inputs: cast_inputs,
+                                child_regions: [].into_iter().collect(),
+                                outputs: [].into_iter().collect(),
+                            },
+                        );
+                        let cast_stored_value = func.vars.define(
+                            cx,
+                            VarDecl {
+                                attrs: Default::default(),
+                                ty: pointee_type,
+                                def_parent: Either::Right(cast_stored_value_inst),
+                                def_idx: 0,
+                            },
+                        );
+                        func.nodes[cast_stored_value_inst].outputs.push(cast_stored_value);
+
+                        data_inst_def.kind = access_op.into();
+                        data_inst_def.inputs[0] = adjusted_ptr;
+                        data_inst_def.inputs[1] = Value::Var(cast_stored_value);
+
+                        return Ok(Transformed::Changed(data_inst_def));
+                    }
+                    (None, None) | (Some(_), Some(_)) => unreachable!(),
+                };
+
+                // FIXME(eddyb) unify this with the logic above?
+                assert!(is_partial);
                 let new_kind_and_inputs = if let Some(stored_value) = stored_value {
                     let shl_amount = bw.access_bit_offset_in_pointee;
 
