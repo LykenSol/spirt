@@ -15,3 +15,8 @@ pub fn structurize_func_cfgs(module: &mut Module) {
         }
     }
 }
+
+// FIXME(eddyb) properly make this configurable.
+pub fn emulate_call_stack(module: &mut Module, config: &cf::stackful::CallStackEmuConfig) {
+    cf::stackful::CallStackEmulator::new(module, config).transform_module(module);
+}

@@ -9,6 +9,7 @@ use crate::{scalar, spv};
 pub mod callgraph;
 pub mod cfgssa;
 pub mod hermetic;
+pub mod stackful;
 pub mod structurize;
 pub mod unstructured;
 

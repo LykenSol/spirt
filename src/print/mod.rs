@@ -3016,6 +3016,8 @@ impl Print for Vec<DiagMsgPart> {
             DiagMsgPart::Type(ty) => ty.print(printer),
             DiagMsgPart::Const(ct) => ct.print(printer),
             DiagMsgPart::MemAccesses(accesses) => accesses.print(printer),
+
+            DiagMsgPart::Func(func) => func.print(printer),
         }))
     }
 }
