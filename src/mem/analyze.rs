@@ -941,10 +941,29 @@ impl<'a> GatherAccesses<'a> {
 
             let mut generate_accesses = |this: &mut Self, ptr: Value, new_accesses| {
                 let slot = match ptr {
-                    Value::Const(ct) => match cx[ct].kind {
-                        ConstKind::PtrToGlobalVar(gv) => {
+                    Value::Const(ct) => match &cx[ct].kind {
+                        // HACK(eddyb) this only sort of makes sense
+                        // for invalid pointers, which cannot themselves
+                        // be meaningfully used in accesses, and only
+                        // require lifting to a logical pointer type
+                        // when they're e.g. a selection case output
+                        // (with a valid pointer in a sibling case).
+                        ConstKind::Undef => return,
+                        ConstKind::SpvInst { spv_inst_and_const_inputs }
+                            if {
+                                // FIXME(eddyb) maybe `qptr` should have its own null constant?
+                                let (spv_inst, _) = &**spv_inst_and_const_inputs;
+                                spv_inst.opcode
+                                    == crate::spv::spec::Spec::get().well_known.OpConstantNull
+                            } =>
+                        {
+                            return;
+                        }
+
+                        &ConstKind::PtrToGlobalVar(gv) => {
                             this.global_var_accesses.entry(gv).or_default()
                         }
+
                         // FIXME(eddyb) attach on the `Const` by replacing
                         // it with a copy that also has an extra attribute,
                         // or actually support by adding the accesses attribute
