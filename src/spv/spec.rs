@@ -124,10 +124,6 @@ def_well_known! {
         OpTypeForwardPointer,
         OpTypePointer,
         OpTypeFunction,
-        OpTypeImage,
-        OpTypeSampler,
-        OpTypeSampledImage,
-        OpTypeAccelerationStructureKHR,
 
         // FIXME(eddyb) hide these from code, lowering should handle most cases.
         OpConstantComposite,
@@ -156,6 +152,8 @@ def_well_known! {
         OpSwitch,
 
         OpFunctionCall,
+
+        OpImageTexelPointer,
 
         OpLoad,
         OpStore,
@@ -200,6 +198,8 @@ def_well_known! {
         UniformConstant,
         Input,
         Output,
+
+        Image,
 
         IncomingRayPayloadKHR,
         IncomingCallableDataKHR,
