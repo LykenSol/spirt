@@ -1,15 +1,101 @@
 //! Immutable IR traversal.
 
+use crate::cf::{self, SelectionKind};
 use crate::func_at::FuncAt;
-use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
+use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
+use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstDef, DataInstKind,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInstKind,
     DbgSrcLoc, DeclDef, DiagMsgPart, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
-    FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
-    ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region,
-    RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
-    spv,
+    FuncDefBody, FuncParam, FxIndexSet, GlobalVar, GlobalVarDecl, GlobalVarDefBody, GlobalVarInit,
+    Import, Module, ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, OrdAssertEq, Region,
+    RegionDef, Type, TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl, spv,
 };
+
+// FIXME(eddyb) should this be placed somewhere else?
+pub struct ReachableUseCollector<'a> {
+    cx: &'a Context,
+    current_module: Option<&'a Module>,
+
+    pub all_uses: AllUses,
+}
+
+// FIXME(eddyb) better names and/or grouping interned and entity separately.
+// FIXME(eddyb) some of these sets could be bitsets etc.
+#[derive(Default)]
+pub struct AllUses {
+    pub attr_sets: FxIndexSet<AttrSet>,
+    pub types: FxIndexSet<Type>,
+    pub consts: FxIndexSet<Const>,
+
+    pub global_vars: FxIndexSet<GlobalVar>,
+    pub funcs: FxIndexSet<Func>,
+}
+
+impl AllUses {
+    // FIXME(eddyb) better APIs, perhaps by merging with callgraphs?
+    // (and/or moving global vars imports to func defs, like Cranelift?)
+    pub fn from_module(module: &Module) -> Self {
+        let mut collector = ReachableUseCollector::new(module.cx_ref());
+        collector.visit_module(module);
+        collector.all_uses
+    }
+}
+
+impl<'a> ReachableUseCollector<'a> {
+    pub fn new(cx: &'a Context) -> Self {
+        ReachableUseCollector { cx, current_module: None, all_uses: AllUses::default() }
+    }
+}
+
+impl<'a> Visitor<'a> for ReachableUseCollector<'a> {
+    fn visit_attr_set_use(&mut self, attrs: AttrSet) {
+        if self.all_uses.attr_sets.insert(attrs) {
+            self.visit_attr_set_def(&self.cx[attrs]);
+        }
+    }
+    fn visit_type_use(&mut self, ty: Type) {
+        if self.all_uses.types.insert(ty) {
+            self.visit_type_def(&self.cx[ty]);
+        }
+    }
+    fn visit_const_use(&mut self, ct: Const) {
+        if self.all_uses.consts.insert(ct) {
+            self.visit_const_def(&self.cx[ct]);
+        }
+    }
+
+    fn visit_global_var_use(&mut self, gv: GlobalVar) {
+        if let Some(module) = self.current_module {
+            if self.all_uses.global_vars.insert(gv) {
+                self.visit_global_var_decl(&module.global_vars[gv]);
+            }
+        } else {
+            // FIXME(eddyb) should this be a hard error?
+        }
+    }
+    fn visit_func_use(&mut self, func: Func) {
+        if let Some(module) = self.current_module {
+            if self.all_uses.funcs.insert(func) {
+                self.visit_func_decl(&module.funcs[func]);
+            }
+        } else {
+            // FIXME(eddyb) should this be a hard error?
+        }
+    }
+
+    fn visit_module(&mut self, module: &'a Module) {
+        assert!(
+            std::ptr::eq(self.cx, &**module.cx_ref()),
+            "print: `Plan::visit_module` does not support `Module`s from a \
+             different `Context` than the one it was initially created with",
+        );
+
+        let old_module = self.current_module.replace(module);
+        module.inner_visit_with(self);
+        self.current_module = old_module;
+    }
+}
 
 // FIXME(eddyb) `Sized` bound shouldn't be needed but removing it requires
 // writing `impl Visitor<'a> + ?Sized` in `fn inner_visit_with` signatures.
@@ -64,8 +150,8 @@ pub trait Visitor<'a>: Sized {
     fn visit_node_def(&mut self, func_at_node: FuncAt<'a, Node>) {
         func_at_node.inner_visit_with(self);
     }
-    fn visit_data_inst_def(&mut self, data_inst_def: &'a DataInstDef) {
-        data_inst_def.inner_visit_with(self);
+    fn visit_var_decl(&mut self, func_at_var: FuncAt<'a, Var>) {
+        func_at_var.decl().inner_visit_with(self);
     }
     fn visit_value_use(&mut self, v: &'a Value) {
         v.inner_visit_with(self);
@@ -127,7 +213,6 @@ impl_visit! {
         visit_const_def(ConstDef),
         visit_global_var_decl(GlobalVarDecl),
         visit_func_decl(FuncDecl),
-        visit_data_inst_def(DataInstDef),
         visit_value_use(Value),
     }
     forward_to_inner_visit {
@@ -245,13 +330,15 @@ impl InnerVisit for Attr {
                 }
             }
 
+            Attr::Mem(attr) => match attr {
+                MemAttr::Accesses(accesses) => accesses.0.inner_visit_with(visitor),
+            },
+
             Attr::QPtr(attr) => match attr {
                 QPtrAttr::ToSpvPtrInput { input_idx: _, pointee }
                 | QPtrAttr::FromSpvPtrOutput { addr_space: _, pointee } => {
                     visitor.visit_type_use(pointee.0);
                 }
-
-                QPtrAttr::Usage(usage) => usage.0.inner_visit_with(visitor),
             },
         }
     }
@@ -267,46 +354,46 @@ impl InnerVisit for Vec<DiagMsgPart> {
                 &DiagMsgPart::Attrs(attrs) => visitor.visit_attr_set_use(attrs),
                 &DiagMsgPart::Type(ty) => visitor.visit_type_use(ty),
                 &DiagMsgPart::Const(ct) => visitor.visit_const_use(ct),
-                DiagMsgPart::QPtrUsage(usage) => usage.inner_visit_with(visitor),
+                DiagMsgPart::MemAccesses(accesses) => accesses.inner_visit_with(visitor),
             }
         }
     }
 }
 
-impl InnerVisit for QPtrUsage {
+impl InnerVisit for MemAccesses {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         match self {
-            &QPtrUsage::Handles(qptr::shapes::Handle::Opaque(ty)) => {
+            &MemAccesses::Handles(crate::mem::shapes::Handle::Opaque(ty)) => {
                 visitor.visit_type_use(ty);
             }
-            QPtrUsage::Handles(qptr::shapes::Handle::Buffer(_, data_usage)) => {
-                data_usage.inner_visit_with(visitor);
+            MemAccesses::Handles(crate::mem::shapes::Handle::Buffer(_, data_happ)) => {
+                data_happ.inner_visit_with(visitor);
             }
-            QPtrUsage::Memory(usage) => usage.inner_visit_with(visitor),
+            MemAccesses::Data(happ) => happ.inner_visit_with(visitor),
         }
     }
 }
 
-impl InnerVisit for QPtrMemUsage {
+impl InnerVisit for DataHapp {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { max_size: _, kind } = self;
+        let Self { max_size: _, flags: _, kind } = self;
         kind.inner_visit_with(visitor);
     }
 }
 
-impl InnerVisit for QPtrMemUsageKind {
+impl InnerVisit for DataHappKind {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         match self {
-            Self::Unused => {}
-            &Self::StrictlyTyped(ty) | &Self::DirectAccess(ty) => {
+            Self::Dead => {}
+            &Self::StrictlyTyped(ty) | &Self::Direct(ty) => {
                 visitor.visit_type_use(ty);
             }
-            Self::OffsetBase(entries) => {
-                for sub_usage in entries.values() {
-                    sub_usage.inner_visit_with(visitor);
+            Self::Disjoint(entries) => {
+                for sub_happ in entries.values() {
+                    sub_happ.inner_visit_with(visitor);
                 }
             }
-            Self::DynOffsetBase { element, stride: _ } => {
+            Self::Repeated { element, stride: _ } => {
                 element.inner_visit_with(visitor);
             }
         }
@@ -319,9 +406,13 @@ impl InnerVisit for TypeDef {
 
         visitor.visit_attr_set_use(*attrs);
         match kind {
-            TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => {}
+            TypeKind::Scalar(_)
+            | TypeKind::Vector(_)
+            | TypeKind::QPtr
+            | TypeKind::Thunk
+            | TypeKind::SpvStringLiteralForExtInst => {}
 
-            TypeKind::SpvInst { spv_inst: _, type_and_const_inputs } => {
+            TypeKind::SpvInst { spv_inst: _, type_and_const_inputs, value_lowering: _ } => {
                 for &ty_or_ct in type_and_const_inputs {
                     match ty_or_ct {
                         TypeOrConst::Type(ty) => visitor.visit_type_use(ty),
@@ -340,14 +431,21 @@ impl InnerVisit for ConstDef {
         visitor.visit_attr_set_use(*attrs);
         visitor.visit_type_use(*ty);
         match kind {
-            &ConstKind::PtrToGlobalVar(gv) => visitor.visit_global_var_use(gv),
+            ConstKind::Undef
+            | ConstKind::Scalar(_)
+            | ConstKind::Vector(_)
+            | ConstKind::SpvStringLiteralForExtInst(_) => {}
+
+            &ConstKind::PtrToGlobalVar { global_var, offset: _ } => {
+                visitor.visit_global_var_use(global_var);
+            }
+            &ConstKind::PtrToFunc(func) => visitor.visit_func_use(func),
             ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                 let (_spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
                 for &ct in const_inputs {
                     visitor.visit_const_use(ct);
                 }
             }
-            ConstKind::SpvStringLiteralForExtInst(_) => {}
         }
     }
 }
@@ -369,9 +467,11 @@ impl InnerVisit for GlobalVarDecl {
         visitor.visit_type_use(*type_of_ptr_to);
         if let Some(shape) = shape {
             match shape {
-                qptr::shapes::GlobalVarShape::TypedInterface(ty) => visitor.visit_type_use(*ty),
-                qptr::shapes::GlobalVarShape::Handles { .. }
-                | qptr::shapes::GlobalVarShape::UntypedData(_) => {}
+                crate::mem::shapes::GlobalVarShape::TypedInterface(ty) => {
+                    visitor.visit_type_use(*ty);
+                }
+                crate::mem::shapes::GlobalVarShape::Handles { .. }
+                | crate::mem::shapes::GlobalVarShape::UntypedData(_) => {}
             }
         }
         match addr_space {
@@ -385,18 +485,39 @@ impl InnerVisit for GlobalVarDefBody {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
         let Self { initializer } = self;
 
-        if let Some(initializer) = *initializer {
-            visitor.visit_const_use(initializer);
+        if let Some(initializer) = initializer {
+            initializer.inner_visit_with(visitor);
+        }
+    }
+}
+
+impl InnerVisit for GlobalVarInit {
+    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
+        match self {
+            &GlobalVarInit::Direct(ct) => visitor.visit_const_use(ct),
+            GlobalVarInit::SpvAggregate { ty, leaves } => {
+                visitor.visit_type_use(*ty);
+                for &ct in leaves {
+                    visitor.visit_const_use(ct);
+                }
+            }
+            GlobalVarInit::Data(data) => {
+                for &ct in data.used_symbolic_values() {
+                    visitor.visit_const_use(ct);
+                }
+            }
         }
     }
 }
 
 impl InnerVisit for FuncDecl {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, ret_type, params, def } = self;
+        let Self { attrs, ret_types, params, def } = self;
 
         visitor.visit_attr_set_use(*attrs);
-        visitor.visit_type_use(*ret_type);
+        for &ty in ret_types {
+            visitor.visit_type_use(ty);
+        }
         for param in params {
             param.inner_visit_with(visitor);
         }
@@ -420,10 +541,6 @@ impl InnerVisit for FuncDefBody {
             Some(cfg) => {
                 for region in cfg.rev_post_order(self) {
                     visitor.visit_region_def(self.at(region));
-
-                    if let Some(control_inst) = cfg.control_inst_on_exit_from.get(region) {
-                        control_inst.inner_visit_with(visitor);
-                    }
                 }
             }
         }
@@ -436,22 +553,13 @@ impl<'a> FuncAt<'a, Region> {
     pub fn inner_visit_with(self, visitor: &mut impl Visitor<'a>) {
         let RegionDef { inputs, children, outputs } = self.def();
 
-        for input in inputs {
-            input.inner_visit_with(visitor);
+        for &input in inputs {
+            visitor.visit_var_decl(self.at(input));
         }
         self.at(*children).into_iter().inner_visit_with(visitor);
         for v in outputs {
             visitor.visit_value_use(v);
         }
-    }
-}
-
-impl InnerVisit for RegionInputDecl {
-    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, ty } = *self;
-
-        visitor.visit_attr_set_use(attrs);
-        visitor.visit_type_use(ty);
     }
 }
 
@@ -469,118 +577,84 @@ impl<'a> FuncAt<'a, EntityListIter<Node>> {
 // requirement, whereas this has `'a` in `self: FuncAt<'a, Node>`.
 impl<'a> FuncAt<'a, Node> {
     pub fn inner_visit_with(self, visitor: &mut impl Visitor<'a>) {
-        let NodeDef { kind, outputs } = self.def();
+        let NodeDef { attrs, kind, inputs, child_regions, outputs } = self.def();
 
+        visitor.visit_attr_set_use(*attrs);
         match kind {
-            NodeKind::Block { insts } => {
-                for func_at_inst in self.at(*insts) {
-                    visitor.visit_data_inst_def(func_at_inst.def());
-                }
-            }
-            NodeKind::Select {
-                kind: SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-                scrutinee,
-                cases,
-            } => {
-                visitor.visit_value_use(scrutinee);
-                for &case in cases {
-                    visitor.visit_region_def(self.at(case));
-                }
-            }
-            NodeKind::Loop { initial_inputs, body, repeat_condition } => {
-                for v in initial_inputs {
-                    visitor.visit_value_use(v);
-                }
-                visitor.visit_region_def(self.at(*body));
-                visitor.visit_value_use(repeat_condition);
-            }
-            NodeKind::ExitInvocation { kind: cfg::ExitInvocationKind::SpvInst(_), inputs } => {
-                for v in inputs {
-                    visitor.visit_value_use(v);
-                }
+            &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
+
+            NodeKind::Select(
+                SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
+            )
+            | NodeKind::Loop { repeat_condition: _ }
+            | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
+            | DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
+            | DataInstKind::Mem(
+                MemOp::FuncLocalVar(_)
+                | MemOp::Load { .. }
+                | MemOp::Store { .. }
+                | MemOp::Copy { .. },
+            )
+            | DataInstKind::QPtr(
+                QPtrOp::HandleArrayIndex
+                | QPtrOp::BufferData
+                | QPtrOp::BufferDynLen { .. }
+                | QPtrOp::Offset(_)
+                | QPtrOp::DynOffset { .. },
+            )
+            | DataInstKind::ThunkBind(_) => {}
+            DataInstKind::SpvInst(_, lowering)
+            | DataInstKind::SpvExtInst { ext_set: _, inst: _, lowering } => {
+                lowering.inner_visit_with(visitor);
             }
         }
-        for output in outputs {
-            output.inner_visit_with(visitor);
+        for v in inputs {
+            visitor.visit_value_use(v);
+        }
+        for &region in child_regions {
+            visitor.visit_region_def(self.at(region));
+        }
+
+        // HACK(eddyb) semantically, `repeat_condition` is a body region output.
+        if let NodeKind::Loop { repeat_condition } = kind {
+            visitor.visit_value_use(repeat_condition);
+        }
+
+        for &output in outputs {
+            visitor.visit_var_decl(self.at(output));
         }
     }
 }
 
-impl InnerVisit for NodeOutputDecl {
+impl InnerVisit for VarDecl {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, ty } = *self;
+        let Self { attrs, ty, def_parent: _, def_idx: _ } = *self;
 
         visitor.visit_attr_set_use(attrs);
         visitor.visit_type_use(ty);
     }
 }
 
-impl InnerVisit for DataInstDef {
+impl InnerVisit for spv::InstLowering {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, kind, inputs, output_type } = self;
+        let Self { disaggregated_output, disaggregated_inputs } = self;
 
-        visitor.visit_attr_set_use(*attrs);
-        kind.inner_visit_with(visitor);
-        for v in inputs {
-            visitor.visit_value_use(v);
-        }
-        if let Some(ty) = *output_type {
+        if let Some(ty) = *disaggregated_output {
             visitor.visit_type_use(ty);
         }
-    }
-}
-
-impl InnerVisit for DataInstKind {
-    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        match self {
-            &DataInstKind::FuncCall(func) => visitor.visit_func_use(func),
-            DataInstKind::QPtr(op) => match *op {
-                QPtrOp::FuncLocalVar(_)
-                | QPtrOp::HandleArrayIndex
-                | QPtrOp::BufferData
-                | QPtrOp::BufferDynLen { .. }
-                | QPtrOp::Offset(_)
-                | QPtrOp::DynOffset { .. }
-                | QPtrOp::Load
-                | QPtrOp::Store => {}
-            },
-            DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
-        }
-    }
-}
-
-impl InnerVisit for cfg::ControlInst {
-    fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, kind, inputs, targets: _, target_inputs } = self;
-
-        visitor.visit_attr_set_use(*attrs);
-        match kind {
-            cfg::ControlInstKind::Unreachable
-            | cfg::ControlInstKind::Return
-            | cfg::ControlInstKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(_))
-            | cfg::ControlInstKind::Branch
-            | cfg::ControlInstKind::SelectBranch(
-                SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-            ) => {}
-        }
-        for v in inputs {
-            visitor.visit_value_use(v);
-        }
-        for inputs in target_inputs.values() {
-            for v in inputs {
-                visitor.visit_value_use(v);
-            }
+        for &(_, ty) in disaggregated_inputs {
+            visitor.visit_type_use(ty);
         }
     }
 }
 
 impl InnerVisit for Value {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        match *self {
-            Self::Const(ct) => visitor.visit_const_use(ct),
-            Self::RegionInput { region: _, input_idx: _ }
-            | Self::NodeOutput { node: _, output_idx: _ }
-            | Self::DataInstOutput(_) => {}
+        match self {
+            &Self::Const(ct) => visitor.visit_const_use(ct),
+            // FIXME(eddyb) maybe there should be a `visit_var_use`?
+            Self::Var(_) => {}
         }
     }
 }

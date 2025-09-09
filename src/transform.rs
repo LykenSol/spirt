@@ -1,18 +1,18 @@
 //! Mutable IR traversal.
 
+use crate::cf::{self, SelectionKind};
 use crate::func_at::FuncAtMut;
-use crate::qptr::{self, QPtrAttr, QPtrMemUsage, QPtrMemUsageKind, QPtrOp, QPtrUsage};
+use crate::mem::{DataHapp, DataHappKind, MemAccesses, MemAttr, MemOp};
+use crate::qptr::{QPtrAttr, QPtrOp};
 use crate::{
-    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInst, DataInstDef,
-    DataInstKind, DbgSrcLoc, DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl,
-    FuncDefBody, FuncParam, GlobalVar, GlobalVarDecl, GlobalVarDefBody, Import, Module,
-    ModuleDebugInfo, ModuleDialect, Node, NodeDef, NodeKind, NodeOutputDecl, OrdAssertEq, Region,
-    RegionDef, RegionInputDecl, SelectionKind, Type, TypeDef, TypeKind, TypeOrConst, Value, cfg,
-    spv,
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstKind, DbgSrcLoc,
+    DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
+    GlobalVar, GlobalVarDecl, GlobalVarDefBody, GlobalVarInit, Import, Module, ModuleDebugInfo,
+    ModuleDialect, Node, NodeDef, NodeKind, OrdAssertEq, Region, RegionDef, Type, TypeDef,
+    TypeKind, TypeOrConst, Value, Var, VarDecl, spv,
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
-use std::slice;
 
 /// The result of a transformation (which is not in-place).
 #[must_use]
@@ -193,11 +193,14 @@ pub trait Transformer: Sized {
     fn in_place_transform_func_decl(&mut self, func_decl: &mut FuncDecl) {
         func_decl.inner_in_place_transform_with(self);
     }
+    fn in_place_transform_region_def(&mut self, mut func_at_region: FuncAtMut<'_, Region>) {
+        func_at_region.inner_in_place_transform_with(self);
+    }
     fn in_place_transform_node_def(&mut self, mut func_at_node: FuncAtMut<'_, Node>) {
         func_at_node.inner_in_place_transform_with(self);
     }
-    fn in_place_transform_data_inst_def(&mut self, mut func_at_data_inst: FuncAtMut<'_, DataInst>) {
-        func_at_data_inst.inner_in_place_transform_with(self);
+    fn in_place_transform_var_decl(&mut self, func_at_var: FuncAtMut<'_, Var>) {
+        func_at_var.decl().inner_in_place_transform_with(self);
     }
 }
 
@@ -343,13 +346,31 @@ impl InnerTransform for Attr {
                 })))
             }
 
-            Attr::QPtr(attr) => transform!({
+            Attr::Mem(attr) => transform!({
                 attr -> match attr {
-                    &QPtrAttr::ToSpvPtrInput { input_idx, pointee } => transform!({
+                    MemAttr::Accesses(OrdAssertEq(accesses)) => transform!({
+                        accesses -> match accesses {
+                            &MemAccesses::Handles(crate::mem::shapes::Handle::Opaque(ty)) => transform!({
+                                ty -> transformer.transform_type_use(ty),
+                            } => MemAccesses::Handles(crate::mem::shapes::Handle::Opaque(ty))),
+                            MemAccesses::Handles(crate::mem::shapes::Handle::Buffer(addr_space, data_happ)) => transform!({
+                                data_happ -> data_happ.inner_transform_with(transformer),
+                            } => MemAccesses::Handles(crate::mem::shapes::Handle::Buffer(*addr_space, data_happ))),
+                            MemAccesses::Data(happ) => transform!({
+                                happ -> happ.inner_transform_with(transformer),
+                            } => MemAccesses::Data(happ)),
+                        }
+                    } => MemAttr::Accesses(OrdAssertEq(accesses))),
+                }
+            } => Attr::Mem(attr)),
+
+            Attr::QPtr(attr) => transform!({
+                attr -> match *attr {
+                    QPtrAttr::ToSpvPtrInput { input_idx, pointee } => transform!({
                         pointee -> transformer.transform_type_use(pointee.0).map(OrdAssertEq),
                     } => QPtrAttr::ToSpvPtrInput { input_idx, pointee }),
 
-                    &QPtrAttr::FromSpvPtrOutput {
+                    QPtrAttr::FromSpvPtrOutput {
                         addr_space,
                         pointee,
                     } => transform!({
@@ -358,20 +379,6 @@ impl InnerTransform for Attr {
                         addr_space,
                         pointee,
                     }),
-
-                    QPtrAttr::Usage(OrdAssertEq(usage)) => transform!({
-                        usage -> match usage {
-                            &QPtrUsage::Handles(qptr::shapes::Handle::Opaque(ty)) => transform!({
-                                ty -> transformer.transform_type_use(ty),
-                            } => QPtrUsage::Handles(qptr::shapes::Handle::Opaque(ty))),
-                            QPtrUsage::Handles(qptr::shapes::Handle::Buffer(addr_space, data_usage)) => transform!({
-                                data_usage -> data_usage.inner_transform_with(transformer),
-                            } => QPtrUsage::Handles(qptr::shapes::Handle::Buffer(*addr_space, data_usage))),
-                            QPtrUsage::Memory(usage) => transform!({
-                                usage -> usage.inner_transform_with(transformer),
-                            } => QPtrUsage::Memory(usage)),
-                        }
-                    } => QPtrAttr::Usage(OrdAssertEq(usage))),
                 }
             } => Attr::QPtr(attr)),
         }
@@ -385,41 +392,42 @@ impl<T: InnerTransform> InnerTransform for Rc<T> {
     }
 }
 
-impl InnerTransform for QPtrMemUsage {
+impl InnerTransform for DataHapp {
     fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
-        let Self { max_size, kind } = self;
+        let Self { max_size, flags, kind } = self;
 
         transform!({
             kind -> kind.inner_transform_with(transformer)
         } => Self {
             max_size: *max_size,
+            flags: *flags,
             kind,
         })
     }
 }
 
-impl InnerTransform for QPtrMemUsageKind {
+impl InnerTransform for DataHappKind {
     fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
         match self {
-            Self::Unused => Transformed::Unchanged,
+            Self::Dead => Transformed::Unchanged,
             &Self::StrictlyTyped(ty) => transform!({
                 ty -> transformer.transform_type_use(ty),
             } => Self::StrictlyTyped(ty)),
-            &Self::DirectAccess(ty) => transform!({
+            &Self::Direct(ty) => transform!({
                 ty -> transformer.transform_type_use(ty),
-            } => Self::DirectAccess(ty)),
-            Self::OffsetBase(entries) => transform!({
-                entries -> Transformed::map_iter(entries.values(), |sub_usage| {
-                    sub_usage.inner_transform_with(transformer)
+            } => Self::Direct(ty)),
+            Self::Disjoint(entries) => transform!({
+                entries -> Transformed::map_iter(entries.values(), |sub_happ| {
+                    sub_happ.inner_transform_with(transformer)
                 }).map(|new_iter| {
                     // HACK(eddyb) this is a bit inefficient but `Transformed::map_iter`
                     // limits us here in how it handles the whole `Clone` thing.
                     entries.keys().copied().zip(new_iter).collect()
                 }).map(Rc::new)
-            } => Self::OffsetBase(entries)),
-            Self::DynOffsetBase { element, stride } => transform!({
+            } => Self::Disjoint(entries)),
+            Self::Repeated { element, stride } => transform!({
                 element -> element.inner_transform_with(transformer),
-            } => Self::DynOffsetBase { element, stride: *stride }),
+            } => Self::Repeated { element, stride: *stride }),
         }
     }
 }
@@ -431,9 +439,13 @@ impl InnerTransform for TypeDef {
         transform!({
             attrs -> transformer.transform_attr_set_use(*attrs),
             kind -> match kind {
-                TypeKind::QPtr | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
+                TypeKind::Scalar(_)
+                | TypeKind::Vector(_)
+                | TypeKind::QPtr
+                | TypeKind::Thunk
+                | TypeKind::SpvStringLiteralForExtInst => Transformed::Unchanged,
 
-                TypeKind::SpvInst { spv_inst, type_and_const_inputs } => Transformed::map_iter(
+                TypeKind::SpvInst { spv_inst, type_and_const_inputs, value_lowering } => Transformed::map_iter(
                     type_and_const_inputs.iter(),
                     |ty_or_ct| match *ty_or_ct {
                         TypeOrConst::Type(ty) => transform!({
@@ -447,6 +459,7 @@ impl InnerTransform for TypeDef {
                 ).map(|new_iter| TypeKind::SpvInst {
                     spv_inst: spv_inst.clone(),
                     type_and_const_inputs: new_iter.collect(),
+                    value_lowering: value_lowering.clone(),
                 }),
             },
         } => Self {
@@ -464,9 +477,18 @@ impl InnerTransform for ConstDef {
             attrs -> transformer.transform_attr_set_use(*attrs),
             ty -> transformer.transform_type_use(*ty),
             kind -> match kind {
-                ConstKind::PtrToGlobalVar(gv) => transform!({
-                    gv -> transformer.transform_global_var_use(*gv),
-                } => ConstKind::PtrToGlobalVar(gv)),
+                ConstKind::Undef
+                | ConstKind::Scalar(_)
+                | ConstKind::Vector(_)
+                | ConstKind::SpvStringLiteralForExtInst(_) => Transformed::Unchanged,
+
+                ConstKind::PtrToGlobalVar { global_var, offset } => transform!({
+                    global_var -> transformer.transform_global_var_use(*global_var),
+                } => ConstKind::PtrToGlobalVar { global_var, offset: *offset }),
+
+                ConstKind::PtrToFunc(func) => transform!({
+                    func -> transformer.transform_func_use(*func),
+                } => ConstKind::PtrToFunc(func)),
 
                 ConstKind::SpvInst { spv_inst_and_const_inputs } => {
                     let (spv_inst, const_inputs) = &**spv_inst_and_const_inputs;
@@ -477,7 +499,6 @@ impl InnerTransform for ConstDef {
                         spv_inst_and_const_inputs: Rc::new((spv_inst.clone(), new_iter.collect())),
                     })
                 }
-                ConstKind::SpvStringLiteralForExtInst(_) => Transformed::Unchanged
             },
         } => Self {
             attrs,
@@ -506,11 +527,11 @@ impl InnerInPlaceTransform for GlobalVarDecl {
         transformer.transform_type_use(*type_of_ptr_to).apply_to(type_of_ptr_to);
         if let Some(shape) = shape {
             match shape {
-                qptr::shapes::GlobalVarShape::TypedInterface(ty) => {
+                crate::mem::shapes::GlobalVarShape::TypedInterface(ty) => {
                     transformer.transform_type_use(*ty).apply_to(ty);
                 }
-                qptr::shapes::GlobalVarShape::Handles { .. }
-                | qptr::shapes::GlobalVarShape::UntypedData(_) => {}
+                crate::mem::shapes::GlobalVarShape::Handles { .. }
+                | crate::mem::shapes::GlobalVarShape::UntypedData(_) => {}
             }
         }
         match addr_space {
@@ -525,17 +546,38 @@ impl InnerInPlaceTransform for GlobalVarDefBody {
         let Self { initializer } = self;
 
         if let Some(initializer) = initializer {
-            transformer.transform_const_use(*initializer).apply_to(initializer);
+            initializer.inner_in_place_transform_with(transformer);
+        }
+    }
+}
+
+impl InnerInPlaceTransform for GlobalVarInit {
+    fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
+        match self {
+            GlobalVarInit::Direct(ct) => transformer.transform_const_use(*ct).apply_to(ct),
+            GlobalVarInit::SpvAggregate { ty, leaves } => {
+                transformer.transform_type_use(*ty).apply_to(ty);
+                for ct in leaves {
+                    transformer.transform_const_use(*ct).apply_to(ct);
+                }
+            }
+            GlobalVarInit::Data(data) => {
+                for ct in data.used_symbolic_values_mut() {
+                    transformer.transform_const_use(*ct).apply_to(ct);
+                }
+            }
         }
     }
 }
 
 impl InnerInPlaceTransform for FuncDecl {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let Self { attrs, ret_type, params, def } = self;
+        let Self { attrs, ret_types, params, def } = self;
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
-        transformer.transform_type_use(*ret_type).apply_to(ret_type);
+        for ty in ret_types {
+            transformer.transform_type_use(*ty).apply_to(ty);
+        }
         for param in params {
             param.inner_transform_with(transformer).apply_to(param);
         }
@@ -560,18 +602,13 @@ impl InnerTransform for FuncParam {
 impl InnerInPlaceTransform for FuncDefBody {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
         match &self.unstructured_cfg {
-            None => self.at_mut_body().inner_in_place_transform_with(transformer),
+            None => transformer.in_place_transform_region_def(self.at_mut_body()),
             Some(cfg) => {
                 // HACK(eddyb) have to compute this before borrowing any `self` fields.
                 let rpo = cfg.rev_post_order(self);
 
                 for region in rpo {
-                    self.at_mut(region).inner_in_place_transform_with(transformer);
-
-                    let cfg = self.unstructured_cfg.as_mut().unwrap();
-                    if let Some(control_inst) = cfg.control_inst_on_exit_from.get_mut(region) {
-                        control_inst.inner_in_place_transform_with(transformer);
-                    }
+                    transformer.in_place_transform_region_def(self.at_mut(region));
                 }
             }
         }
@@ -583,8 +620,11 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Region> {
         // HACK(eddyb) handle the fields of `Region` separately, to
         // allow reborrowing `FuncAtMut` (for recursing into `Node`s).
         let RegionDef { inputs, children: _, outputs: _ } = self.reborrow().def();
-        for input in inputs {
-            input.inner_transform_with(transformer).apply_to(input);
+
+        // FIXME(eddyb) dedup with the future `FuncAtMut<Value>` solution.
+        for input_idx in 0..inputs.len() {
+            let input = self.reborrow().def().inputs[input_idx];
+            transformer.in_place_transform_var_decl(self.reborrow().at(input));
         }
 
         self.reborrow().at_children().into_iter().inner_in_place_transform_with(transformer);
@@ -593,20 +633,6 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Region> {
         for v in outputs {
             transformer.transform_value_use(v).apply_to(v);
         }
-    }
-}
-
-impl InnerTransform for RegionInputDecl {
-    fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
-        let Self { attrs, ty } = self;
-
-        transform!({
-            attrs -> transformer.transform_attr_set_use(*attrs),
-            ty -> transformer.transform_type_use(*ty),
-        } => Self {
-            attrs,
-            ty,
-        })
     }
 }
 
@@ -619,139 +645,86 @@ impl InnerInPlaceTransform for FuncAtMut<'_, EntityListIter<Node>> {
     }
 }
 
-impl FuncAtMut<'_, Node> {
-    fn child_regions(&mut self) -> &mut [Region] {
-        match &mut self.reborrow().def().kind {
-            NodeKind::Block { .. } | NodeKind::ExitInvocation { .. } => &mut [][..],
-
-            NodeKind::Select { cases, .. } => cases,
-            NodeKind::Loop { body, .. } => slice::from_mut(body),
-        }
-    }
-}
-
 impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        // HACK(eddyb) handle pre-child-regions parts of `kind` separately to
-        // allow reborrowing `FuncAtMut` (for the child region recursion).
-        match &mut self.reborrow().def().kind {
-            &mut NodeKind::Block { insts } => {
-                let mut func_at_inst_iter = self.reborrow().at(insts).into_iter();
-                while let Some(func_at_inst) = func_at_inst_iter.next() {
-                    transformer.in_place_transform_data_inst_def(func_at_inst);
-                }
-            }
-            NodeKind::Select {
-                kind: SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-                scrutinee,
-                cases: _,
-            } => {
-                transformer.transform_value_use(scrutinee).apply_to(scrutinee);
-            }
-            NodeKind::Loop { initial_inputs: inputs, body: _, repeat_condition: _ }
-            | NodeKind::ExitInvocation { kind: cfg::ExitInvocationKind::SpvInst(_), inputs } => {
-                for v in inputs {
-                    transformer.transform_value_use(v).apply_to(v);
-                }
-            }
-        }
-
-        // FIXME(eddyb) represent the list of child regions without having them
-        // in a `Vec` (or `SmallVec`), which requires workarounds like this.
-        for child_region_idx in 0..self.child_regions().len() {
-            let child_region = self.child_regions()[child_region_idx];
-            self.reborrow().at(child_region).inner_in_place_transform_with(transformer);
-        }
-
-        let NodeDef { kind, outputs } = self.reborrow().def();
-
-        match kind {
-            // Fully handled above, before recursing into any child regions.
-            NodeKind::Block { insts: _ }
-            | NodeKind::Select { kind: _, scrutinee: _, cases: _ }
-            | NodeKind::ExitInvocation { kind: cfg::ExitInvocationKind::SpvInst(_), inputs: _ } => {
-            }
-
-            NodeKind::Loop { initial_inputs: _, body: _, repeat_condition } => {
-                transformer.transform_value_use(repeat_condition).apply_to(repeat_condition);
-            }
-        };
-
-        for output in outputs {
-            output.inner_transform_with(transformer).apply_to(output);
-        }
-    }
-}
-
-impl InnerTransform for NodeOutputDecl {
-    fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
-        let Self { attrs, ty } = self;
-
-        transform!({
-            attrs -> transformer.transform_attr_set_use(*attrs),
-            ty -> transformer.transform_type_use(*ty),
-        } => Self {
-            attrs,
-            ty,
-        })
-    }
-}
-
-impl InnerInPlaceTransform for FuncAtMut<'_, DataInst> {
-    fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let DataInstDef { attrs, kind, inputs, output_type } = self.reborrow().def();
+        let NodeDef { attrs, kind, inputs: _, child_regions: _, outputs: _ } =
+            self.reborrow().def();
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
-        kind.inner_in_place_transform_with(transformer);
-        for v in inputs {
-            transformer.transform_value_use(v).apply_to(v);
-        }
-        if let Some(output_type) = output_type {
-            transformer.transform_type_use(*output_type).apply_to(output_type);
-        }
-    }
-}
-
-impl InnerInPlaceTransform for DataInstKind {
-    fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        match self {
+        match kind {
             DataInstKind::FuncCall(func) => transformer.transform_func_use(*func).apply_to(func),
-            DataInstKind::QPtr(op) => match op {
-                QPtrOp::FuncLocalVar(_)
-                | QPtrOp::HandleArrayIndex
+
+            NodeKind::Select(
+                SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
+            )
+            | NodeKind::Loop { repeat_condition: _ }
+            | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
+            | DataInstKind::Scalar(_)
+            | DataInstKind::Vector(_)
+            | DataInstKind::Mem(
+                MemOp::FuncLocalVar(_)
+                | MemOp::Load { .. }
+                | MemOp::Store { .. }
+                | MemOp::Copy { .. },
+            )
+            | DataInstKind::QPtr(
+                QPtrOp::HandleArrayIndex
                 | QPtrOp::BufferData
                 | QPtrOp::BufferDynLen { .. }
                 | QPtrOp::Offset(_)
-                | QPtrOp::DynOffset { .. }
-                | QPtrOp::Load
-                | QPtrOp::Store => {}
-            },
-            DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
+                | QPtrOp::DynOffset { .. },
+            )
+            | DataInstKind::ThunkBind(_) => {}
+
+            DataInstKind::SpvInst(_, lowering)
+            | DataInstKind::SpvExtInst { ext_set: _, inst: _, lowering } => {
+                lowering.inner_in_place_transform_with(transformer);
+            }
+        }
+
+        for v in &mut self.reborrow().def().inputs {
+            transformer.transform_value_use(v).apply_to(v);
+        }
+
+        for child_region_idx in 0..self.reborrow().def().child_regions.len() {
+            let child_region = self.reborrow().def().child_regions[child_region_idx];
+            transformer.in_place_transform_region_def(self.reborrow().at(child_region));
+        }
+
+        let NodeDef { attrs: _, kind, inputs: _, child_regions: _, outputs } =
+            self.reborrow().def();
+
+        // HACK(eddyb) semantically, `repeat_condition` is a body region output.
+        if let NodeKind::Loop { repeat_condition } = kind {
+            transformer.transform_value_use(repeat_condition).apply_to(repeat_condition);
+        }
+
+        // FIXME(eddyb) dedup with the future `FuncAtMut<Value>` solution.
+        for output_idx in 0..outputs.len() {
+            let output = self.reborrow().def().outputs[output_idx];
+            transformer.in_place_transform_var_decl(self.reborrow().at(output));
         }
     }
 }
 
-impl InnerInPlaceTransform for cfg::ControlInst {
+impl InnerInPlaceTransform for VarDecl {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let Self { attrs, kind, inputs, targets: _, target_inputs } = self;
+        let Self { attrs, ty, def_parent: _, def_idx: _ } = self;
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
-        match kind {
-            cfg::ControlInstKind::Unreachable
-            | cfg::ControlInstKind::Return
-            | cfg::ControlInstKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(_))
-            | cfg::ControlInstKind::Branch
-            | cfg::ControlInstKind::SelectBranch(
-                SelectionKind::BoolCond | SelectionKind::SpvInst(_),
-            ) => {}
+        transformer.transform_type_use(*ty).apply_to(ty);
+    }
+}
+
+impl InnerInPlaceTransform for spv::InstLowering {
+    fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
+        let Self { disaggregated_output, disaggregated_inputs } = self;
+
+        if let Some(disaggregated_output) = disaggregated_output {
+            transformer.transform_type_use(*disaggregated_output).apply_to(disaggregated_output);
         }
-        for v in inputs {
-            transformer.transform_value_use(v).apply_to(v);
-        }
-        for inputs in target_inputs.values_mut() {
-            for v in inputs {
-                transformer.transform_value_use(v).apply_to(v);
-            }
+        for (_range, ty) in disaggregated_inputs {
+            transformer.transform_type_use(*ty).apply_to(ty);
         }
     }
 }
@@ -762,10 +735,8 @@ impl InnerTransform for Value {
             Self::Const(ct) => transform!({
                 ct -> transformer.transform_const_use(*ct),
             } => Self::Const(ct)),
-
-            Self::RegionInput { region: _, input_idx: _ }
-            | Self::NodeOutput { node: _, output_idx: _ }
-            | Self::DataInstOutput(_) => Transformed::Unchanged,
+            // FIXME(eddyb) maybe there should be a `transform_var_use`?
+            Self::Var(_) => Transformed::Unchanged,
         }
     }
 }

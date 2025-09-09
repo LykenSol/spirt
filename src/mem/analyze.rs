@@ -1,0 +1,1785 @@
+//! Memory access analysis (for "type recovery", i.e. untyped -> typed memory).
+//
+// TODO(eddyb) consider renaming this to `mem::typed`.
+//
+// FIXME(eddyb) the `legalize`-vs-`analyze`+`lift` split can be confusing,
+// and may need more than documentation (but for now, see `qptr::legalize` docs).
+
+use crate::func_at::FuncAt;
+use crate::mem::{DataHapp, DataHappFlags, DataHappKind, MemAccesses, MemAttr, MemOp, shapes};
+use crate::qptr::{QPtrAttr, QPtrOp};
+use crate::visit::{InnerVisit, Visitor};
+use crate::{
+    AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInstKind, DeclDef, Diag,
+    ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind, OrdAssertEq, Type,
+    TypeKind, Value, Var, scalar,
+};
+use itertools::Either;
+use smallvec::SmallVec;
+use std::mem;
+use std::num::NonZeroU32;
+use std::ops::Bound;
+use std::rc::Rc;
+
+// HACK(eddyb) sharing layout code with other modules.
+// FIXME(eddyb) can this just be a non-glob import?
+use crate::mem::layout::*;
+
+#[derive(Clone)]
+struct AnalysisError(Diag);
+
+struct AccessMerger<'a> {
+    cx: &'a Context,
+    layout_cache: &'a LayoutCache<'a>,
+}
+
+/// Result type for `AccessMerger` methods - unlike `Result<T, AnalysisError>`,
+/// this always keeps the `T` value, even in the case of an error.
+struct MergeResult<T> {
+    merged: T,
+    error: Option<AnalysisError>,
+}
+
+impl<T> MergeResult<T> {
+    fn ok(merged: T) -> Self {
+        Self { merged, error: None }
+    }
+
+    fn into_result(self) -> Result<T, AnalysisError> {
+        let Self { merged, error } = self;
+        match error {
+            None => Ok(merged),
+            Some(e) => Err(e),
+        }
+    }
+
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> MergeResult<U> {
+        let Self { merged, error } = self;
+        let merged = f(merged);
+        MergeResult { merged, error }
+    }
+}
+
+impl AccessMerger<'_> {
+    fn merge(&self, a: MemAccesses, b: MemAccesses) -> MergeResult<MemAccesses> {
+        match (a, b) {
+            (
+                MemAccesses::Handles(shapes::Handle::Opaque(a)),
+                MemAccesses::Handles(shapes::Handle::Opaque(b)),
+            ) if a == b => MergeResult::ok(MemAccesses::Handles(shapes::Handle::Opaque(a))),
+
+            (
+                MemAccesses::Handles(shapes::Handle::Buffer(a_as, a)),
+                MemAccesses::Handles(shapes::Handle::Buffer(b_as, b)),
+            ) => {
+                // HACK(eddyb) the `AddrSpace` field is entirely redundant.
+                assert!(a_as == AddrSpace::Handles && b_as == AddrSpace::Handles);
+
+                self.merge_data(a, b).map(|happ| {
+                    MemAccesses::Handles(shapes::Handle::Buffer(AddrSpace::Handles, happ))
+                })
+            }
+
+            (MemAccesses::Data(a), MemAccesses::Data(b)) => {
+                self.merge_data(a, b).map(MemAccesses::Data)
+            }
+
+            (a, b) => {
+                MergeResult {
+                    // FIXME(eddyb) there may be a better choice here, but it
+                    // generally doesn't matter, as this method only has one
+                    // caller, and it just calls `.into_result()` right away.
+                    merged: a.clone(),
+                    error: Some(AnalysisError(Diag::bug([
+                        "merge: ".into(),
+                        a.into(),
+                        " vs ".into(),
+                        b.into(),
+                    ]))),
+                }
+            }
+        }
+    }
+
+    fn merge_data(&self, a: DataHapp, b: DataHapp) -> MergeResult<DataHapp> {
+        self.merge_data_at(a, 0, b)
+    }
+
+    // FIXME(eddyb) make the name of this clarify the asymmetric effect, something
+    // like "make `a` compatible with `offset => b`".
+    fn merge_data_at(&self, a: DataHapp, b_offset_in_a: u32, b: DataHapp) -> MergeResult<DataHapp> {
+        // NOTE(eddyb) this is doable because it's currently impossible for
+        // the merged HAPP to be outside the bounds of *both* `a` and `offset => b`.
+        let max_size = match (a.max_size, b.max_size) {
+            (Some(a), Some(b)) => Some(a.max(b.checked_add(b_offset_in_a).unwrap())),
+            (None, _) | (_, None) => None,
+        };
+
+        let [a, b] = if b_offset_in_a == 0 {
+            // Ensure that `a` is "larger" than `b`, or at least the same size
+            // (when either they're identical, or one is a "newtype" of the other),
+            // to make it easier to handle all the possible interactions below,
+            // by skipping (or deprioritizing, if supported) the "wrong direction".
+            let mut sorted = [a, b];
+            sorted.sort_by_key(|happ| {
+                #[derive(PartialEq, Eq, PartialOrd, Ord)]
+                enum MaxSize<T> {
+                    Fixed(T),
+                    // FIXME(eddyb) this probably needs to track "min size"?
+                    Dynamic,
+                }
+                let max_size = happ.max_size.map_or(MaxSize::Dynamic, MaxSize::Fixed);
+
+                // When sizes are equal, pick the more restrictive side.
+                #[derive(PartialEq, Eq, PartialOrd, Ord)]
+                enum TypeStrictness {
+                    Any,
+                    Array {
+                        // HACK(eddyb) this allows ending up with the larger stride
+                        // on the left.
+                        stride: NonZeroU32,
+                    },
+                    Exact,
+                }
+                #[allow(clippy::match_same_arms)]
+                let type_strictness = match happ.kind {
+                    DataHappKind::Dead | DataHappKind::Disjoint(_) => TypeStrictness::Any,
+
+                    DataHappKind::Repeated { stride, .. } => TypeStrictness::Array { stride },
+
+                    // FIXME(eddyb) this should be `Any`, even if in theory it
+                    // could contain arrays or structs that need decomposition
+                    // (note that, for typed reads/write, arrays do not need to be
+                    // *indexed* to work, i.e. they *do not* require `DynOffset`s,
+                    // `Offset`s suffice, and for them `Repeated` is at most
+                    // a "run-length"/deduplication optimization over `Disjoint`).
+                    // NOTE(eddyb) this should still prefer `OpTypeVector` over `Repeated`!
+                    DataHappKind::Direct(_) => TypeStrictness::Exact,
+
+                    DataHappKind::StrictlyTyped(_) => TypeStrictness::Exact,
+                };
+
+                (max_size, type_strictness)
+            });
+            let [b, a] = sorted;
+            [a, b]
+        } else {
+            // HACK(eddyb) to avoid callers having to account for this, treat
+            // `a` too small to fit `offset => b` as a new `Disjoint`.
+            let a_min_req_max_size = max_size.unwrap_or(b_offset_in_a);
+            if a.max_size.is_some_and(|a| a < a_min_req_max_size) {
+                [
+                    DataHapp {
+                        max_size,
+                        flags: a.flags.propagate_outwards(),
+                        kind: DataHappKind::Disjoint(Rc::new(
+                            Some((0, a))
+                                .filter(|(_, a)| !matches!(a.kind, DataHappKind::Dead))
+                                .into_iter()
+                                .collect(),
+                        )),
+                    },
+                    b,
+                ]
+            } else {
+                [a, b]
+            }
+        };
+        assert_eq!(max_size, a.max_size);
+
+        let mut flags = a.flags;
+        flags |= if b_offset_in_a == 0 && max_size == b.max_size {
+            b.flags
+        } else {
+            // HACK(eddyb) assuming flags-preserving nesting of `b` into `a`,
+            // with `flags |= b.flags` later used if that stops being true.
+            b.flags.propagate_outwards()
+        };
+
+        // Decompose the "smaller" and/or "less strict" side (`b`) first.
+        let can_flatten_b = {
+            // HACK(eddyb) this check was added later, after it turned out
+            // that *deep* flattening of arbitrary offsets in `b` would've
+            // required constant-folding of `qptr.offset` in `qptr::lift`,
+            // to not need all the type nesting levels for `OpAccessChain`.
+            b_offset_in_a == 0
+            // HACK(eddyb) this second check also avoids flattening e.g.
+            // a smaller copy from/to offset 0 of a larger variable.
+            && flags.contains(b.flags)
+        };
+        if can_flatten_b {
+            match b.kind {
+                // `Dead`s are always ignored.
+                DataHappKind::Dead => {
+                    let mut a = a;
+                    a.flags = flags;
+                    return MergeResult::ok(a);
+                }
+
+                DataHappKind::Disjoint(b_entries) => {
+                    // FIXME(eddyb) this whole dance only needed due to `Rc`.
+                    let b_entries = Rc::try_unwrap(b_entries);
+                    let b_entries = match b_entries {
+                        Ok(entries) => Either::Left(entries.into_iter()),
+                        Err(ref entries) => {
+                            Either::Right(entries.iter().map(|(&k, v)| (k, v.clone())))
+                        }
+                    };
+
+                    let mut ab = a;
+                    ab.flags = flags;
+                    let mut all_errors = None;
+                    for (b_offset, b_sub_happ) in b_entries {
+                        let MergeResult { merged, error: new_error } = self.merge_data_at(
+                            ab,
+                            b_offset.checked_add(b_offset_in_a).unwrap(),
+                            b_sub_happ,
+                        );
+                        ab = merged;
+
+                        // FIXME(eddyb) move some of this into `MergeResult`!
+                        if let Some(AnalysisError(e)) = new_error {
+                            let all_errors = &mut all_errors
+                                .get_or_insert(AnalysisError(Diag::bug([])))
+                                .0
+                                .message;
+                            // FIXME(eddyb) should this mean `MergeResult` should
+                            // use `errors: Vec<AnalysisError>` instead of `Option`?
+                            if !all_errors.is_empty() {
+                                all_errors.push("\n".into());
+                            }
+                            // FIXME(eddyb) this is scuffed because the error might
+                            // (or really *should*) already refer to the right offset!
+                            all_errors.push(format!("+{b_offset} => ").into());
+                            all_errors.extend(e.message);
+                        }
+                    }
+                    return MergeResult {
+                        merged: ab,
+                        // FIXME(eddyb) should this mean `MergeResult` should
+                        // use `errors: Vec<AnalysisError>` instead of `Option`?
+                        error: all_errors.map(|AnalysisError(mut e)| {
+                            e.message.insert(0, "merge_data: conflicts:\n".into());
+                            AnalysisError(e)
+                        }),
+                    };
+                }
+
+                _ => {}
+            }
+        }
+
+        let kind = match a.kind {
+            // `Dead`s are always ignored.
+            DataHappKind::Dead => {
+                // NOTE(eddyb) this is handled near the start of `merge_data_at`.
+                assert_eq!(b_offset_in_a, 0);
+
+                // HACK(eddyb) in lieu of flags-preserving nesting of `b` into `a`.
+                flags |= b.flags;
+
+                MergeResult::ok(b.kind)
+            }
+
+            // Typed leaves must support any possible accesses applied to them
+            // (when they match, or overtake, that access, in size, like here),
+            // with their inherent hierarchy (i.e. their array/struct nesting).
+            DataHappKind::StrictlyTyped(a_type) | DataHappKind::Direct(a_type) => {
+                // HACK(eddyb) in lieu of flags-preserving nesting of `b` into `a`.
+                flags |= b.flags;
+
+                let b_type_at_offset_0 = match b.kind {
+                    DataHappKind::StrictlyTyped(b_type) | DataHappKind::Direct(b_type)
+                        if b_offset_in_a == 0 =>
+                    {
+                        Some(b_type)
+                    }
+                    _ => None,
+                };
+                let ty = if Some(a_type) == b_type_at_offset_0 {
+                    MergeResult::ok(a_type)
+                } else {
+                    let type_supporting_happ_at_offset = |a: &DataHapp, b_offset_in_a, b| {
+                        let (a_type, a_is_strict) = match a.kind {
+                            DataHappKind::StrictlyTyped(ty) => (ty, true),
+                            DataHappKind::Direct(ty) => (ty, false),
+                            _ => unreachable!(),
+                        };
+                        match self.layout_of(a_type) {
+                            // FIXME(eddyb) should this be `unreachable!()`? also, is
+                            // it possible to end up with `ty` being an `OpTypeStruct`
+                            // decorated with `Block`, showing up as a `Buffer` handle?
+                            //
+                            // NOTE(eddyb) `Block`-annotated buffer types are *not*
+                            // usable anywhere inside buffer data, since they would
+                            // conflict with our own `Block`-annotated wrapper.
+                            Ok(TypeLayout::Handle(_) | TypeLayout::HandleArray(..)) => {
+                                Err(AnalysisError(Diag::bug([
+                                    "merge_data: impossible handle type for DataHapp".into(),
+                                ])))
+                            }
+                            Ok(TypeLayout::Concrete(concrete)) => Ok(
+                                concrete.type_supporting_happ_at_offset(self.cx, b_offset_in_a, b)
+                            ),
+
+                            Err(e) => Err(e),
+                        }
+                        .transpose()
+                        .and_then(|ty_or_err| {
+                            let ty = ty_or_err.as_ref().ok().copied().unwrap_or(a_type);
+
+                            if a_is_strict && ty != a_type {
+                                return None;
+                            }
+
+                            Some(MergeResult { merged: ty, error: ty_or_err.err() })
+                        })
+                    };
+
+                    type_supporting_happ_at_offset(&a, b_offset_in_a, &b)
+                        .or_else(|| {
+                            b_type_at_offset_0
+                                .and_then(|_| type_supporting_happ_at_offset(&b, 0, &a))
+                        })
+                        .unwrap_or_else(|| {
+                            MergeResult {
+                                merged: a_type,
+                                // FIXME(eddyb) this should ideally embed the types in the
+                                // error somehow.
+                                error: Some(AnalysisError(Diag::bug([
+                                    "merge_data: type subcomponents incompatible with accesses ("
+                                        .into(),
+                                    MemAccesses::Data(a.clone()).into(),
+                                    " vs ".into(),
+                                    MemAccesses::Data(b.clone()).into(),
+                                    ")".into(),
+                                ]))),
+                            }
+                        })
+                };
+
+                // FIXME(eddyb) if the chosen (maybe-larger) side isn't strict,
+                // it should also be possible to expand it into its components,
+                // with the other (maybe-smaller) side becoming a leaf.
+
+                // FIXME(eddyb) this might not enough because the
+                // strict leaf could be *nested* inside `b`!!!
+                let is_strict = |kind| matches!(kind, &DataHappKind::StrictlyTyped(_));
+                if is_strict(&a.kind) || is_strict(&b.kind) {
+                    ty.map(DataHappKind::StrictlyTyped)
+                } else {
+                    ty.map(DataHappKind::Direct)
+                }
+            }
+
+            DataHappKind::Repeated { element: mut a_element, stride: a_stride } => {
+                let b_offset_in_a_element = b_offset_in_a % a_stride;
+
+                let mut b = b;
+                let b_fits_in_a_element = b
+                    .max_size
+                    .and_then(|b_max_size| b_max_size.checked_add(b_offset_in_a_element))
+                    .is_some_and(|b_in_a_max_size| b_in_a_max_size <= a_stride.get())
+                    || match b.kind {
+                        // HACK(eddyb) special-case for when a whole number N
+                        // of `b_element`s fit in each `a_element` (which does
+                        // complicate lifting, needing new `/ N` and `% N` ops,
+                        // but it's better than no support at all).
+                        DataHappKind::Repeated { element: _, stride: b_stride }
+                            if b_offset_in_a_element == 0
+                                && a_stride > b_stride
+                                && a_stride.get().is_multiple_of(b_stride.get()) =>
+                        {
+                            b.max_size = Some(a_stride.get());
+                            true
+                        }
+                        _ => false,
+                    };
+
+                // Array-like dynamic offsetting needs to always merge any accesses
+                // that fit inside the stride, with its "element" HAPP, no matter
+                // how complex it may be (notably, this is needed for nested arrays).
+                if b_fits_in_a_element {
+                    // FIXME(eddyb) this in-place merging dance only needed due to `Rc`.
+                    ({
+                        let a_element_mut = Rc::make_mut(&mut a_element);
+                        let a_element = mem::replace(a_element_mut, DataHapp::DEAD);
+                        self.merge_data_at(a_element, b_offset_in_a_element, b)
+                            .map(|merged| *a_element_mut = merged)
+                    })
+                    .map(|()| DataHappKind::Repeated { element: a_element, stride: a_stride })
+                } else {
+                    // HACK(eddyb) in lieu of flags-preserving nesting of `b` into `a`.
+                    flags |= b.flags;
+
+                    match b.kind {
+                        DataHappKind::Repeated { element: b_element, stride: b_stride }
+                            if b_offset_in_a_element == 0 && a_stride == b_stride =>
+                        {
+                            // FIXME(eddyb) this in-place merging dance only needed due to `Rc`.
+                            ({
+                                let a_element_mut = Rc::make_mut(&mut a_element);
+                                let a_element = mem::replace(a_element_mut, DataHapp::DEAD);
+                                let b_element =
+                                    Rc::try_unwrap(b_element).unwrap_or_else(|e| (*e).clone());
+                                self.merge_data(a_element, b_element)
+                                    .map(|merged| *a_element_mut = merged)
+                            })
+                            .map(|()| DataHappKind::Repeated {
+                                element: a_element,
+                                stride: a_stride,
+                            })
+                        }
+                        _ => {
+                            // HACK(eddyb) needed due to `a` being moved out of.
+                            let a = DataHapp {
+                                max_size: a.max_size,
+                                flags: a.flags,
+                                kind: DataHappKind::Repeated {
+                                    element: a_element,
+                                    stride: a_stride,
+                                },
+                            };
+
+                            // FIXME(eddyb) implement somehow (by adjusting stride?).
+                            // NOTE(eddyb) with `b` as an `Repeated`/`Disjoint`, it could
+                            // also be possible to superimpose its offset patterns onto `a`,
+                            // though that's easier for `Disjoint` than `Repeated`.
+
+                            // HACK(eddyb) special-case "small element" indexing
+                            // vs a single "large element", by indexing the latter.
+                            let max_size_and_stride_for_repeating_b = b
+                                .max_size
+                                .and_then(|b_max_size| {
+                                    Some((a.max_size, NonZeroU32::new(b_max_size)?))
+                                })
+                                .filter(|&(max_size, stride)| {
+                                    match b.kind {
+                                        // HACK(eddyb) refuse nesting `Repeated`s.
+                                        DataHappKind::Repeated { .. } => false,
+
+                                        _ => {
+                                            b_offset_in_a_element == 0
+                                                && max_size.is_none_or(|size| {
+                                                    size >= stride.get()
+                                                        && size.is_multiple_of(stride.get())
+                                                })
+                                        }
+                                    }
+                                });
+                            if let Some((max_size, stride)) = max_size_and_stride_for_repeating_b {
+                                return self.merge_data(
+                                    a,
+                                    DataHapp {
+                                        max_size,
+                                        flags: b.flags.propagate_outwards(),
+                                        kind: DataHappKind::Repeated {
+                                            element: Rc::new(b),
+                                            stride,
+                                        },
+                                    },
+                                );
+                            }
+
+                            MergeResult {
+                                merged: a.kind.clone(),
+                                error: Some(AnalysisError(Diag::bug([
+                                    format!(
+                                        "merge_data: unimplemented \
+                                         non-intra-element merging into stride={a_stride} ("
+                                    )
+                                    .into(),
+                                    MemAccesses::Data(a).into(),
+                                    " vs ".into(),
+                                    MemAccesses::Data(b).into(),
+                                    ")".into(),
+                                ]))),
+                            }
+                        }
+                    }
+                }
+            }
+
+            DataHappKind::Disjoint(mut a_entries) => {
+                let overlapping_entries = a_entries
+                    .range((
+                        Bound::Unbounded,
+                        b.max_size.map_or(Bound::Unbounded, |b_max_size| {
+                            // HACK(eddyb) the unconditional `insert` below, at
+                            // `b_offset_in_a`, can overwrite an existing entry
+                            // if the ZST case isn't correctly handled.
+                            if b_max_size == 0 {
+                                Bound::Included(b_offset_in_a)
+                            } else {
+                                Bound::Excluded(b_offset_in_a.checked_add(b_max_size).unwrap())
+                            }
+                        }),
+                    ))
+                    .rev()
+                    .take_while(|&(&a_sub_offset, a_sub_happ)| {
+                        a_sub_happ.max_size.is_none_or(|a_sub_max_size| {
+                            // HACK(eddyb) the unconditional `insert` below, at
+                            // `b_offset_in_a`, can overwrite an existing entry
+                            // if the ZST case isn't correctly handled.
+                            if b.max_size == Some(0) && a_sub_offset == b_offset_in_a {
+                                return true;
+                            }
+
+                            a_sub_offset.checked_add(a_sub_max_size).unwrap() > b_offset_in_a
+                        })
+                    });
+
+                // FIXME(eddyb) this is a bit inefficient but we don't have
+                // cursors, so we have to buffer the `BTreeMap` keys here.
+                let overlapping_offsets: SmallVec<[u32; 16]> =
+                    overlapping_entries.map(|(&a_sub_offset, _)| a_sub_offset).collect();
+                let a_entries_mut = Rc::make_mut(&mut a_entries);
+                let mut all_errors = None;
+                let (mut b_offset_in_a, mut b) = (b_offset_in_a, b);
+                for a_sub_offset in overlapping_offsets {
+                    let a_sub_happ = a_entries_mut.remove(&a_sub_offset).unwrap();
+
+                    // HACK(eddyb) this replicates the condition in which
+                    // `merge_data_at` would fail its similar assert, some of
+                    // the cases denied here might be legal, but they're rare
+                    // enough that we can do this for now.
+                    let is_illegal = a_sub_offset != b_offset_in_a && {
+                        let (a_sub_total_max_size, b_total_max_size) = (
+                            a_sub_happ.max_size.map(|a| a.checked_add(a_sub_offset).unwrap()),
+                            b.max_size.map(|b| b.checked_add(b_offset_in_a).unwrap()),
+                        );
+                        let total_max_size_merged = match (a_sub_total_max_size, b_total_max_size) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (None, _) | (_, None) => None,
+                        };
+                        total_max_size_merged
+                            != if a_sub_offset < b_offset_in_a {
+                                a_sub_total_max_size
+                            } else {
+                                b_total_max_size
+                            }
+                    };
+                    if is_illegal {
+                        // HACK(eddyb) needed due to `a` being moved out of.
+                        let a = DataHapp {
+                            max_size: a.max_size,
+                            flags: a.flags,
+                            kind: DataHappKind::Disjoint(a_entries.clone()),
+                        };
+                        return MergeResult {
+                            merged: DataHapp {
+                                max_size,
+                                flags,
+                                kind: DataHappKind::Disjoint(a_entries),
+                            },
+                            error: Some(AnalysisError(Diag::bug([
+                                format!(
+                                    "merge_data: unsupported straddling overlap \
+                                     at offsets {a_sub_offset} vs {b_offset_in_a} ("
+                                )
+                                .into(),
+                                MemAccesses::Data(a).into(),
+                                " vs ".into(),
+                                MemAccesses::Data(b).into(),
+                                ")".into(),
+                            ]))),
+                        };
+                    }
+
+                    let new_error;
+                    (b_offset_in_a, MergeResult { merged: b, error: new_error }) =
+                        if a_sub_offset < b_offset_in_a {
+                            (
+                                a_sub_offset,
+                                self.merge_data_at(a_sub_happ, b_offset_in_a - a_sub_offset, b),
+                            )
+                        } else {
+                            (
+                                b_offset_in_a,
+                                self.merge_data_at(b, a_sub_offset - b_offset_in_a, a_sub_happ),
+                            )
+                        };
+
+                    // FIXME(eddyb) move some of this into `MergeResult`!
+                    if let Some(AnalysisError(e)) = new_error {
+                        let all_errors =
+                            &mut all_errors.get_or_insert(AnalysisError(Diag::bug([]))).0.message;
+                        // FIXME(eddyb) should this mean `MergeResult` should
+                        // use `errors: Vec<AnalysisError>` instead of `Option`?
+                        if !all_errors.is_empty() {
+                            all_errors.push("\n".into());
+                        }
+                        // FIXME(eddyb) this is scuffed because the error might
+                        // (or really *should*) already refer to the right offset!
+                        all_errors.push(format!("+{a_sub_offset} => ").into());
+                        all_errors.extend(e.message);
+                    }
+                }
+                a_entries_mut.insert(b_offset_in_a, b);
+                MergeResult {
+                    merged: DataHappKind::Disjoint(a_entries),
+                    // FIXME(eddyb) should this mean `MergeResult` should
+                    // use `errors: Vec<AnalysisError>` instead of `Option`?
+                    error: all_errors.map(|AnalysisError(mut e)| {
+                        e.message.insert(0, "merge_data: conflicts:\n".into());
+                        AnalysisError(e)
+                    }),
+                }
+            }
+        };
+        kind.map(|kind| DataHapp { max_size, flags, kind })
+    }
+
+    /// Attempt to compute a `TypeLayout` for a given (SPIR-V) `Type`.
+    fn layout_of(&self, ty: Type) -> Result<TypeLayout, AnalysisError> {
+        self.layout_cache.layout_of(ty).map_err(|LayoutError(err)| AnalysisError(err))
+    }
+}
+
+impl MemTypeLayout {
+    /// Determine if this layout is compatible with `happ` at `happ_offset`,
+    /// returning `Some(compatible_type)` if so.
+    ///
+    /// That is, all typed leaves of `happ` must be found inside `self`, at
+    /// their respective offsets, and all [`DataHappKind::Repeated`]s must
+    /// find a same-stride array inside `self` (to allow dynamic indexing).
+    ///
+    /// The returned `compatible_type` can be either `self.original_type`, or
+    /// a "similarly shaped" type (e.g. `f32` -> `u32`) improving compatibility.
+    //
+    // FIXME(eddyb) consider using `Result` to make it unambiguous.
+    fn type_supporting_happ_at_offset(
+        &self,
+        cx: &Context,
+        happ_offset: u32,
+        happ: &DataHapp,
+    ) -> Option<Type> {
+        if let DataHappKind::Dead = happ.kind {
+            return Some(self.original_type);
+        }
+
+        // "Fast accept" based on type alone (expected as recursion base case).
+        if let DataHappKind::StrictlyTyped(happ_type) | DataHappKind::Direct(happ_type) = happ.kind
+            && happ_offset == 0
+            && self.original_type == happ_type
+        {
+            return Some(self.original_type);
+        }
+
+        {
+            // FIXME(eddyb) should `DataHapp` have have an `.extent()` method?
+            let happ_extent = Extent { start: 0, end: happ.max_size }.saturating_add(happ_offset);
+
+            // "Fast reject" based on size alone (expected w/ multiple attempts).
+            // FIXME(eddyb) should `MemTypeLayout` have have an `.extent()` method?
+            let extent = Extent {
+                start: 0,
+                end: (self.mem_layout.dyn_unit_stride.is_none())
+                    .then_some(self.mem_layout.fixed_base.size),
+            };
+            if !extent.includes(&happ_extent) {
+                return None;
+            }
+        }
+
+        let any_component_supports = |happ_offset: u32, happ: &DataHapp| {
+            // FIXME(eddyb) should `DataHapp` have have an `.extent()` method?
+            let happ_extent = Extent { start: 0, end: happ.max_size }.saturating_add(happ_offset);
+
+            // FIXME(eddyb) `find_components_containing` is linear today but
+            // could be made logarithmic (via binary search).
+            self.components.find_components_containing(happ_extent).any(|idx| {
+                match &self.components {
+                    Components::Scalar => unreachable!(),
+                    Components::Elements { stride, elem, .. } => {
+                        // FIXME(eddyb) support rebuilding an array type.
+                        elem.type_supporting_happ_at_offset(cx, happ_offset % stride.get(), happ)
+                            == Some(elem.original_type)
+                    }
+                    Components::Fields { offsets, layouts, .. } => {
+                        // FIXME(eddyb) support rebuilding a struct type.
+                        let field = &layouts[idx];
+                        field.type_supporting_happ_at_offset(cx, happ_offset - offsets[idx], happ)
+                            == Some(field.original_type)
+                    }
+                }
+            })
+        };
+        match &happ.kind {
+            _ if any_component_supports(happ_offset, happ) => Some(self.original_type),
+
+            DataHappKind::Dead => unreachable!(),
+
+            &DataHappKind::StrictlyTyped(access_type) | &DataHappKind::Direct(access_type) => {
+                if access_type.as_scalar(cx).is_some() {
+                    let original_scalar_type = self.original_type.as_scalar(cx)?;
+                    match original_scalar_type {
+                        // FIXME(eddyb) not sure if this even a realistic situation.
+                        scalar::Type::Bool => return None,
+
+                        // HACK(eddyb) only unsigned integers are easy to support
+                        // directly, without incurring extra bit-shifts, though
+                        // any other type that allows bitcasting, could also work.
+                        scalar::Type::UInt(_) => {
+                            return Some(self.original_type);
+                        }
+
+                        scalar::Type::SInt(_) | scalar::Type::Float(_) => {}
+                    }
+                    return Some(cx.intern(scalar::Type::UInt(scalar::IntWidth::try_from_bits(
+                        original_scalar_type.bit_width(),
+                    )?)));
+                }
+
+                None
+            }
+
+            DataHappKind::Disjoint(entries) => {
+                entries
+                    .iter()
+                    .all(|(&sub_offset, sub_happ)| {
+                        // FIXME(eddyb) maybe this overflow should be propagated up,
+                        // as a sign that `happ` is malformed?
+                        happ_offset.checked_add(sub_offset).is_some_and(|combined_offset| {
+                            // NOTE(eddyb) the reason this is only applicable to
+                            // offset `0` is that *in all other cases*, every
+                            // individual `Disjoint` requires its own type, to
+                            // allow performing offsets *in steps* (even if the
+                            // offsets could easily be constant-folded, they'd
+                            // *have to* be constant-folded *before* analysis,
+                            // to ensure there is no need for the intermediaries).
+                            if combined_offset == 0 {
+                                // FIXME(eddyb) support rebuilding a struct type.
+                                self.type_supporting_happ_at_offset(cx, 0, sub_happ)
+                                    == Some(self.original_type)
+                            } else {
+                                any_component_supports(combined_offset, sub_happ)
+                            }
+                        })
+                    })
+                    .then_some(self.original_type)
+            }
+
+            // Finding an array entirely nested in a component was handled above,
+            // so here `layout` can only be a matching array (same stride and length).
+            DataHappKind::Repeated { element: happ_elem, stride: happ_stride } => {
+                let happ_fixed_len = happ
+                    .max_size
+                    .map(|size| {
+                        if !size.is_multiple_of(happ_stride.get()) {
+                            // FIXME(eddyb) maybe this should be propagated up,
+                            // as a sign that `happ` is malformed?
+                            return Err(());
+                        }
+                        NonZeroU32::new(size / happ_stride.get()).ok_or(())
+                    })
+                    .transpose();
+
+                match &self.components {
+                    // Dynamic offsetting into non-arrays is not supported, and it'd
+                    // only make sense for legalization (or small-length arrays where
+                    // selecting elements based on the index may be a practical choice).
+                    Components::Scalar | Components::Fields { .. } => {
+                        // HACK(eddyb) as per the comment above: this is really
+                        // only here as a form of legalization.
+                        happ_fixed_len
+                            .ok()
+                            .flatten()
+                            .is_some_and(|happ_fixed_len| {
+                                (0..happ_fixed_len.get()).all(|i| {
+                                    let elem_offset = i.checked_mul(happ_stride.get()).unwrap();
+                                    // FIXME(eddyb) maybe this overflow should be propagated up,
+                                    // as a sign that `happ` is malformed?
+                                    happ_offset.checked_add(elem_offset).is_some_and(
+                                        |combined_offset| {
+                                            self.type_supporting_happ_at_offset(
+                                                cx,
+                                                combined_offset,
+                                                happ_elem,
+                                            ) == Some(self.original_type)
+                                        },
+                                    )
+                                })
+                            })
+                            .then_some(self.original_type)
+                    }
+
+                    Components::Elements {
+                        stride: layout_stride,
+                        elem: layout_elem,
+                        fixed_len: layout_fixed_len,
+                    } => {
+                        // HACK(eddyb) extend the max length implied by `happ`,
+                        // such that the array can start at offset `0`.
+                        let ext_happ_offset = happ_offset % happ_stride.get();
+                        let ext_happ_fixed_len = happ_fixed_len.and_then(|happ_fixed_len| {
+                            happ_fixed_len
+                                .map(|happ_fixed_len| {
+                                    NonZeroU32::new(
+                                        // FIXME(eddyb) maybe this overflow should be propagated up,
+                                        // as a sign that `happ` is malformed?
+                                        (happ_offset / happ_stride.get())
+                                            .checked_add(happ_fixed_len.get())
+                                            .ok_or(())?,
+                                    )
+                                    .ok_or(())
+                                })
+                                .transpose()
+                        });
+
+                        // FIXME(eddyb) this could maybe be allowed if there is still
+                        // some kind of divisibility relation between the strides.
+                        if ext_happ_offset != 0 {
+                            return None;
+                        }
+
+                        if layout_stride == happ_stride
+                            && Ok(*layout_fixed_len) == ext_happ_fixed_len
+                        {
+                            // FIXME(eddyb) support rebuilding an array type.
+                            (layout_elem.type_supporting_happ_at_offset(cx, 0, happ_elem)
+                                == Some(layout_elem.original_type))
+                            .then_some(self.original_type)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum AttrTarget {
+    Var(Var),
+    Node(Node),
+    Func,
+}
+
+struct FuncGatherAccessesResults {
+    param_accesses: SmallVec<[Option<Result<MemAccesses, AnalysisError>>; 2]>,
+    accesses_or_err_attrs_to_attach: Vec<(AttrTarget, Result<MemAccesses, AnalysisError>)>,
+}
+
+#[derive(Clone)]
+enum FuncGatherAccessesState {
+    InProgress,
+    Complete(Rc<FuncGatherAccessesResults>),
+}
+
+pub struct GatherAccesses<'a> {
+    cx: Rc<Context>,
+    layout_cache: LayoutCache<'a>,
+
+    global_var_accesses: FxIndexMap<GlobalVar, Result<MemAccesses, AnalysisError>>,
+    func_states: FxIndexMap<Func, FuncGatherAccessesState>,
+}
+
+impl<'a> GatherAccesses<'a> {
+    pub fn new(cx: Rc<Context>, layout_config: &'a LayoutConfig) -> Self {
+        Self {
+            cx: cx.clone(),
+            layout_cache: LayoutCache::new(cx, layout_config),
+
+            global_var_accesses: Default::default(),
+            func_states: Default::default(),
+        }
+    }
+
+    pub fn gather_accesses_in_module(mut self, module: &mut Module) {
+        for (export_key, &exportee) in &module.exports {
+            if let Exportee::Func(func) = exportee {
+                self.gather_accesses_in_func(module, func);
+            }
+
+            // Ensure even unused interface variables get their `mem.accesses`.
+            match export_key {
+                ExportKey::LinkName(_) => {}
+                ExportKey::SpvEntryPoint { imms: _, interface_global_vars } => {
+                    for &gv in interface_global_vars {
+                        self.global_var_accesses.entry(gv).or_insert_with(|| {
+                            Ok(match module.global_vars[gv].shape {
+                                Some(shapes::GlobalVarShape::Handles { handle, .. }) => {
+                                    MemAccesses::Handles(match handle {
+                                        shapes::Handle::Opaque(ty) => shapes::Handle::Opaque(ty),
+                                        shapes::Handle::Buffer(..) => shapes::Handle::Buffer(
+                                            AddrSpace::Handles,
+                                            DataHapp::DEAD,
+                                        ),
+                                    })
+                                }
+                                _ => MemAccesses::Data(DataHapp::DEAD),
+                            })
+                        });
+                    }
+                }
+            }
+        }
+
+        // Analysis over, write all attributes back to the module.
+        for (gv, accesses) in self.global_var_accesses {
+            let global_var_def = &mut module.global_vars[gv];
+            match accesses {
+                Ok(accesses) => {
+                    // FIXME(eddyb) deduplicate attribute manipulation.
+                    global_var_def.attrs = self.cx.intern(AttrSetDef {
+                        attrs: self.cx[global_var_def.attrs]
+                            .attrs
+                            .iter()
+                            .cloned()
+                            .chain([Attr::Mem(MemAttr::Accesses(OrdAssertEq(accesses)))])
+                            .collect(),
+                    });
+                }
+                Err(AnalysisError(e)) => {
+                    global_var_def.attrs.push_diag(&self.cx, e);
+                }
+            }
+        }
+        for (func, state) in self.func_states {
+            match state {
+                FuncGatherAccessesState::InProgress => unreachable!(),
+                FuncGatherAccessesState::Complete(func_results) => {
+                    let FuncGatherAccessesResults {
+                        param_accesses,
+                        accesses_or_err_attrs_to_attach,
+                    } = Rc::try_unwrap(func_results).ok().unwrap();
+
+                    let func_decl = &mut module.funcs[func];
+                    for (param_decl, accesses) in func_decl.params.iter_mut().zip(param_accesses) {
+                        if let Some(accesses) = accesses {
+                            match accesses {
+                                Ok(accesses) => {
+                                    // FIXME(eddyb) deduplicate attribute manipulation.
+                                    param_decl.attrs = self.cx.intern(AttrSetDef {
+                                        attrs: self.cx[param_decl.attrs]
+                                            .attrs
+                                            .iter()
+                                            .cloned()
+                                            .chain([Attr::Mem(MemAttr::Accesses(OrdAssertEq(
+                                                accesses,
+                                            )))])
+                                            .collect(),
+                                    });
+                                }
+                                Err(AnalysisError(e)) => {
+                                    param_decl.attrs.push_diag(&self.cx, e);
+                                }
+                            }
+                        }
+                    }
+
+                    let func_decl = &mut module.funcs[func];
+                    let func_def_body = match &mut func_decl.def {
+                        DeclDef::Present(func_def_body) => func_def_body,
+                        DeclDef::Imported(_) => continue,
+                    };
+
+                    for (v, accesses) in accesses_or_err_attrs_to_attach {
+                        let attrs = match v {
+                            AttrTarget::Var(v) => &mut func_def_body.at_mut(v).decl().attrs,
+                            AttrTarget::Node(node) => {
+                                assert!(accesses.is_err());
+
+                                &mut func_def_body.at_mut(node).def().attrs
+                            }
+                            AttrTarget::Func => {
+                                assert!(accesses.is_err());
+
+                                &mut func_decl.attrs
+                            }
+                        };
+                        match accesses {
+                            Ok(accesses) => {
+                                // FIXME(eddyb) deduplicate attribute manipulation.
+                                *attrs = self.cx.intern(AttrSetDef {
+                                    attrs: self.cx[*attrs]
+                                        .attrs
+                                        .iter()
+                                        .cloned()
+                                        .chain([Attr::Mem(MemAttr::Accesses(OrdAssertEq(
+                                            accesses,
+                                        )))])
+                                        .collect(),
+                                });
+                            }
+                            Err(AnalysisError(e)) => {
+                                attrs.push_diag(&self.cx, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // HACK(eddyb) `FuncGatherAccessesState` also serves to indicate recursion errors.
+    fn gather_accesses_in_func(&mut self, module: &Module, func: Func) -> FuncGatherAccessesState {
+        if let Some(cached) = self.func_states.get(&func).cloned() {
+            return cached;
+        }
+
+        self.func_states.insert(func, FuncGatherAccessesState::InProgress);
+
+        let completed_state = FuncGatherAccessesState::Complete(Rc::new(
+            self.gather_accesses_in_func_uncached(module, func),
+        ));
+
+        self.func_states.insert(func, completed_state.clone());
+        completed_state
+    }
+    fn gather_accesses_in_func_uncached(
+        &mut self,
+        module: &Module,
+        func: Func,
+    ) -> FuncGatherAccessesResults {
+        let cx = self.cx.clone();
+        let is_qptr = |ty: Type| matches!(cx[ty].kind, TypeKind::QPtr);
+
+        let func_decl = &module.funcs[func];
+        let mut accesses_or_err_attrs_to_attach = vec![];
+
+        // FIXME(eddyb) should such a "small vec/int map" be a proper type?
+        fn small_vec_from_position_value_pairs<T, const N: usize>(
+            entries: impl IntoIterator<Item = (usize, T)>,
+        ) -> SmallVec<[Option<T>; N]>
+        where
+            [Option<T>; N]: smallvec::Array<Item = Option<T>>,
+        {
+            let mut slots = SmallVec::new();
+            for (i, x) in entries {
+                if i >= slots.len() {
+                    slots.extend((slots.len()..=i).map(|_| None));
+                }
+                slots[i] = Some(x);
+            }
+            slots
+        }
+
+        let func_def_body = match &func_decl.def {
+            DeclDef::Present(func_def_body) => func_def_body,
+            DeclDef::Imported(_) => {
+                let param_accesses = small_vec_from_position_value_pairs(
+                    func_decl.params.iter().enumerate().filter(|(_, param)| is_qptr(param.ty)).map(
+                        |(i, _)| {
+                            (
+                                i,
+                                Err(AnalysisError(Diag::bug([
+                                    "pointer param of imported func".into()
+                                ]))),
+                            )
+                        },
+                    ),
+                );
+                return FuncGatherAccessesResults {
+                    param_accesses,
+                    accesses_or_err_attrs_to_attach,
+                };
+            }
+        };
+
+        // HACK(eddyb) this could be `FxHashMap`, except it's iterated at the end
+        // to generate errors for outputs of nodes that somehow weren't visited,
+        // or inputs of regions (i.e. loop bodies, which don't support pointers),
+        // and while *technically* not a hazard, it's better to be deterministic.
+        let mut var_accesses = FxIndexMap::default();
+
+        // HACK(eddyb) reversing a post-order traversal to get RPO, which for
+        // structured control-flow means outside-in/top-down (just like pre-order),
+        // while post-order and reverse pre-order are inside-out/bottom-up.
+        let mut post_order_nodes = vec![];
+        func_def_body.inner_visit_with(&mut VisitAllNodes {
+            before: |_| {},
+            after: |node| post_order_nodes.push(node),
+        });
+        for &node in post_order_nodes.iter().rev() {
+            let node_def = func_def_body.at(node).def();
+
+            // FIXME(eddyb) consider avoiding this collection step.
+            let mut per_output_accesses = small_vec_from_position_value_pairs::<_, 1>(
+                node_def
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &v)| Some((i, var_accesses.swap_remove(&v)?))),
+            );
+
+            // Always attach attributes to `qptr`-typed outputs,
+            // on top of propagating them from uses to definitions.
+            for (&output_var, accesses) in node_def.outputs.iter().zip(&per_output_accesses) {
+                if let Some(accesses) = accesses {
+                    accesses_or_err_attrs_to_attach
+                        .push((AttrTarget::Var(output_var), Clone::clone(accesses)));
+                }
+            }
+
+            let offset_accesses = |accesses, offset: u32| {
+                let happ = match accesses {
+                    MemAccesses::Handles(_) => {
+                        return Err(AnalysisError(Diag::bug([format!(
+                            "Offset({offset}): cannot offset in handle memory"
+                        )
+                        .into()])));
+                    }
+                    MemAccesses::Data(happ) => happ,
+                };
+
+                // FIXME(eddyb) these should be normalized
+                // (e.g. constant-folded) out of existence,
+                // but while they exist, they should be noops.
+                if offset == 0 {
+                    return Ok(MemAccesses::Data(happ));
+                }
+
+                Ok(MemAccesses::Data(DataHapp {
+                    max_size: happ
+                        .max_size
+                        .map(|max_size| {
+                            offset.checked_add(max_size).ok_or_else(|| {
+                                AnalysisError(Diag::bug([format!(
+                                    "Offset({offset}): size overflow ({offset}+{max_size})"
+                                )
+                                .into()]))
+                            })
+                        })
+                        .transpose()?,
+                    flags: happ.flags.propagate_outwards(),
+                    // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
+                    // to represent the one-element case, seems
+                    // quite wasteful when it's likely consumed.
+                    kind: DataHappKind::Disjoint(Rc::new([(offset, happ)].into())),
+                }))
+            };
+            let mut generate_accesses = |this: &mut Self, ptr: Value, new_accesses| {
+                // HACK(eddyb) in order to handle the different `Entry` types
+                // (inevitable due to different key types for different maps),
+                // the `.or_insert_with(|| new_accesses.take().unwrap())` pattern
+                // is used to distinguish "newly inserted" vs "needs merge".
+                let mut new_accesses = Some(new_accesses);
+
+                let accesses = match ptr {
+                    Value::Const(ct) => match &cx[ct].kind {
+                        // HACK(eddyb) this only sort of makes sense
+                        // for invalid pointers, which cannot themselves
+                        // be meaningfully used in accesses, and only
+                        // require lifting to a logical pointer type
+                        // when they're e.g. a selection case output
+                        // (with a valid pointer in a sibling case).
+                        ConstKind::Undef => return,
+                        ConstKind::SpvInst { spv_inst_and_const_inputs }
+                            if {
+                                // FIXME(eddyb) maybe `qptr` should have its own null constant?
+                                let (spv_inst, _) = &**spv_inst_and_const_inputs;
+                                spv_inst.opcode
+                                    == crate::spv::spec::Spec::get().well_known.OpConstantNull
+                            } =>
+                        {
+                            return;
+                        }
+
+                        // TODO(eddyb) implement `offset: Some(_)` by analogy
+                        // to `qptr.offset` on the `offset: None` case.
+                        &ConstKind::PtrToGlobalVar { global_var, offset } => {
+                            if let Some(offset) = offset
+                                && let Some(Ok(accesses)) = new_accesses
+                            {
+                                new_accesses = Some(offset_accesses(accesses, offset.get()));
+                            }
+
+                            this.global_var_accesses
+                                .entry(global_var)
+                                .or_insert_with(|| new_accesses.take().unwrap())
+                        }
+
+                        // FIXME(eddyb) attach on the `Const` by replacing
+                        // it with a copy that also has an extra attribute,
+                        // or actually support by adding the accesses attribute
+                        // in the same manner (if it makes sense to do so).
+                        _ => {
+                            accesses_or_err_attrs_to_attach.push((
+                                AttrTarget::Node(node),
+                                Err(AnalysisError(Diag::bug([
+                                    "unsupported pointer constant `".into(),
+                                    ct.into(),
+                                    "`".into(),
+                                ]))),
+                            ));
+                            return;
+                        }
+                    },
+                    Value::Var(ptr) => {
+                        var_accesses.entry(ptr).or_insert_with(|| new_accesses.take().unwrap())
+                    }
+                };
+
+                // HACK(eddyb) also see the comment on `new_accesses`.
+                if let Some(new_accesses) = new_accesses {
+                    // HACK(eddyb) using a placeholder to get by-value access.
+                    let old_accesses = mem::replace(accesses, Err(AnalysisError(Diag::bug([]))));
+                    *accesses = old_accesses.and_then(|old_accesses| {
+                        AccessMerger { cx: &this.cx, layout_cache: &this.layout_cache }
+                            .merge(old_accesses, new_accesses?)
+                            .into_result()
+                    });
+                }
+            };
+
+            match &node_def.kind {
+                NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation { .. } => {
+                    for (&output_var, accesses) in node_def.outputs.iter().zip(per_output_accesses)
+                    {
+                        // HACK(eddyb) `accesses` was already attached earlier.
+                        if accesses.is_some() {
+                            accesses_or_err_attrs_to_attach.push((
+                                AttrTarget::Var(output_var),
+                                Err(AnalysisError(Diag::bug(["unsupported dynamic qptr".into()]))),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+
+                DataInstKind::Scalar(_)
+                | DataInstKind::Vector(_)
+                | DataInstKind::FuncCall(_)
+                | DataInstKind::Mem(_)
+                | DataInstKind::QPtr(_)
+                | DataInstKind::ThunkBind(_)
+                | DataInstKind::SpvInst(..)
+                | DataInstKind::SpvExtInst { .. } => {}
+            }
+
+            // HACK(eddyb) this may be a bit wasteful, but it avoids
+            // complicating acessing `per_output_accesses` below, and
+            // most instructions should only have at most two outputs.
+            {
+                let expected = node_def.outputs.len();
+                if per_output_accesses.len() < expected {
+                    per_output_accesses.extend((per_output_accesses.len()..expected).map(|_| None));
+                }
+            }
+
+            // FIXME(eddyb) merge with `match &node_def.kind` above.
+            let data_inst_def = node_def;
+            match &data_inst_def.kind {
+                NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
+                    unreachable!()
+                }
+
+                DataInstKind::Scalar(_) | DataInstKind::Vector(_) => {}
+
+                &DataInstKind::FuncCall(callee) => match self
+                    .gather_accesses_in_func(module, callee)
+                {
+                    FuncGatherAccessesState::Complete(callee_results) => {
+                        for (&arg, param_accesses) in
+                            data_inst_def.inputs.iter().zip(&callee_results.param_accesses)
+                        {
+                            if let Some(param_accesses) = param_accesses {
+                                generate_accesses(self, arg, param_accesses.clone());
+                            }
+                        }
+                    }
+                    FuncGatherAccessesState::InProgress => {
+                        accesses_or_err_attrs_to_attach.push((
+                            AttrTarget::Node(node),
+                            Err(AnalysisError(Diag::bug(["unsupported recursive call".into()]))),
+                        ));
+                    }
+                },
+
+                DataInstKind::Mem(MemOp::FuncLocalVar(_mem_layout)) => {
+                    // FIXME(eddyb) merge/intersect `mem.accesses` from uses,
+                    // with the inherent size/align (given by `_mem_layout`)?
+                }
+                DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
+                    assert_eq!(per_output_accesses.len(), 1);
+                    generate_accesses(
+                        self,
+                        data_inst_def.inputs[0],
+                        per_output_accesses[0]
+                            .take()
+                            .unwrap_or_else(|| {
+                                Err(AnalysisError(Diag::bug([
+                                    "HandleArrayIndex: unknown element".into()
+                                ])))
+                            })
+                            .and_then(|accesses| match accesses {
+                                MemAccesses::Handles(handle) => Ok(MemAccesses::Handles(handle)),
+                                MemAccesses::Data(_) => Err(AnalysisError(Diag::bug([
+                                    "HandleArrayIndex: cannot be accessed as data".into(),
+                                ]))),
+                            }),
+                    );
+                }
+                DataInstKind::QPtr(QPtrOp::BufferData) => {
+                    assert_eq!(per_output_accesses.len(), 1);
+                    generate_accesses(
+                        self,
+                        data_inst_def.inputs[0],
+                        per_output_accesses[0]
+                            .take()
+                            .unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD)))
+                            .and_then(|accesses| {
+                                let happ = match accesses {
+                                    MemAccesses::Handles(_) => {
+                                        return Err(AnalysisError(Diag::bug([
+                                            "BufferData: cannot be accessed as handles".into(),
+                                        ])));
+                                    }
+                                    MemAccesses::Data(happ) => happ,
+                                };
+                                Ok(MemAccesses::Handles(shapes::Handle::Buffer(
+                                    AddrSpace::Handles,
+                                    happ,
+                                )))
+                            }),
+                    );
+                }
+                &DataInstKind::QPtr(QPtrOp::BufferDynLen { fixed_base_size, dyn_unit_stride }) => {
+                    let array_happ = DataHapp {
+                        max_size: None,
+                        flags: DataHappFlags::empty(),
+                        kind: DataHappKind::Repeated {
+                            // FIXME(eddyb) allocating `Rc` a bit wasteful here.
+                            element: Rc::new(DataHapp::DEAD),
+                            stride: dyn_unit_stride,
+                        },
+                    };
+                    let buf_data_happ = if fixed_base_size == 0 {
+                        array_happ
+                    } else {
+                        DataHapp {
+                            max_size: None,
+                            flags: array_happ.flags.propagate_outwards(),
+                            kind: DataHappKind::Disjoint(Rc::new(
+                                [(fixed_base_size, array_happ)].into(),
+                            )),
+                        }
+                    };
+                    generate_accesses(
+                        self,
+                        data_inst_def.inputs[0],
+                        Ok(MemAccesses::Handles(shapes::Handle::Buffer(
+                            AddrSpace::Handles,
+                            buf_data_happ,
+                        ))),
+                    );
+                }
+                &DataInstKind::QPtr(QPtrOp::Offset(offset)) => {
+                    assert_eq!(per_output_accesses.len(), 1);
+                    generate_accesses(
+                        self,
+                        data_inst_def.inputs[0],
+                        u32::try_from(offset)
+                            .ok()
+                            .ok_or_else(|| {
+                                AnalysisError(Diag::bug([format!(
+                                    "Offset({offset}): negative offset"
+                                )
+                                .into()]))
+                            })
+                            .and_then(|offset| {
+                                offset_accesses(
+                                    per_output_accesses[0]
+                                        .take()
+                                        .unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD)))?,
+                                    offset,
+                                )
+                            }),
+                    );
+                }
+                DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
+                    assert_eq!(per_output_accesses.len(), 1);
+                    let (stride, index_bounds) = (*stride, index_bounds.clone());
+                    generate_accesses(
+                        self,
+                        data_inst_def.inputs[0],
+                        per_output_accesses[0]
+                            .take()
+                            .unwrap_or(Ok(MemAccesses::Data(DataHapp::DEAD)))
+                            .and_then(|accesses| {
+                                let happ = match accesses {
+                                    MemAccesses::Handles(_) => {
+                                        return Err(AnalysisError(Diag::bug([
+                                            "DynOffset: cannot offset in handle memory".into(),
+                                        ])));
+                                    }
+                                    MemAccesses::Data(happ) => happ,
+                                };
+
+                                // FIXME(eddyb) does the `None` case allow
+                                // for negative offsets?
+                                // FIXME(eddyb) LLVM's new `nuw`/`nusw` flags
+                                // on GEPs are likely a good starting point
+                                // for offset signedness disambiguation.
+                                let max_size = index_bounds
+                                    .map(|index_bounds| {
+                                        if index_bounds.start < 0 || index_bounds.end < 0 {
+                                            return Err(AnalysisError(Diag::bug([
+                                                "DynOffset: potentially negative offset".into(),
+                                            ])));
+                                        }
+                                        let index_bounds_end =
+                                            u32::try_from(index_bounds.end).unwrap();
+                                        index_bounds_end.checked_mul(stride.get()).ok_or_else(
+                                            || {
+                                                AnalysisError(Diag::bug([format!(
+                                                    "DynOffset: size overflow \
+                                                     ({index_bounds_end} × {stride})"
+                                                )
+                                                .into()]))
+                                            },
+                                        )
+                                    })
+                                    .transpose()?;
+
+                                // HACK(eddyb) force an array-like "reshaping"
+                                // of `happ`, by demanding it *also* support
+                                // dynamic indexing with `stride`.
+                                let strided_happ =
+                                    AccessMerger { cx: &self.cx, layout_cache: &self.layout_cache }
+                                        .merge_data(
+                                            happ,
+                                            DataHapp {
+                                                max_size: None,
+                                                flags: DataHappFlags::empty(),
+                                                kind: DataHappKind::Repeated {
+                                                    // FIXME(eddyb) allocating `Rc` a bit wasteful here.
+                                                    element: Rc::new(DataHapp::DEAD),
+                                                    stride,
+                                                },
+                                            },
+                                        )
+                                        .into_result()?;
+                                // HACK(eddyb) `merged_stride > stride` is now
+                                // possible, with `qptr::lift` being expected to
+                                // emulate finer-grained offsetting in that case.
+                                let flags = match &strided_happ.kind {
+                                    DataHappKind::Repeated { element, stride: merged_stride }
+                                        if *merged_stride >= stride
+                                            && element
+                                                .max_size
+                                                .is_some_and(|s| s <= merged_stride.get()) =>
+                                    {
+                                        element.flags.propagate_outwards()
+                                    }
+
+                                    _ => {
+                                        return Err(AnalysisError(Diag::bug([
+                                            format!(
+                                                "DynOffset: unexpected strided \
+                                                 (N × {stride}) reshaping result: "
+                                            )
+                                            .into(),
+                                            MemAccesses::Data(strided_happ).into(),
+                                        ])));
+                                    }
+                                };
+
+                                Ok(MemAccesses::Data(DataHapp {
+                                    max_size,
+                                    flags,
+                                    kind: strided_happ.kind,
+                                }))
+                            }),
+                    );
+                }
+                DataInstKind::Mem(op @ (MemOp::Load { offset } | MemOp::Store { offset })) => {
+                    // HACK(eddyb) `_` will match multiple variants soon.
+                    #[allow(clippy::match_wildcard_for_single_variants)]
+                    let (op_name, access_type) = match op {
+                        MemOp::Load { .. } => {
+                            ("Load", func_def_body.at(data_inst_def.outputs[0]).decl().ty)
+                        }
+                        MemOp::Store { .. } => {
+                            ("Store", func_def_body.at(data_inst_def.inputs[1]).type_of(&cx))
+                        }
+                        _ => unreachable!(),
+                    };
+                    generate_accesses(
+                        self,
+                        data_inst_def.inputs[0],
+                        self.layout_cache
+                            .layout_of(access_type)
+                            .map_err(|LayoutError(e)| AnalysisError(e))
+                            .and_then(|layout| match layout {
+                                TypeLayout::Handle(shapes::Handle::Opaque(ty))
+                                    if offset.is_none() =>
+                                {
+                                    Ok(MemAccesses::Handles(shapes::Handle::Opaque(ty)))
+                                }
+                                TypeLayout::Handle(shapes::Handle::Buffer(..)) => {
+                                    Err(AnalysisError(Diag::bug([format!(
+                                        "{op_name}: cannot access whole Buffer"
+                                    )
+                                    .into()])))
+                                }
+                                TypeLayout::Handle(_) => Err(AnalysisError(Diag::bug([format!(
+                                    "{op_name} {{ offset: {offset:?} }}: \
+                                     cannot offset in handle memory"
+                                )
+                                .into()]))),
+                                TypeLayout::HandleArray(..) => {
+                                    Err(AnalysisError(Diag::bug([format!(
+                                        "{op_name}: cannot access whole HandleArray"
+                                    )
+                                    .into()])))
+                                }
+                                TypeLayout::Concrete(concrete)
+                                    if concrete.mem_layout.dyn_unit_stride.is_some() =>
+                                {
+                                    Err(AnalysisError(Diag::bug([format!(
+                                        "{op_name}: cannot access unsized type"
+                                    )
+                                    .into()])))
+                                }
+                                TypeLayout::Concrete(concrete) => {
+                                    let happ = DataHapp {
+                                        flags: DataHappFlags::empty(),
+                                        max_size: Some(concrete.mem_layout.fixed_base.size),
+                                        kind: DataHappKind::Direct(access_type),
+                                    };
+
+                                    // FIXME(eddyb) deduplicate this with
+                                    // `QPtrOp::Offset` above.
+                                    let offset = offset
+                                        .map(|offset| u32::try_from(offset.get()))
+                                        .transpose()
+                                        .ok()
+                                        .ok_or_else(|| {
+                                            AnalysisError(Diag::bug([format!(
+                                                "{op_name} {{ offset: {offset:?} }}: \
+                                                 negative offset"
+                                            )
+                                            .into()]))
+                                        })?;
+
+                                    let Some(offset) = offset else {
+                                        return Ok(MemAccesses::Data(happ));
+                                    };
+
+                                    Ok(MemAccesses::Data(DataHapp {
+                                        max_size: happ
+                                            .max_size
+                                            .map(|max_size| {
+                                                offset.checked_add(max_size).ok_or_else(|| {
+                                                    AnalysisError(Diag::bug([format!(
+                                                        "{op_name} {{ offset: {offset} }}: \
+                                                         size overflow ({offset}+{max_size})"
+                                                    )
+                                                    .into()]))
+                                                })
+                                            })
+                                            .transpose()?,
+                                        flags: happ.flags.propagate_outwards(),
+                                        // FIXME(eddyb) allocating `Rc<BTreeMap<_, _>>`
+                                        // to represent the one-element case, seems
+                                        // quite wasteful when it's likely consumed.
+                                        kind: DataHappKind::Disjoint(Rc::new(
+                                            [(offset, happ)].into(),
+                                        )),
+                                    }))
+                                }
+                            }),
+                    );
+                }
+                &DataInstKind::Mem(MemOp::Copy { size }) => {
+                    let max_size = Some(size.get());
+                    // FIXME(eddyb) `DataHappKind::Dead` might
+                    // make more sense data-structure wise, but it
+                    // risks potentially losing the `flags`.
+                    let kind = DataHappKind::Disjoint(Default::default());
+
+                    generate_accesses(
+                        self,
+                        data_inst_def.inputs[0],
+                        Ok(MemAccesses::Data(DataHapp {
+                            max_size,
+                            flags: DataHappFlags::COPY_DST,
+                            kind: kind.clone(),
+                        })),
+                    );
+                    generate_accesses(
+                        self,
+                        data_inst_def.inputs[1],
+                        Ok(MemAccesses::Data(DataHapp {
+                            max_size,
+                            flags: DataHappFlags::COPY_SRC,
+                            kind,
+                        })),
+                    );
+                }
+
+                DataInstKind::ThunkBind(_) => {
+                    if data_inst_def
+                        .inputs
+                        .iter()
+                        .any(|&v| is_qptr(func_def_body.at(v).type_of(&cx)))
+                    {
+                        accesses_or_err_attrs_to_attach.push((
+                            AttrTarget::Node(node),
+                            Err(AnalysisError(Diag::bug([
+                                "unsupported `thunk.bind` with pointer inputs".into(),
+                            ]))),
+                        ));
+                    }
+                }
+
+                DataInstKind::SpvInst(..) | DataInstKind::SpvExtInst { .. } => {
+                    for attr in &cx[data_inst_def.attrs].attrs {
+                        if let Attr::QPtr(QPtrAttr::ToSpvPtrInput { input_idx, pointee }) = *attr {
+                            let ty = pointee.0;
+                            generate_accesses(
+                                self,
+                                data_inst_def.inputs[input_idx as usize],
+                                self.layout_cache
+                                    .layout_of(ty)
+                                    .map_err(|LayoutError(e)| AnalysisError(e))
+                                    .and_then(|layout| match layout {
+                                        TypeLayout::Handle(handle) => {
+                                            let handle = match handle {
+                                                shapes::Handle::Opaque(ty) => {
+                                                    shapes::Handle::Opaque(ty)
+                                                }
+                                                // NOTE(eddyb) this error is important,
+                                                // as the `Block` annotation on the
+                                                // buffer type means the type is *not*
+                                                // usable anywhere inside buffer data,
+                                                // since it would conflict with our
+                                                // own `Block`-annotated wrapper.
+                                                shapes::Handle::Buffer(..) => {
+                                                    return Err(AnalysisError(Diag::bug([
+                                                        "ToSpvPtrInput: \
+                                                         whole Buffer ambiguous \
+                                                         (handle vs buffer data)"
+                                                            .into(),
+                                                    ])));
+                                                }
+                                            };
+                                            Ok(MemAccesses::Handles(handle))
+                                        }
+                                        // NOTE(eddyb) because we can't represent
+                                        // the original type, in the same way we
+                                        // use `DataHappKind::StrictlyTyped`
+                                        // for non-handles, we can't guarantee
+                                        // a generated type that matches the
+                                        // desired `pointee` type.
+                                        TypeLayout::HandleArray(..) => {
+                                            Err(AnalysisError(Diag::bug([
+                                                "ToSpvPtrInput: whole handle array unrepresentable"
+                                                    .into(),
+                                            ])))
+                                        }
+                                        TypeLayout::Concrete(concrete) => {
+                                            Ok(MemAccesses::Data(DataHapp {
+                                                max_size: (concrete
+                                                    .mem_layout
+                                                    .dyn_unit_stride
+                                                    .is_none())
+                                                .then_some(concrete.mem_layout.fixed_base.size),
+                                                flags: DataHappFlags::empty(),
+                                                kind: DataHappKind::StrictlyTyped(ty),
+                                            }))
+                                        }
+                                    }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let param_accesses = small_vec_from_position_value_pairs(
+            func_def_body
+                .at_body()
+                .def()
+                .inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| Some((i, var_accesses.swap_remove(&v)?))),
+        );
+
+        if !var_accesses.is_empty() {
+            // HACK(eddyb) this extra traversal only exists in case the reason
+            // for leftover `var_accesses` entries is just the visit order,
+            // however unlikely that is (compared to the even worse case).
+            for &node in &post_order_nodes {
+                let node_def = func_def_body.at(node).def();
+                for &output_var in &node_def.outputs {
+                    if let Some(accesses) = var_accesses.swap_remove(&output_var) {
+                        let diag = match accesses {
+                            Ok(accesses) => Diag::bug([
+                                "extra mem.accesses contributions ignored (visited too late): "
+                                    .into(),
+                                accesses.into(),
+                            ]),
+                            Err(AnalysisError(mut diag)) => {
+                                diag.message.insert(
+                                    0,
+                                    "extra mem.accesses-related errors (visited too late): ".into(),
+                                );
+                                diag
+                            }
+                        };
+                        accesses_or_err_attrs_to_attach
+                            .push((AttrTarget::Var(output_var), Err(AnalysisError(diag))));
+                    }
+                }
+                for &region in &node_def.child_regions {
+                    for &input_var in &func_def_body.at(region).def().inputs {
+                        if let Some(accesses) = var_accesses.swap_remove(&input_var) {
+                            accesses_or_err_attrs_to_attach.extend([
+                                (AttrTarget::Var(input_var), accesses),
+                                (
+                                    AttrTarget::Var(input_var),
+                                    Err(AnalysisError(Diag::bug([
+                                        "unsupported dynamic qptr".into()
+                                    ]))),
+                                ),
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // FIXME(eddyb) this should ideally be detected by a SPIR-T verifier.
+        if !var_accesses.is_empty() {
+            accesses_or_err_attrs_to_attach.push((
+                AttrTarget::Func,
+                Err(AnalysisError(Diag::bug([format!(
+                    "{} `qptr` values are used, but their definitions were never visited",
+                    var_accesses.len()
+                )
+                .into()]))),
+            ));
+        }
+
+        FuncGatherAccessesResults { param_accesses, accesses_or_err_attrs_to_attach }
+    }
+}
+
+// HACK(eddyb) this is easier than implementing a proper reverse traversal.
+#[derive(Default)]
+struct VisitAllNodes<B: FnMut(Node), A: FnMut(Node)> {
+    before: B,
+    after: A,
+}
+
+impl<B: FnMut(Node), A: FnMut(Node)> Visitor<'_> for VisitAllNodes<B, A> {
+    // FIXME(eddyb) this is excessive, maybe different kinds of
+    // visitors should exist for module-level and func-level?
+    fn visit_attr_set_use(&mut self, _: AttrSet) {}
+    fn visit_type_use(&mut self, _: Type) {}
+    fn visit_const_use(&mut self, _: Const) {}
+    fn visit_global_var_use(&mut self, _: GlobalVar) {}
+    fn visit_func_use(&mut self, _: Func) {}
+
+    fn visit_node_def(&mut self, func_at_node: FuncAt<'_, Node>) {
+        (self.before)(func_at_node.position);
+        func_at_node.inner_visit_with(self);
+        (self.after)(func_at_node.position);
+    }
+}

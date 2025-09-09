@@ -152,8 +152,7 @@
 
 // NOTE(eddyb) all the modules are declared here, but they're documented "inside"
 // (i.e. using inner doc comments).
-pub mod cfg;
-pub mod cfgssa;
+pub mod cf;
 mod context;
 pub mod func_at;
 pub mod print;
@@ -168,12 +167,17 @@ pub mod passes {
     pub mod link;
     pub mod qptr;
 }
+pub mod mem;
 pub mod qptr;
+pub mod scalar;
+pub mod sched;
 pub mod spv;
+pub mod vector;
 
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 use std::rc::Rc;
 
 // HACK(eddyb) work around the lack of `FxIndex{Map,Set}` type aliases elsewhere.
@@ -396,6 +400,10 @@ pub enum Attr {
     // of `AttrSetDef::{dbg_src_loc,set_dbg_src_loc}`.
     DbgSrcLoc(OrdAssertEq<DbgSrcLoc>),
 
+    /// Memory-specific attributes (see [`mem::MemAttr`]).
+    #[from]
+    Mem(mem::MemAttr),
+
     /// `QPtr`-specific attributes (see [`qptr::QPtrAttr`]).
     #[from]
     QPtr(qptr::QPtrAttr),
@@ -460,6 +468,12 @@ impl Diag {
     pub fn warn(message: impl IntoIterator<Item = DiagMsgPart>) -> Self {
         Self::new(DiagLevel::Warning, message)
     }
+
+    // HACK(eddyb) this only really exists to allow filtering `Diag::bug`s by
+    // the module that produced them, even if in a relatively cursed way.
+    pub(crate) fn bug_src_path_prefix() -> Option<&'static str> {
+        std::panic::Location::caller().file().strip_suffix("lib.rs")
+    }
 }
 
 /// The "severity" level of a [`Diag`]nostic.
@@ -488,7 +502,7 @@ pub enum DiagMsgPart {
     Attrs(AttrSet),
     Type(Type),
     Const(Const),
-    QPtrUsage(qptr::QPtrUsage),
+    MemAccesses(mem::MemAccesses),
 }
 
 /// Wrapper to limit `Ord` for interned index types (e.g. [`InternedStr`])
@@ -522,16 +536,30 @@ impl<T: Eq> Ord for OrdAssertEq<T> {
 pub use context::Type;
 
 /// Definition for a [`Type`].
-//
-// FIXME(eddyb) maybe special-case some basic types like integers.
 #[derive(PartialEq, Eq, Hash)]
 pub struct TypeDef {
     pub attrs: AttrSet,
     pub kind: TypeKind,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
 pub enum TypeKind {
+    /// Scalar (`bool`, integer, and floating-point) type, with limitations
+    /// on the supported bit-widths (power-of-two multiples of a byte).
+    ///
+    /// **Note**: pointers are never scalars (like SPIR-V, but unlike other IRs).
+    ///
+    /// See also the [`scalar`] module for more documentation and definitions.
+    #[from]
+    Scalar(scalar::Type),
+
+    /// Vector (small array of [`scalar`]s) type, with some limitations on the
+    /// supported component counts (but all standard ones should be included).
+    ///
+    /// See also the [`vector`] module for more documentation and definitions.
+    #[from]
+    Vector(vector::Type),
+
     /// "Quasi-pointer", an untyped pointer-like abstract scalar that can represent
     /// both memory locations (in any address space) and other kinds of locations
     /// (e.g. SPIR-V `OpVariable`s in non-memory "storage classes").
@@ -544,14 +572,19 @@ pub enum TypeKind {
     /// (e.g. "points to variable `x`" or "accessed at offset `y`") can be found
     /// attached as `Attr`s on those `Value`s (see [`Attr::QPtr`]).
     //
-    // FIXME(eddyb) a "refinement system" that's orthogonal from types, and kept
-    // separately in e.g. `RegionInputDecl`, might be a better approach?
+    // FIXME(eddyb) a "refinement system" that's orthogonal from types,
+    // and kept separately in `VarDecl`, might be a better approach?
     QPtr,
 
+    // TODO(eddyb) reconsider name? add signature? etc.
+    Thunk,
+
+    // FIXME(eddyb) consider wrapping all of these in an `Rc` like `ConstKind`.
     SpvInst {
         spv_inst: spv::Inst,
         // FIXME(eddyb) find a better name.
         type_and_const_inputs: SmallVec<[TypeOrConst; 2]>,
+        value_lowering: spv::ValueLowering,
     },
 
     /// The type of a [`ConstKind::SpvStringLiteralForExtInst`] constant, i.e.
@@ -559,12 +592,18 @@ pub enum TypeKind {
     SpvStringLiteralForExtInst,
 }
 
-// HACK(eddyb) this behaves like an implicit conversion for `cx.intern(...)`.
-impl context::InternInCx<Type> for TypeKind {
-    fn intern_in_cx(self, cx: &Context) -> Type {
-        cx.intern(TypeDef { attrs: Default::default(), kind: self })
+// HACK(eddyb) this behaves like an implicit conversion for `cx.intern(...)`,
+// and the macro is only used because coherence bans `impl<T: Into<TypeKind>>`.
+macro_rules! impl_intern_type_kind {
+    ($($kind:ty),+ $(,)?) => {
+        $(impl context::InternInCx<Type> for $kind {
+            fn intern_in_cx(self, cx: &Context) -> Type {
+                cx.intern(TypeDef { attrs: Default::default(), kind: self.into() })
+            }
+        })+
     }
 }
+impl_intern_type_kind!(TypeKind, scalar::Type, vector::Type);
 
 // HACK(eddyb) this is like `Either<Type, Const>`, only used in `TypeKind::SpvInst`,
 // and only because SPIR-V type definitions can references both types and consts.
@@ -574,10 +613,28 @@ pub enum TypeOrConst {
     Const(Const),
 }
 
-/// Interned handle for a [`ConstDef`](crate::ConstDef) (a constant value).
+// HACK(eddyb) on `Type` instead of `TypeDef` for ergonomics reasons.
+impl Type {
+    pub fn as_scalar(self, cx: &Context) -> Option<scalar::Type> {
+        match cx[self].kind {
+            TypeKind::Scalar(ty) => Some(ty),
+            _ => None,
+        }
+    }
+    pub fn as_vector(self, cx: &Context) -> Option<vector::Type> {
+        match cx[self].kind {
+            TypeKind::Vector(ty) => Some(ty),
+            _ => None,
+        }
+    }
+}
+
+/// Interned handle for a [`ConstDef`](crate::ConstDef) (a constant [`Value`](crate::Value)).
 pub use context::Const;
 
-/// Definition for a [`Const`]: a constant value.
+/// Definition for a [`Const`]: a constant [`Value`].
+///
+/// See [`Value`] docs for limitations on the types of values, including [`Const`]s.
 //
 // FIXME(eddyb) maybe special-case some basic consts like integer literals.
 #[derive(PartialEq, Eq, Hash)]
@@ -587,9 +644,54 @@ pub struct ConstDef {
     pub kind: ConstKind,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
 pub enum ConstKind {
-    PtrToGlobalVar(GlobalVar),
+    /// Undeterminate value (i.e. SPIR-V `OpUndef`, LLVM `undef`).
+    //
+    // FIXME(eddyb) could it be possible to adopt LLVM's newer `poison`+`freeze`
+    // model, without being forced to never lift back to `OpUndef`?
+    Undef,
+
+    /// Scalar (`bool`, integer, and floating-point) constant, which must have
+    /// a type of [`TypeKind::Scalar`] (of the same [`scalar::Type`]).
+    ///
+    /// See also the [`scalar`] module for more documentation and definitions.
+    //
+    // FIXME(eddyb) maybe document the 128-bit limitation?.
+    // FIXME(eddyb) this technically makes the `scalar::Type` redundant, could
+    // it get out of sync? (perhaps "forced canonicalization" could be used to
+    // enforce that interning simply doesn't allow such scenarios?).
+    #[from]
+    Scalar(scalar::Const),
+
+    /// Vector (small array of [`scalar`]s) constant, which must have
+    /// a type of [`TypeKind::Vector`] (of the same [`vector::Type`]).
+    ///
+    /// See also the [`vector`] module for more documentation and definitions.
+    //
+    // FIXME(eddyb) maybe document the 128-bit limitation inherited from `scalar::Const`?
+    // FIXME(eddyb) this technically makes the `vector::Type` redundant, could
+    // it get out of sync? (perhaps "forced canonicalization" could be used to
+    // enforce that interning simply doesn't allow such scenarios?).
+    #[from]
+    Vector(vector::Const),
+
+    // FIXME(eddyb) maybe merge these? however, their connection is somewhat
+    // tenuous (being one of the LLVM-isms SPIR-V inherited, among other things),
+    // there's still the need to rename "global variable" post-`Var`-refactor,
+    // and last but not least, `PtrToFunc` needs `SPV_INTEL_function_pointers`,
+    // an OpenCL-only extension Intel came up with for their own SPIR-V tooling.
+    PtrToGlobalVar {
+        global_var: GlobalVar,
+
+        // FIXME(eddyb) try using this feature in more places.
+        // FIXME(eddyb) make this an `enum`, with another variant encoding some
+        // GEP-like (aka SPIR-V `OpAccessChain`) "field path".
+        // FIXME(eddyb) consider some kind of "capability slicing" replacement,
+        // which could limit the usable range of the resulting pointer.
+        offset: Option<NonZeroU32>,
+    },
+    PtrToFunc(Func),
 
     // HACK(eddyb) this is a fallback case that should become increasingly rare
     // (especially wrt recursive consts), `Rc` means it can't bloat `ConstDef`.
@@ -601,6 +703,40 @@ pub enum ConstKind {
     /// which can't have literals itself - for non-string literals `OpConstant*`
     /// are readily usable, but only `OpString` is supported for string literals.
     SpvStringLiteralForExtInst(InternedStr),
+}
+
+// HACK(eddyb) this behaves like an implicit conversion for `cx.intern(...)`,
+// like the `TypeKind` one, but this one is even weirder because it also interns
+// the inherent type of the constant, as a `Type` (with empty attributes).
+macro_rules! impl_intern_const_kind {
+    ($($kind:ty),+ $(,)?) => {
+        $(impl context::InternInCx<Const> for $kind {
+            fn intern_in_cx(self, cx: &Context) -> Const {
+                cx.intern(ConstDef {
+                    attrs: Default::default(),
+                    ty: cx.intern(self.ty()),
+                    kind: self.into(),
+                })
+            }
+        })+
+    }
+}
+impl_intern_const_kind!(scalar::Const, vector::Const);
+
+// HACK(eddyb) on `Const` instead of `ConstDef` for ergonomics reasons.
+impl Const {
+    pub fn as_scalar(self, cx: &Context) -> Option<&scalar::Const> {
+        match &cx[self].kind {
+            ConstKind::Scalar(ct) => Some(ct),
+            _ => None,
+        }
+    }
+    pub fn as_vector(self, cx: &Context) -> Option<&vector::Const> {
+        match &cx[self].kind {
+            ConstKind::Vector(ct) => Some(ct),
+            _ => None,
+        }
+    }
 }
 
 /// Declarations ([`GlobalVarDecl`], [`FuncDecl`]) can contain a full definition,
@@ -637,7 +773,7 @@ pub struct GlobalVarDecl {
 
     /// When `type_of_ptr_to` is `QPtr`, `shape` must be used to describe the
     /// global variable (see `GlobalVarShape`'s documentation for more details).
-    pub shape: Option<qptr::shapes::GlobalVarShape>,
+    pub shape: Option<mem::shapes::GlobalVarShape>,
 
     /// The address space the global variable will be allocated into.
     pub addr_space: AddrSpace,
@@ -657,10 +793,31 @@ pub enum AddrSpace {
 }
 
 /// The body of a [`GlobalVar`] definition.
+//
+// FIXME(eddyb) make "interface variables" go through imports, not definitions.
 #[derive(Clone)]
 pub struct GlobalVarDefBody {
-    /// If `Some`, the global variable will start out with the specified value.
-    pub initializer: Option<Const>,
+    pub initializer: Option<GlobalVarInit>,
+}
+
+/// Initial contents for a [`GlobalVar`] definition.
+//
+// FIXME(eddyb) add special cases for for undef/zeroed/etc.
+// FIXME(eddyb) consider renaming this to `ConstData` or `ConstBlob`?
+#[derive(Clone)]
+pub enum GlobalVarInit {
+    /// Single valid (constant) value (see [`Value`] docs for valid types).
+    //
+    // FIXME(eddyb) does this need to be its own case at all?
+    Direct(Const),
+
+    /// SPIR-V "aggregate" (`OpTypeStruct`/`OpTypeArray`), represented as its
+    /// non-aggregate leaves (i.e. it's disaggregated, as per [`Value`] docs).
+    SpvAggregate { ty: Type, leaves: SmallVec<[Const; 4]> },
+
+    /// Explicitly laid out constant data, using [`mem::const_data::ConstData`]
+    /// to efficiently mix concrete bytes with symbolic ([`Const`]) values.
+    Data(mem::const_data::ConstData<Const>),
 }
 
 /// Entity handle for a [`FuncDecl`](crate::FuncDecl) (a function).
@@ -671,14 +828,14 @@ pub use context::Func;
 pub struct FuncDecl {
     pub attrs: AttrSet,
 
-    pub ret_type: Type,
+    pub ret_types: SmallVec<[Type; 2]>,
 
     pub params: SmallVec<[FuncParam; 2]>,
 
     pub def: DeclDef<FuncDefBody>,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct FuncParam {
     pub attrs: AttrSet,
 
@@ -692,12 +849,12 @@ pub struct FuncParam {
 pub struct FuncDefBody {
     pub regions: EntityDefs<Region>,
     pub nodes: EntityDefs<Node>,
-    pub data_insts: EntityDefs<DataInst>,
+    pub vars: EntityDefs<Var>,
 
     /// The [`Region`] representing the whole body of the function.
     ///
     /// Function parameters are provided via `body.inputs`, i.e. they can be
-    /// only accessed with `Value::RegionInputs { region: body, idx }`.
+    /// only accessed with `VarKind::RegionInput { region: body, idx }`.
     ///
     /// When `unstructured_cfg` is `None`, this includes the structured return
     /// of the function, with `body.outputs` as the returned values.
@@ -711,7 +868,9 @@ pub struct FuncDefBody {
     /// When present, it starts at `body` (more specifically, its exit),
     /// effectively replacing the structured return `body` otherwise implies,
     /// with `body` (or rather, its `children`) always being fully structured.
-    pub unstructured_cfg: Option<cfg::ControlFlowGraph>,
+    //
+    // FIXME(eddyb) replace this with a new `NodeKind` variant.
+    pub unstructured_cfg: Option<cf::unstructured::ControlFlowGraph>,
 }
 
 /// Entity handle for a [`RegionDef`](crate::RegionDef)
@@ -736,9 +895,8 @@ pub struct FuncDefBody {
 ///       [`Node`], or function (the latter being a "structured return")
 ///     * "divergent": execution gets stuck in the region (an infinite loop),
 ///       or is aborted (e.g. `OpTerminateInvocation` from SPIR-V)
-/// * "unstructured": [`Region`]s which connect to other [`Region`]s
-///   using [`cfg::ControlInst`](crate::cfg::ControlInst)s (as described by a
-///   [`cfg::ControlFlowGraph`](crate::cfg::ControlFlowGraph))
+/// * "unstructured": [`Region`]s which connect to other [`Region`]s using "`thunk`s"
+///   (as described by [`cfg::ControlFlowGraph`](crate::cfg::ControlFlowGraph))
 ///
 /// When a function's entire body can be described by a single [`Region`],
 /// that function is said to have (entirely) "structured control-flow".
@@ -771,15 +929,9 @@ pub struct FuncDefBody {
 ///   (i.e. in all possible execution paths, the definition precedes all uses)
 ///
 /// But unlike SPIR-V, SPIR-T's structured control-flow has implications for SSA:
-/// * dominance is simpler, so values defined in a [`Region`](crate::Region) can be used:
-///   * later in that region, including in the region's `outputs`
-///     (which allows "exporting" values out to the rest of the function)
-///   * outside that region, but *only* if the parent [`Node`](crate::Node)
-///     is a `Loop` (that is, when the region is a loop's body)
-///     * this is an "emergent" property, stemming from the region having to
-///       execute (at least once) before the parent [`Node`](crate::Node)
-///       can complete, but is not is not ideal and should eventually be replaced
-///       with passing all such values through loop (body) `outputs`
+/// * dominance is simpler, so values defined in a [`Region`](crate::Region) can
+///   *only* be used later in that region, including in the region's `outputs`
+///   (which allows "exporting" values out to the rest of the function)
 /// * instead of φ ("phi") nodes, SPIR-T uses region `outputs` to merge values
 ///   coming from separate control-flow paths (i.e. the cases of a `Select`),
 ///   and region `inputs` for passing values back along loop backedges
@@ -790,8 +942,7 @@ pub struct FuncDefBody {
 ///     instead of in the merge (where phi nodes require special-casing, as
 ///     their "uses" of all the "source" values would normally be illegal)
 ///   * in unstructured control-flow, region `inputs` are additionally used for
-///     representing phi nodes, as [`cfg::ControlInst`](crate::cfg::ControlInst)s
-///     passing values to their target regions
+///     representing phi nodes, as `thunk`s passing values to their target regions
 ///     * all value uses across unstructured control-flow edges (i.e. not in the
 ///       same region containing the value definition) *require* explicit passing,
 ///       as unstructured control-flow [`Region`](crate::Region)s
@@ -803,31 +954,19 @@ pub use context::Region;
 #[derive(Clone, Default)]
 pub struct RegionDef {
     /// Inputs to this [`Region`]:
-    /// * accessed using [`Value::RegionInput`]
+    /// * accessed using [`VarKind::RegionInput`]
     /// * values provided by the parent:
     ///   * when this is the function body: the function's parameters
-    pub inputs: SmallVec<[RegionInputDecl; 2]>,
+    pub inputs: SmallVec<[Var; 2]>,
 
     pub children: EntityList<Node>,
 
     /// Output values from this [`Region`], provided to the parent:
-    /// * when this is the function body: these are the structured return values
-    /// * when this is a `Select` case: these are the values for the parent
-    ///   [`Node`]'s outputs (accessed using [`Value::NodeOutput`])
-    /// * when this is a `Loop` body: these are the values to be used for the
-    ///   next loop iteration's body `inputs`
-    ///   * **not** accessible through [`Value::NodeOutput`] on the `Loop`,
-    ///     as it's both confusing regarding [`Value::RegionInput`], and
-    ///     also there's nothing stopping body-defined values from directly being
-    ///     used outside the loop (once that changes, this aspect can be flipped)
+    /// * when exiting a [`Node`]: these are the values for its outputs
+    ///   (the caller's `FuncCall` [`Node`], in the case of a function body)
+    /// * when continuing a `Loop`: these are the values fed back into
+    ///   the next loop iteration's body `inputs`
     pub outputs: SmallVec<[Value; 2]>,
-}
-
-#[derive(Copy, Clone)]
-pub struct RegionInputDecl {
-    pub attrs: AttrSet,
-
-    pub ty: Type,
 }
 
 /// Entity handle for a [`NodeDef`](crate::NodeDef)
@@ -841,47 +980,53 @@ pub use context::Node;
 /// See [`Region`] docs for more on control-flow in SPIR-T.
 #[derive(Clone)]
 pub struct NodeDef {
+    pub attrs: AttrSet,
+
     pub kind: NodeKind,
 
+    // FIXME(eddyb) change the inline size of this to fit most nodes.
+    pub inputs: SmallVec<[Value; 2]>,
+
+    // HACK(eddyb) mostly separate to allow the above `kind`-before-`inputs` order.
+    pub child_regions: SmallVec<[Region; 2]>,
+
     /// Outputs from this [`Node`]:
-    /// * accessed using [`Value::NodeOutput`]
+    /// * accessed using [`VarKind::NodeOutput`]
     /// * values provided by `region.outputs`, where `region` is the executed
     ///   child [`Region`]:
     ///   * when this is a `Select`: the case that was chosen
-    pub outputs: SmallVec<[NodeOutputDecl; 2]>,
-}
-
-#[derive(Copy, Clone)]
-pub struct NodeOutputDecl {
-    pub attrs: AttrSet,
-
-    pub ty: Type,
-}
-
-#[derive(Clone)]
-pub enum NodeKind {
-    /// Linear chain of [`DataInst`]s, executing in sequence.
+    ///   * when this is a `Loop`: the last iteration of the body
     ///
-    /// This is only an optimization over keeping [`DataInst`]s in [`Region`]
-    /// linear chains directly, or even merging [`DataInst`] with [`Node`].
-    Block {
-        // FIXME(eddyb) should empty blocks be allowed? should `DataInst`s be
-        // linked directly into the `Region` `children` list?
-        insts: EntityList<DataInst>,
-    },
+    //
+    // FIXME(eddyb) recombine with these `DataInstDef` docs:
+    //
+    /// Types (and attributes) for all the outputs of this instruction.
+    ///
+    /// That is, `vars[outputs[i]].ty` is the type of the [`VarKind::DataInstOutput`]
+    /// with `output_idx == i` (see also [`Value`] documentation).
+    ///
+    /// Most instructions have `0` or `1` outputs, with the notable exception
+    /// of SPIR-V instructions which originally produced SPIR-V "aggregates"
+    /// (`OpTypeStruct`/`OpTypeArray`) before [`spv::lower`] decomposed them
+    /// (in the general case, [`spv::InstLowering`] tracks original types).
+    pub outputs: SmallVec<[Var; 2]>,
+}
 
-    /// Choose one [`Region`] out of `cases` to execute, based on a single
-    /// value input (`scrutinee`) interpreted according to [`SelectionKind`].
+#[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
+pub enum NodeKind {
+    /// Choose one [`Region`] out of `child_regions` to execute, based on a single
+    /// value input (`input[0]`) interpreted according to [`SelectionKind`].
     ///
     /// This corresponds to "gamma" (`γ`) nodes in (R)VSDG, though those are
     /// sometimes limited only to a two-way selection on a boolean condition.
-    Select { kind: SelectionKind, scrutinee: Value, cases: SmallVec<[Region; 2]> },
+    Select(cf::SelectionKind),
 
-    /// Execute `body` repeatedly, until `repeat_condition` evaluates to `false`.
+    /// Execute a "body" (`child_regions[0]`) repeatedly, until `repeat_condition`
+    /// evaluates to `false`.
     ///
-    /// To represent "loop state", `body` can take `inputs`, getting values from:
-    /// * on the first iteration: `initial_inputs`
-    /// * on later iterations: `body`'s own `outputs` (from the last iteration)
+    /// To represent "loop state", the body can take inputs, getting values from:
+    /// * on the first iteration: initial `inputs` (from `NodeDef`)
+    /// * on later iterations: the body's own `outputs` (from the last iteration)
     ///
     /// As the condition is checked only *after* the body, this type of loop is
     /// sometimes described as "tail-controlled", and is also equivalent to the
@@ -889,12 +1034,8 @@ pub enum NodeKind {
     ///
     /// This corresponds to "theta" (`θ`) nodes in (R)VSDG.
     Loop {
-        initial_inputs: SmallVec<[Value; 2]>,
-
-        body: Region,
-
-        // FIXME(eddyb) should this be kept in `body.outputs`? (that would not
-        // have any ambiguity as to whether it can see `body`-computed values)
+        // FIXME(eddyb) move this to body's `outputs`, removing any ambiguity as
+        // to whether it can see body-computed values, and simplifying traversals.
         repeat_condition: Value,
     },
 
@@ -903,84 +1044,134 @@ pub enum NodeKind {
     /// indicating a fatal error as well.
     //
     // FIXME(eddyb) make this less shader-controlflow-centric.
-    ExitInvocation {
-        kind: cfg::ExitInvocationKind,
+    ExitInvocation(cf::ExitInvocationKind),
 
-        // FIXME(eddyb) centralize `Value` inputs across `Node`s,
-        // and only use stricter types for building/traversing the IR.
-        inputs: SmallVec<[Value; 2]>,
-    },
-}
+    // NOTE(eddyb) all variants below used to be in `DataInstKind`.
+    //
+    /// Scalar (`bool`, integer, and floating-point) pure operations.
+    ///
+    /// See also the [`scalar`] module for more documentation and definitions.
+    #[from]
+    Scalar(scalar::Op),
 
-#[derive(Clone)]
-pub enum SelectionKind {
-    /// Two-case selection based on boolean condition, i.e. `if`-`else`, with
-    /// the two cases being "then" and "else" (in that order).
-    BoolCond,
+    /// Vector (small array of [`scalar`]s) pure operations.
+    ///
+    /// See also the [`vector`] module for more documentation and definitions.
+    #[from]
+    Vector(vector::Op),
 
-    SpvInst(spv::Inst),
-}
-
-/// Entity handle for a [`DataInstDef`](crate::DataInstDef) (a leaf instruction).
-pub use context::DataInst;
-
-/// Definition for a [`DataInst`]: a leaf (non-control-flow) instruction.
-//
-// FIXME(eddyb) `DataInstKind::FuncCall` should probably be a `NodeKind`,
-// but also `DataInst` vs `Node` is a purely artificial distinction.
-#[derive(Clone)]
-pub struct DataInstDef {
-    pub attrs: AttrSet,
-
-    pub kind: DataInstKind,
-
-    // FIXME(eddyb) change the inline size of this to fit most instructions.
-    pub inputs: SmallVec<[Value; 2]>,
-
-    pub output_type: Option<Type>,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, derive_more::From)]
-pub enum DataInstKind {
-    // FIXME(eddyb) try to split this into recursive and non-recursive calls,
-    // to avoid needing special handling for recursion where it's impossible.
     FuncCall(Func),
+
+    /// Memory-specific operations (see [`mem::MemOp`]).
+    #[from]
+    Mem(mem::MemOp),
 
     /// `QPtr`-specific operations (see [`qptr::QPtrOp`]).
     #[from]
     QPtr(qptr::QPtrOp),
 
+    // TODO(eddyb) document (maybe move into e.g. `cf::ThunkOp`?).
+    ThunkBind(cf::unstructured::ControlTarget),
+
     // FIXME(eddyb) should this have `#[from]`?
-    SpvInst(spv::Inst),
+    SpvInst(spv::Inst, spv::InstLowering),
     SpvExtInst {
         ext_set: InternedStr,
         inst: u32,
+        lowering: spv::InstLowering,
     },
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub enum Value {
-    Const(Const),
+// HACK(eddyb) temporarily reusing `Node` pre-merger, with:
+// - `child_regions` always empty
+// - `outputs.len` always <= 1
+pub type DataInst = Node;
+pub type DataInstDef = NodeDef;
+pub type DataInstKind = NodeKind;
 
+// FIXME(eddyb) should this be above region/node?
+// FIXME(eddyb) document the fact that "variable" is used here in a sense
+// more like e.g. math/lambda calculus/SSA/Rust immutable variables,
+// and *not* some sort of "mutable slot" (like e.g. wasm local variables),
+// also mention `GlobalVar`/`mem::MemOp::FuncLocalVar`.
+pub use context::Var;
+
+/// Declaration for a [`Var`]: a [`Region`] input or [`Node`] output.
+#[derive(Clone)]
+pub struct VarDecl {
+    pub attrs: AttrSet,
+
+    pub ty: Type,
+
+    // FIXME(eddyb) add a `context::PackedEither` using the sign of s/u32/i32/
+    // interned/entity, and use it to be more compact than `Either<Region, Node>`.
+    pub def_parent: itertools::Either<Region, Node>,
+    pub def_idx: u32,
+}
+
+impl VarDecl {
+    // FIXME(eddyb) `VarKind` maybe should've been `VarDef`, but the `Def` suffix
+    // can get confusing, and `VarKind` was picked early in the refactor.
+    // FIXME(eddyb) document that the indices returned are only valid while the
+    // `Var`s (`RegionDef` `inputs` or `NodeDef` `outputs`) remain unchanged.
+    pub fn kind(&self) -> VarKind {
+        self.def_parent.either(
+            |region| VarKind::RegionInput { region, input_idx: self.def_idx },
+            |node| VarKind::NodeOutput { node, output_idx: self.def_idx },
+        )
+    }
+}
+
+// FIXME(eddyb) consider using `usize` (still packed as `u32`) for indices.
+// FIXME(eddyb) document that the indices contained are only valid while the
+// `Var`s (`RegionDef` `inputs` or `NodeDef` `outputs`) remain unchanged.
+pub enum VarKind {
     /// One of the inputs to a [`Region`]:
     /// * declared by `region.inputs[input_idx]`
     /// * value provided by the parent of the `region`:
     ///   * when `region` is the function body: `input_idx`th function parameter
-    RegionInput {
-        region: Region,
-        input_idx: u32,
-    },
+    RegionInput { region: Region, input_idx: u32 },
 
     /// One of the outputs produced by a [`Node`]:
     /// * declared by `node.outputs[output_idx]`
     /// * value provided by `region.outputs[output_idx]`, where `region` is the
     ///   executed child [`Region`] (of `node`):
     ///   * when `node` is a `Select`: the case that was chosen
-    NodeOutput {
-        node: Node,
-        output_idx: u32,
-    },
+    ///   * when `node` is a `Loop`: the last iteration of the body
+    // TODO(eddyb) include former `DataInst`s in above docs.
+    NodeOutput { node: Node, output_idx: u32 },
+}
 
-    /// The output value of a [`DataInst`].
-    DataInstOutput(DataInst),
+/// Use of a value, either constant or defined earlier in the same function.
+///
+/// Each `Value` can only have one of these types:
+/// * [`scalar`] (`bool`, integer, and floating-point), i.e. [`TypeKind::Scalar`]
+/// * vectors (small array of [`scalar`]s)
+///   * these are *not* traditional SIMD vectors, but more a form of "compression"
+///     (i.e. vector ops often applying the equivalent scalar op per-component),
+///     and sometimes also mandated by specs (e.g. some Vulkan `BuiltIn` types)
+/// * matrices (small array of vectors)
+///   * less fundamental than vectors, may be treated like arrays in the future
+/// * pointers and by-value (but still opaque) resource handles
+///   * SPIR-V has both opaque resource handles that behave much like pointers,
+///     even physical ones (e.g. ray-tracing `OpTypeAccelerationStructureKHR`s),
+///     and others that are only loaded from memory just before using them as
+///     operands (e.g. images/samplers), and such mismatches in indirection may
+///     result in SPIR-T making further distinctions here in the future
+///
+/// Notably, "aggregate" types (SPIR-V `OpTypeStruct`/`OpTypeArray`) are excluded,
+/// so they have to be (recursively) disaggregated into their constituents, and
+/// passed around as separate `Value`s (see also [`DataInstDef`] docs).
+/// * SPIR-V inherited "by-value aggregates" from LLVM, which supports them under
+///   the name "FCA" ("first-class aggregates"), but other IRs (and LLVM passes)
+///   avoid them because of their (negative) impact on analyses and transforms,
+///   with their main vestigial purpose being to encode multiple return values
+///   from functions, which can be done more directly in other IRs (and SPIR-T)
+//
+// FIXME(eddyb) add a `context::PackedEither` using the sign of s/u32/i32/
+// interned/entity, and use it to be more compact than `Either<Const, Var>`.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub enum Value {
+    Const(Const),
+    Var(Var),
 }

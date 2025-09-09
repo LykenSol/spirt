@@ -1,13 +1,14 @@
 // FIXME(eddyb) layouts are a bit tricky: this recomputes them from several passes.
 
-use crate::qptr::shapes;
+use crate::mem::shapes;
 use crate::{
-    AddrSpace, Attr, Const, ConstKind, Context, Diag, FxIndexMap, Type, TypeKind, TypeOrConst, spv,
+    AddrSpace, Attr, Const, Context, Diag, FxIndexMap, Type, TypeKind, TypeOrConst, scalar, spv,
 };
 use itertools::Either;
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::fmt;
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::rc::Rc;
@@ -17,6 +18,8 @@ use std::rc::Rc;
 //
 // FIXME(eddyb) use proper newtypes (and log2 for align!).
 pub struct LayoutConfig {
+    pub is_big_endian: bool,
+
     pub ignore_legacy_align: bool,
     pub min_aggregate_legacy_align: u32,
 
@@ -43,28 +46,37 @@ pub struct LayoutConfig {
     // mode, which disallows reinterpretation on the basis that the precise
     // offsets/sizes may not match between types (but that's its own nightmare).
     pub logical_ptr_size_align: (u32, u32),
+
+    /// Whether `OpConvertPtrToU(p) = 0` and `p = OpConvertUToPtr(0)` are expected
+    /// to correspond to `p = OpConstantNull`, even for logical `OpTypePointer`s.
+    pub logical_ptr_null_is_zero: bool,
 }
 
 impl LayoutConfig {
-    pub const VULKAN_SCALAR_LAYOUT: Self = Self {
+    pub const VULKAN_SCALAR_LAYOUT_LE: Self = Self {
+        is_big_endian: false,
+
         ignore_legacy_align: true,
         min_aggregate_legacy_align: 1,
 
         abstract_bool_size_align: (1, 1),
         logical_ptr_size_align: (1, 1),
+
+        logical_ptr_null_is_zero: false,
     };
-    pub const VULKAN_STANDARD_LAYOUT: Self =
-        Self { ignore_legacy_align: false, ..Self::VULKAN_SCALAR_LAYOUT };
+    pub const VULKAN_STANDARD_LAYOUT_LE: Self =
+        Self { ignore_legacy_align: false, ..Self::VULKAN_SCALAR_LAYOUT_LE };
     // FIXME(eddyb) is this even useful? (all the storage classes that have any
     // kind of alignment requirements, require explicit offsets)
-    pub const VULKAN_EXTENDED_ALIGN_UBO_LAYOUT: Self =
-        Self { min_aggregate_legacy_align: 16, ..Self::VULKAN_STANDARD_LAYOUT };
+    pub const VULKAN_EXTENDED_ALIGN_UBO_LAYOUT_LE: Self =
+        Self { min_aggregate_legacy_align: 16, ..Self::VULKAN_STANDARD_LAYOUT_LE };
 }
 
-pub(super) struct LayoutError(pub(super) Diag);
+pub struct LayoutError(pub(crate) Diag);
 
+// HACK(eddyb) `pub` so that `spirti` can also rely on this.
 #[derive(Clone)]
-pub(super) enum TypeLayout {
+pub enum TypeLayout {
     Handle(HandleLayout),
     HandleArray(HandleLayout, Option<NonZeroU32>),
 
@@ -73,16 +85,17 @@ pub(super) enum TypeLayout {
 }
 
 // NOTE(eddyb) `Handle` is parameterized over the `Buffer` layout.
-pub(super) type HandleLayout = shapes::Handle<Rc<MemTypeLayout>>;
+pub(crate) type HandleLayout = shapes::Handle<Rc<MemTypeLayout>>;
 
-pub(super) struct MemTypeLayout {
-    pub(super) original_type: Type,
-    pub(super) mem_layout: shapes::MaybeDynMemLayout,
-    pub(super) components: Components,
+// HACK(eddyb) `pub` so that `spirti` can also rely on this.
+pub struct MemTypeLayout {
+    pub original_type: Type,
+    pub mem_layout: shapes::MaybeDynMemLayout,
+    pub components: Components,
 }
 
 // FIXME(eddyb) use proper newtypes for byte sizes.
-pub(super) enum Components {
+pub enum Components {
     Scalar,
 
     /// Vector and array elements (all of them having the same `elem` layout).
@@ -99,23 +112,156 @@ pub(super) enum Components {
     },
 }
 
-impl Components {
-    /// Return all components (by index), which completely contain `offset_range`.
+impl MemTypeLayout {
+    /// Recursively expand `MemTypeLayout`s into their components, at every level
+    /// for which `predicate` returns `true`. `each_leaf` is called for each
+    /// leaf (scalar or `recurse_into` returned `false`) component, and includes
+    /// its offset (starting at `base_offset`).
     ///
-    /// If `offset_range` is zero-sized (`offset_range.start == offset_range.end`),
-    /// this can return multiple components, with at most one ever being non-ZST.
+    /// Because each array element has its own offset, each array element will
+    /// be separately flattened, such that the entire array will be covered.
+    ///
+    /// `Err` may be returned in some cases (e.g. offset overflows, dynamic arrays),
+    /// in which case the sequence of leaves `each_leaf` produced can be considered
+    /// incomplete and shouldn't be used.
+    //
+    // HACK(eddyb) `pub fn` so that `spirti` can also rely on this.
+    pub fn deeply_flatten_if(
+        &self,
+        base_offset: i32,
+        recurse_into: &impl Fn(&Self) -> bool,
+        each_leaf: &mut impl FnMut(i32, &Self) -> Result<(), LayoutError>,
+    ) -> Result<(), LayoutError> {
+        match &self.components {
+            Components::Scalar => each_leaf(base_offset, self),
+            _ if !recurse_into(self) => each_leaf(base_offset, self),
+
+            Components::Elements { stride, elem, fixed_len } => {
+                let len = fixed_len.ok_or_else(|| {
+                    LayoutError(Diag::err([
+                        "dynamically sized type `".into(),
+                        self.original_type.into(),
+                        "` cannot be flattened into a finite sequence of leaves".into(),
+                    ]))
+                })?;
+
+                for i in 0..len.get() {
+                    let offset = i32::try_from(i)
+                        .ok()
+                        .and_then(|i| {
+                            // HACK(eddyb) don't claim an overflow for `0 * stride`
+                            // even if `stride` doesn't fit in `i32`.
+                            if i == 0 {
+                                Some(base_offset)
+                            } else {
+                                let stride = i32::try_from(stride.get()).ok()?;
+                                base_offset.checked_add(i.checked_mul(stride)?)
+                            }
+                        })
+                        .ok_or_else(|| {
+                            LayoutError(Diag::bug([format!(
+                                "`{base_offset} + {i} * {stride}` overflowed `s32`"
+                            )
+                            .into()]))
+                        })?;
+                    elem.deeply_flatten_if(offset, recurse_into, each_leaf)?;
+                }
+                Ok(())
+            }
+
+            Components::Fields { offsets, layouts } => {
+                for (&field_offset, field) in offsets.iter().zip(layouts) {
+                    let offset = i32::try_from(field_offset)
+                        .ok()
+                        .and_then(|field_offset| base_offset.checked_add(field_offset))
+                        .ok_or_else(|| {
+                            LayoutError(Diag::bug([format!(
+                                "`{base_offset} + {field_offset}` overflowed `s32`"
+                            )
+                            .into()]))
+                        })?;
+                    field.deeply_flatten_if(offset, recurse_into, each_leaf)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+// FIXME(eddyb) review this, especially wrt using it in more places.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) struct Extent<T> {
+    pub(crate) start: T,
+    // FIXME(eddyb) would `Option<RangeTo<T>>` be clearer?
+    pub(crate) end: Option<T>,
+}
+
+impl<T: fmt::Display> fmt::Display for Extent<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { start, end } = self;
+        start.fmt(f)?;
+        f.write_str("..")?;
+        if let Some(end) = end {
+            end.fmt(f)?;
+        }
+        Ok(())
+    }
+}
+
+// HACK(eddyb) comparison helper for `Option<T>` so that `Some(_) < None`.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum InfOr<T> {
+    Fin(T),
+    Inf,
+}
+
+impl<T> From<Range<T>> for Extent<T> {
+    fn from(range: Range<T>) -> Self {
+        Self { start: range.start, end: Some(range.end) }
+    }
+}
+
+impl<T: Ord> Extent<T> {
+    pub(crate) fn includes(&self, other: &Self) -> bool {
+        self.start <= other.start
+            && other.end.as_ref().map_or(InfOr::Inf, InfOr::Fin)
+                <= self.end.as_ref().map_or(InfOr::Inf, InfOr::Fin)
+    }
+}
+
+impl Extent<u32> {
+    pub(crate) fn checked_add(self, delta: u32) -> Option<Self> {
+        Some(Self {
+            start: self.start.checked_add(delta)?,
+            end: self.end.map(|end| end.checked_add(delta).ok_or(())).transpose().ok()?,
+        })
+    }
+
+    // FIXME(eddyb) this pattern was already used in a few places, is it reasonable?
+    pub(crate) fn saturating_add(self, delta: u32) -> Self {
+        Self {
+            start: self.start.saturating_add(delta),
+            end: self.end.map(|end| end.saturating_add(delta)),
+        }
+    }
+}
+
+impl Components {
+    /// Return all components (by index), which completely contain `extent`.
+    ///
+    /// If `extent` is zero-sized (`Some(extent.start) == extent.end`), this
+    /// can return multiple components, with at most one ever being non-ZST.
     //
     // FIXME(eddyb) be more aggressive in pruning ZSTs so this can be simpler.
-    pub(super) fn find_components_containing(
+    pub(crate) fn find_components_containing(
         &self,
-        // FIXME(eddyb) consider renaming such offset ranges to "extent".
-        offset_range: Range<u32>,
+        extent: Extent<u32>,
     ) -> impl Iterator<Item = usize> + '_ {
-        match self {
+        let candidate_component_indices_with_extent = match self {
             Components::Scalar => Either::Left(None.into_iter()),
             Components::Elements { stride, elem, fixed_len } => {
                 Either::Left(
-                    Some(offset_range.start / stride.get())
+                    Some(extent.start / stride.get())
                         .and_then(|elem_idx| {
                             let elem_idx_vs_len = fixed_len
                                 .map_or(Ordering::Less, |fixed_len| elem_idx.cmp(&fixed_len.get()));
@@ -127,11 +273,11 @@ impl Components {
 
                                 Ordering::Greater => return None,
                             };
-                            let elem_start = elem_idx * stride.get();
-                            Some((elem_idx, elem_start..elem_start.checked_add(elem_size)?))
+                            Some((
+                                usize::try_from(elem_idx).ok()?,
+                                Extent::from(0..elem_size).checked_add(elem_idx * stride.get())?,
+                            ))
                         })
-                        .filter(|(_, elem_range)| offset_range.end <= elem_range.end)
-                        .and_then(|(elem_idx, _)| usize::try_from(elem_idx).ok())
                         .into_iter(),
                 )
             }
@@ -143,85 +289,63 @@ impl Components {
                     .iter()
                     .zip(layouts)
                     .map(|(&field_offset, field)| {
-                        // HACK(eddyb) really need a maybe-open-ended range type.
-                        if field.mem_layout.dyn_unit_stride.is_some() {
-                            Err(field_offset..)
-                        } else {
-                            Ok(field_offset
-                                ..field_offset
-                                    .checked_add(field.mem_layout.fixed_base.size)
-                                    .unwrap())
+                        Extent {
+                            start: 0,
+                            end: (field.mem_layout.dyn_unit_stride.is_none())
+                                .then_some(field.mem_layout.fixed_base.size),
                         }
+                        .checked_add(field_offset)
+                        .unwrap()
                     })
-                    .enumerate()
-                    .filter(move |(_, field_range)| match field_range {
-                        Ok(field_range) => {
-                            field_range.start <= offset_range.start
-                                && offset_range.end <= field_range.end
-                        }
-                        Err(field_range) => field_range.start <= offset_range.start,
-                    })
-                    .map(|(field_idx, _)| field_idx),
+                    .enumerate(),
             ),
-        }
+        };
+        candidate_component_indices_with_extent
+            .filter(move |(_, component_extent)| component_extent.includes(&extent))
+            .map(|(component_idx, _)| component_idx)
     }
 }
 
 /// Context for computing `TypeLayout`s from `Type`s (with caching).
-pub(super) struct LayoutCache<'a> {
+//
+// HACK(eddyb) `pub` so that `spirti` can also rely on this.
+pub struct LayoutCache<'a> {
     cx: Rc<Context>,
     wk: &'static spv::spec::WellKnown,
 
-    config: &'a LayoutConfig,
+    pub config: &'a LayoutConfig,
 
     cache: RefCell<FxIndexMap<Type, TypeLayout>>,
 }
 
 impl<'a> LayoutCache<'a> {
-    pub(super) fn new(cx: Rc<Context>, config: &'a LayoutConfig) -> Self {
+    // HACK(eddyb) `pub fn` so that `spirti` can also rely on this.
+    pub fn new(cx: Rc<Context>, config: &'a LayoutConfig) -> Self {
         Self { cx, wk: &spv::spec::Spec::get().well_known, config, cache: Default::default() }
     }
 
-    // FIXME(eddyb) properly distinguish between zero-extension and sign-extension.
     fn const_as_u32(&self, ct: Const) -> Option<u32> {
-        if let ConstKind::SpvInst { spv_inst_and_const_inputs } = &self.cx[ct].kind {
-            let (spv_inst, _const_inputs) = &**spv_inst_and_const_inputs;
-            if spv_inst.opcode == self.wk.OpConstant && spv_inst.imms.len() == 1 {
-                match spv_inst.imms[..] {
-                    [spv::Imm::Short(_, x)] => return Some(x),
-                    _ => unreachable!(),
-                }
-            }
-        }
-        None
+        // HACK(eddyb) lossless roundtrip through `i32` is most conservative
+        // option (only `0..=i32::MAX`, i.e. `0 <= x < 2**32, is allowed).
+        u32::try_from(ct.as_scalar(&self.cx)?.int_as_i32()?).ok()
     }
 
     /// Attempt to compute a `TypeLayout` for a given (SPIR-V) `Type`.
-    pub(super) fn layout_of(&self, ty: Type) -> Result<TypeLayout, LayoutError> {
+    //
+    // HACK(eddyb) `pub fn` so that `spirti` can also rely on this.
+    pub fn layout_of(&self, ty: Type) -> Result<TypeLayout, LayoutError> {
         if let Some(cached) = self.cache.borrow().get(&ty).cloned() {
             return Ok(cached);
         }
 
+        let layout = self.layout_of_uncached(ty)?;
+        self.cache.borrow_mut().insert(ty, layout.clone());
+        Ok(layout)
+    }
+
+    fn layout_of_uncached(&self, ty: Type) -> Result<TypeLayout, LayoutError> {
         let cx = &self.cx;
         let wk = self.wk;
-
-        let ty_def = &cx[ty];
-        let (spv_inst, type_and_const_inputs) = match &ty_def.kind {
-            // FIXME(eddyb) treat `QPtr`s as scalars.
-            TypeKind::QPtr => {
-                return Err(LayoutError(Diag::bug(
-                    ["`layout_of(qptr)` (already lowered?)".into()],
-                )));
-            }
-            TypeKind::SpvInst { spv_inst, type_and_const_inputs } => {
-                (spv_inst, type_and_const_inputs)
-            }
-            TypeKind::SpvStringLiteralForExtInst => {
-                return Err(LayoutError(Diag::bug([
-                    "`layout_of(type_of(OpString<\"...\">))`".into()
-                ])));
-            }
-        };
 
         let scalar_with_size_and_align = |(size, align)| {
             TypeLayout::Concrete(Rc::new(MemTypeLayout {
@@ -233,6 +357,7 @@ impl<'a> LayoutCache<'a> {
                 components: Components::Scalar,
             }))
         };
+
         let scalar = |width: u32| {
             assert!(width.is_power_of_two());
             let size = width / 8;
@@ -340,34 +465,67 @@ impl<'a> LayoutCache<'a> {
                 }
             }
         };
-        let short_imm_at = |i| match spv_inst.imms[i] {
-            spv::Imm::Short(_, x) => x,
-            _ => unreachable!(),
-        };
 
         // FIXME(eddyb) !!! what if... types had a min/max size and then...
         // that would allow surrounding offsets to limit their size... but... ugh...
         // ugh this doesn't make any sense. maybe if the front-end specifies
-        // offsets with "abstract types", it must configure `qptr::layout`?
-        let layout = if spv_inst.opcode == wk.OpTypeBool {
-            // FIXME(eddyb) make this properly abstract instead of only configurable.
-            scalar_with_size_and_align(self.config.abstract_bool_size_align)
-        } else if spv_inst.opcode == wk.OpTypePointer {
+        // offsets with "abstract types", it must configure `mem::layout`?
+
+        let ty_def = &cx[ty];
+        let (spv_inst, type_and_const_inputs) = match &ty_def.kind {
+            TypeKind::Scalar(scalar::Type::Bool) => {
+                // FIXME(eddyb) make this properly abstract instead of only configurable.
+                return Ok(scalar_with_size_and_align(self.config.abstract_bool_size_align));
+            }
+            TypeKind::Scalar(ty) => return Ok(scalar(ty.bit_width())),
+
+            TypeKind::Vector(ty) => {
+                let len = u32::from(ty.elem_count.get());
+                return array(
+                    cx.intern(ty.elem),
+                    ArrayParams {
+                        fixed_len: Some(len),
+                        known_stride: None,
+
+                        // NOTE(eddyb) this is specifically Vulkan "base alignment".
+                        min_legacy_align: 1,
+                        legacy_align_multiplier: if len <= 2 { 2 } else { 4 },
+                    },
+                );
+            }
+
+            TypeKind::QPtr => {
+                // FIXME(eddyb) make this properly abstract instead of only configurable.
+                // FIXME(eddyb) avoid logical vs physical conflicts here, maybe
+                // by adding more `LayoutConfig` fields, or only allowing `qptr`s
+                // to be kept in memory if `logical_ptr_size_align` agrees with
+                // the physical pointer size from the module addressing mode?
+                return Ok(scalar_with_size_and_align(self.config.logical_ptr_size_align));
+            }
+
+            TypeKind::Thunk => {
+                return Err(LayoutError(Diag::bug(["`layout_of(thunk)`".into()])));
+            }
+
+            TypeKind::SpvInst { spv_inst, type_and_const_inputs, .. } => {
+                (spv_inst, type_and_const_inputs)
+            }
+            TypeKind::SpvStringLiteralForExtInst => {
+                return Err(LayoutError(Diag::bug([
+                    "`layout_of(type_of(OpString<\"...\">))`".into()
+                ])));
+            }
+        };
+        let short_imm_at = |i| match spv_inst.imms[i] {
+            spv::Imm::Short(_, x) => x,
+            _ => unreachable!(),
+        };
+        Ok(if spv_inst.opcode == wk.OpTypePointer {
             // FIXME(eddyb) make this properly abstract instead of only configurable.
             // FIXME(eddyb) categorize `OpTypePointer` by storage class and split on
             // logical vs physical here.
             scalar_with_size_and_align(self.config.logical_ptr_size_align)
-        } else if [wk.OpTypeInt, wk.OpTypeFloat].contains(&spv_inst.opcode) {
-            scalar(short_imm_at(0))
-        } else if [wk.OpTypeVector, wk.OpTypeMatrix].contains(&spv_inst.opcode) {
-            let len = short_imm_at(0);
-            let (min_legacy_align, legacy_align_multiplier) = if spv_inst.opcode == wk.OpTypeVector
-            {
-                // NOTE(eddyb) this is specifically Vulkan "base alignment".
-                (1, if len <= 2 { 2 } else { 4 })
-            } else {
-                (self.config.min_aggregate_legacy_align, 1)
-            };
+        } else if spv_inst.opcode == wk.OpTypeMatrix {
             // NOTE(eddyb) `RowMajor` is disallowed on `OpTypeStruct` members below.
             array(
                 match type_and_const_inputs[..] {
@@ -375,10 +533,10 @@ impl<'a> LayoutCache<'a> {
                     _ => unreachable!(),
                 },
                 ArrayParams {
-                    fixed_len: Some(len),
+                    fixed_len: Some(short_imm_at(0)),
                     known_stride: None,
-                    min_legacy_align,
-                    legacy_align_multiplier,
+                    min_legacy_align: self.config.min_aggregate_legacy_align,
+                    legacy_align_multiplier: 1,
                 },
             )?
         } else if [wk.OpTypeArray, wk.OpTypeRuntimeArray].contains(&spv_inst.opcode) {
@@ -628,23 +786,8 @@ impl<'a> LayoutCache<'a> {
             } else {
                 TypeLayout::Concrete(concrete)
             }
-        } else if [
-            wk.OpTypeImage,
-            wk.OpTypeSampler,
-            wk.OpTypeSampledImage,
-            wk.OpTypeAccelerationStructureKHR,
-        ]
-        .contains(&spv_inst.opcode)
-        {
-            TypeLayout::Handle(shapes::Handle::Opaque(ty))
         } else {
-            return Err(LayoutError(Diag::bug([format!(
-                "unknown/unsupported SPIR-V type `{}`",
-                spv_inst.opcode.name()
-            )
-            .into()])));
-        };
-        self.cache.borrow_mut().insert(ty, layout.clone());
-        Ok(layout)
+            TypeLayout::Handle(shapes::Handle::Opaque(ty))
+        })
     }
 }

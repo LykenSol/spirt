@@ -1,430 +1,20 @@
-//! Control-flow graph (CFG) abstractions and utilities.
+//! Control-flow structurization (unstructured CFG -> structured regions).
+//
+// FIXME(eddyb) consider moving docs to the module level?
 
-use crate::transform::{InnerInPlaceTransform as _, Transformer};
+use crate::cf::SelectionKind;
+use crate::cf::unstructured::{ControlTarget, IncomingEdgeCount, LoopFinder, TraversalState};
+use crate::func_at::FuncAtMut;
+use crate::transform::{InnerInPlaceTransform as _, Transformed, Transformer};
 use crate::{
-    AttrSet, Const, ConstDef, ConstKind, Context, EntityOrientedDenseMap, FuncDefBody, FxIndexMap,
-    FxIndexSet, Node, NodeDef, NodeKind, NodeOutputDecl, Region, RegionDef, SelectionKind, Type,
-    TypeKind, Value, spv,
+    AttrSet, Const, ConstDef, ConstKind, Context, DbgSrcLoc, EntityOrientedDenseMap, FuncDefBody,
+    FxIndexMap, FxIndexSet, Node, NodeDef, NodeKind, Region, RegionDef, Type, TypeKind, Value, Var,
+    VarDecl, VarKind, scalar,
 };
 use itertools::{Either, Itertools};
 use smallvec::SmallVec;
 use std::mem;
 use std::rc::Rc;
-
-/// The control-flow graph (CFG) of a function, as control-flow instructions
-/// ([`ControlInst`]s) attached to [`Region`]s, as an "action on exit", i.e.
-/// "terminator" (while intra-region control-flow is strictly structured).
-#[derive(Clone, Default)]
-pub struct ControlFlowGraph {
-    pub control_inst_on_exit_from: EntityOrientedDenseMap<Region, ControlInst>,
-
-    // HACK(eddyb) this currently only comes from `OpLoopMerge`, and cannot be
-    // inferred (because implies too strong of an ownership/uniqueness notion).
-    pub loop_merge_to_loop_header: FxIndexMap<Region, Region>,
-}
-
-#[derive(Clone)]
-pub struct ControlInst {
-    pub attrs: AttrSet,
-
-    pub kind: ControlInstKind,
-
-    pub inputs: SmallVec<[Value; 2]>,
-
-    // FIXME(eddyb) change the inline size of this to fit most instructions.
-    pub targets: SmallVec<[Region; 4]>,
-
-    /// `target_inputs[region][input_idx]` is the [`Value`] that
-    /// `Value::RegionInput { region, input_idx }` will get on entry,
-    /// where `region` must be appear at least once in `targets` - this is a
-    /// separate map instead of being part of `targets` because it reflects the
-    /// limitations of φ ("phi") nodes, which (unlike "basic block arguments")
-    /// cannot tell apart multiple edges with the same source and destination.
-    pub target_inputs: FxIndexMap<Region, SmallVec<[Value; 2]>>,
-}
-
-#[derive(Clone)]
-pub enum ControlInstKind {
-    /// Reaching this point in the control-flow is undefined behavior, e.g.:
-    /// * a `SelectBranch` case that's known to be impossible
-    /// * after a function call, where the function never returns
-    ///
-    /// Optimizations can take advantage of this information, to assume that any
-    /// necessary preconditions for reaching this point, are never met.
-    Unreachable,
-
-    /// Leave the current function, optionally returning a value.
-    Return,
-
-    /// Leave the current invocation, similar to returning from every function
-    /// call in the stack (up to and including the entry-point), but potentially
-    /// indicating a fatal error as well.
-    ExitInvocation(ExitInvocationKind),
-
-    /// Unconditional branch to a single target.
-    Branch,
-
-    /// Branch to one of several targets, chosen by a single value input.
-    SelectBranch(SelectionKind),
-}
-
-#[derive(Clone)]
-pub enum ExitInvocationKind {
-    SpvInst(spv::Inst),
-}
-
-impl ControlFlowGraph {
-    /// Iterate over all [`Region`]s making up `func_def_body`'s CFG, in
-    /// reverse post-order (RPO).
-    ///
-    /// RPO iteration over a CFG provides certain guarantees, most importantly
-    /// that dominators are visited before the entire subgraph they dominate.
-    pub fn rev_post_order(
-        &self,
-        func_def_body: &FuncDefBody,
-    ) -> impl DoubleEndedIterator<Item = Region> + use<> {
-        let mut post_order = SmallVec::<[_; 8]>::new();
-        self.traverse_whole_func(
-            func_def_body,
-            &mut TraversalState {
-                incoming_edge_counts: EntityOrientedDenseMap::new(),
-
-                pre_order_visit: |_| {},
-                post_order_visit: |region| post_order.push(region),
-
-                // NOTE(eddyb) this doesn't impact semantics, but combined with
-                // the final reversal, it should keep targets in the original
-                // order in the cases when they didn't get deduplicated.
-                reverse_targets: true,
-            },
-        );
-        post_order.into_iter().rev()
-    }
-}
-
-// HACK(eddyb) this only serves to disallow accessing `private_count` field of
-// `IncomingEdgeCount`.
-mod sealed {
-    /// Opaque newtype for the count of incoming edges (into a [`Region`](crate::Region)).
-    ///
-    /// The private field prevents direct mutation or construction, forcing the
-    /// use of [`IncomingEdgeCount::ONE`] and addition operations to produce some
-    /// specific count (which would require explicit workarounds for misuse).
-    #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-    pub(super) struct IncomingEdgeCount(usize);
-
-    impl IncomingEdgeCount {
-        pub(super) const ONE: Self = Self(1);
-    }
-
-    impl std::ops::Add for IncomingEdgeCount {
-        type Output = Self;
-        fn add(self, other: Self) -> Self {
-            Self(self.0 + other.0)
-        }
-    }
-
-    impl std::ops::AddAssign for IncomingEdgeCount {
-        fn add_assign(&mut self, other: Self) {
-            *self = *self + other;
-        }
-    }
-}
-use sealed::IncomingEdgeCount;
-
-struct TraversalState<PreVisit: FnMut(Region), PostVisit: FnMut(Region)> {
-    incoming_edge_counts: EntityOrientedDenseMap<Region, IncomingEdgeCount>,
-    pre_order_visit: PreVisit,
-    post_order_visit: PostVisit,
-
-    // FIXME(eddyb) should this be a generic parameter for "targets iterator"?
-    reverse_targets: bool,
-}
-
-impl ControlFlowGraph {
-    fn traverse_whole_func(
-        &self,
-        func_def_body: &FuncDefBody,
-        state: &mut TraversalState<impl FnMut(Region), impl FnMut(Region)>,
-    ) {
-        let func_at_body = func_def_body.at_body();
-
-        // Quick sanity check that this is the right CFG for `func_def_body`.
-        assert!(std::ptr::eq(func_def_body.unstructured_cfg.as_ref().unwrap(), self));
-        assert!(func_at_body.def().outputs.is_empty());
-
-        self.traverse(func_def_body.body, state);
-    }
-
-    fn traverse(
-        &self,
-        region: Region,
-        state: &mut TraversalState<impl FnMut(Region), impl FnMut(Region)>,
-    ) {
-        // FIXME(eddyb) `EntityOrientedDenseMap` should have an `entry` API.
-        if let Some(existing_count) = state.incoming_edge_counts.get_mut(region) {
-            *existing_count += IncomingEdgeCount::ONE;
-            return;
-        }
-        state.incoming_edge_counts.insert(region, IncomingEdgeCount::ONE);
-
-        (state.pre_order_visit)(region);
-
-        let control_inst = self
-            .control_inst_on_exit_from
-            .get(region)
-            .expect("cfg: missing `ControlInst`, despite having left structured control-flow");
-
-        let targets = control_inst.targets.iter().copied();
-        let targets = if state.reverse_targets {
-            Either::Left(targets.rev())
-        } else {
-            Either::Right(targets)
-        };
-        for target in targets {
-            self.traverse(target, state);
-        }
-
-        (state.post_order_visit)(region);
-    }
-}
-
-/// Minimal loop analysis, based on Tarjan's SCC (strongly connected components)
-/// algorithm, applied recursively (for every level of loop nesting).
-///
-/// Here "minimal" means that each loops is the smallest CFG subgraph possible
-/// (excluding any control-flow paths that cannot reach a backedge and cycle),
-/// i.e. each loop is a CFG SCC (strongly connected component).
-///
-/// These "minimal loops" contrast with the "maximal loops" that the greedy
-/// architecture of the structurizer would naively produce, with the main impact
-/// of the difference being where loop exits (`break`s) "merge" (or "reconverge"),
-/// which SPIR-V encodes via `OpLoopMerge`, and is significant for almost anything
-/// where shared memory and/or subgroup ops can allow observing when invocations
-/// "wait for others in the subgroup to exit the loop" (or when they fail to wait).
-///
-/// This analysis was added to because of two observations wrt "reconvergence":
-/// 1. syntactic loops (from some high-level language), when truly structured
-///    (i.e. only using `while`/`do`-`while` exit conditions, not `break` etc.),
-///    *always* map to "minimal loops" on a CFG, as the only loop exit edge is
-///    built-in, and no part of the syntactic "loop body" can be its successor
-/// 2. more pragmatically, compiling shader languages to SPIR-V seems to (almost?)
-///    always *either* fully preserve syntactic loops (via SPIR-V `OpLoopMerge`),
-///    *or* structurize CFGs in a way that produces "minimal loops", which can
-///    be misleading with explicit `break`s (moving user code from just before
-///    the `break` to after the loop), but is less impactful than "maximal loops"
-struct LoopFinder<'a> {
-    cfg: &'a ControlFlowGraph,
-
-    // FIXME(eddyb) this feels a bit inefficient (are many-exit loops rare?).
-    loop_header_to_exit_targets: FxIndexMap<Region, FxIndexSet<Region>>,
-
-    /// SCC accumulation stack, where CFG nodes collect during the depth-first
-    /// traversal, and are only popped when their "SCC root" (loop header) is
-    /// (note that multiple SCCs on the stack does *not* indicate SCC nesting,
-    /// but rather a path between two SCCs, i.e. a loop *following* another).
-    scc_stack: Vec<Region>,
-    /// Per-CFG-node traversal state (often just pointing to a `scc_stack` slot).
-    scc_state: EntityOrientedDenseMap<Region, SccState>,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct SccStackIdx(u32);
-
-#[derive(PartialEq, Eq)]
-enum SccState {
-    /// CFG node has been reached and ended up somewhere on the `scc_stack`,
-    /// where it will remain until the SCC it's part of will be completed.
-    Pending(SccStackIdx),
-
-    /// CFG node had been reached once, but is no longer on the `scc_stack`, its
-    /// parent SCC having been completed (or it wasn't in an SCC to begin with).
-    Complete(EventualCfgExits),
-}
-
-/// Summary of all the ways in which a CFG node may eventually leave the CFG.
-///
-// HACK(eddyb) a loop can reach a CFG subgraph that happens to always "diverge"
-// (e.g. ending in `unreachable`, `ExitInvocation`, or even infinite loops,
-// though those have other issues) and strictly speaking that would always be
-// an edge leaving the SCC of the loop (as it can't reach a backedge), but it
-// still shouldn't be treated as an exit because it doesn't reconverge to the
-// rest of the function, i.e. it can't reach any `return`s, which is what this
-// tracks in order to later make a more accurate decision wrt loop exits.
-//
-// NOTE(eddyb) only in the case where a loop *also* has non-"diverging" exits,
-// do the "diverging" ones not get treated as exits, as the presence of both
-// disambiguates `break`s from naturally "diverging" sections of the loop body
-// (at least for CFGs built from languages without labelled `break` or `goto`,
-// but even then it would be pretty convoluted to set up `break` to diverge,
-// while `break some_outer_label` to reconverge to the rest of the function).
-#[derive(Copy, Clone, Default, PartialEq, Eq)]
-struct EventualCfgExits {
-    // FIXME(eddyb) do the other situations need their own flags here?
-    may_return_from_func: bool,
-}
-
-impl std::ops::BitOr for EventualCfgExits {
-    type Output = Self;
-    fn bitor(self, other: Self) -> Self {
-        Self { may_return_from_func: self.may_return_from_func | other.may_return_from_func }
-    }
-}
-impl std::ops::BitOrAssign for EventualCfgExits {
-    fn bitor_assign(&mut self, other: Self) {
-        *self = *self | other;
-    }
-}
-
-impl<'a> LoopFinder<'a> {
-    fn new(cfg: &'a ControlFlowGraph) -> Self {
-        Self {
-            cfg,
-            loop_header_to_exit_targets: FxIndexMap::default(),
-            scc_stack: vec![],
-            scc_state: EntityOrientedDenseMap::new(),
-        }
-    }
-
-    /// Tarjan's SCC algorithm works by computing the "earliest" reachable node,
-    /// from every node (often using the name `lowlink`), which will be equal
-    /// to the origin node itself iff that node is an "SCC root" (loop header),
-    /// and always point to an "earlier" node if a cycle (via loop backedge) was
-    /// found from somewhere else in the SCC (i.e. from inside the loop body).
-    ///
-    /// Here we track stack indices (as the stack order is the traversal order),
-    /// and distinguish the acyclic case to avoid treating most nodes as self-loops.
-    //
-    // FIXME(eddyb) name of the function is a bit clunky wrt its return type.
-    fn find_earliest_scc_root_of(
-        &mut self,
-        node: Region,
-    ) -> (Option<SccStackIdx>, EventualCfgExits) {
-        let state_entry = self.scc_state.entry(node);
-        if let Some(state) = &state_entry {
-            return match *state {
-                SccState::Pending(scc_stack_idx) => {
-                    // HACK(eddyb) this means that `EventualCfgExits`s will be
-                    // inconsistently observed across the `Pending` nodes of a
-                    // loop body, but that is sound as it cannot feed into any
-                    // `Complete` state until the loop header itself is complete,
-                    // and the monotonic nature of `EventualCfgExits` means that
-                    // the loop header will still get to see the complete picture.
-                    (Some(scc_stack_idx), EventualCfgExits::default())
-                }
-                SccState::Complete(eventual_cfg_exits) => (None, eventual_cfg_exits),
-            };
-        }
-        let scc_stack_idx = SccStackIdx(self.scc_stack.len().try_into().unwrap());
-        self.scc_stack.push(node);
-        *state_entry = Some(SccState::Pending(scc_stack_idx));
-
-        let control_inst = self
-            .cfg
-            .control_inst_on_exit_from
-            .get(node)
-            .expect("cfg: missing `ControlInst`, despite having left structured control-flow");
-
-        let mut eventual_cfg_exits = EventualCfgExits::default();
-
-        if let ControlInstKind::Return = control_inst.kind {
-            eventual_cfg_exits.may_return_from_func = true;
-        }
-
-        let earliest_scc_root = control_inst
-            .targets
-            .iter()
-            .flat_map(|&target| {
-                let (earliest_scc_root_of_target, eventual_cfg_exits_of_target) =
-                    self.find_earliest_scc_root_of(target);
-                eventual_cfg_exits |= eventual_cfg_exits_of_target;
-
-                // HACK(eddyb) if one of the edges is already known to be a loop exit
-                // (from `OpLoopMerge` specifically), treat it almost like a backedge,
-                // but with the additional requirement that the loop header is already
-                // on the stack (i.e. this `node` is reachable from that loop header).
-                let root_candidate_from_loop_merge =
-                    self.cfg.loop_merge_to_loop_header.get(&target).and_then(|&loop_header| {
-                        match self.scc_state.get(loop_header) {
-                            Some(&SccState::Pending(scc_stack_idx)) => Some(scc_stack_idx),
-                            _ => None,
-                        }
-                    });
-
-                earliest_scc_root_of_target.into_iter().chain(root_candidate_from_loop_merge)
-            })
-            .min();
-
-        // If this node has been chosen as the root of an SCC, complete that SCC.
-        if earliest_scc_root == Some(scc_stack_idx) {
-            let scc_start = scc_stack_idx.0 as usize;
-
-            // It's now possible to find all the loop exits: they're all the
-            // edges from nodes of this SCC (loop) to nodes not in the SCC.
-            let target_is_exit = |target| {
-                match self.scc_state[target] {
-                    SccState::Pending(i) => {
-                        assert!(i >= scc_stack_idx);
-                        false
-                    }
-                    SccState::Complete(eventual_cfg_exits_of_target) => {
-                        let EventualCfgExits { may_return_from_func: loop_may_reconverge } =
-                            eventual_cfg_exits;
-                        let EventualCfgExits { may_return_from_func: target_may_reconverge } =
-                            eventual_cfg_exits_of_target;
-
-                        // HACK(eddyb) see comment on `EventualCfgExits` for why
-                        // edges leaving the SCC aren't treated as loop exits
-                        // when they're "more divergent" than the loop itself,
-                        // i.e. if any edges leaving the SCC can reconverge,
-                        // (and therefore the loop as a whole can reconverge)
-                        // only those edges are kept as loop exits.
-                        target_may_reconverge == loop_may_reconverge
-                    }
-                }
-            };
-            self.loop_header_to_exit_targets.insert(
-                node,
-                self.scc_stack[scc_start..]
-                    .iter()
-                    .flat_map(|&scc_node| {
-                        self.cfg.control_inst_on_exit_from[scc_node].targets.iter().copied()
-                    })
-                    .filter(|&target| target_is_exit(target))
-                    .collect(),
-            );
-
-            // Find nested loops by marking *only* the loop header as complete,
-            // clearing loop body nodes' state, and recursing on them: all the
-            // nodes outside the loop (otherwise reachable from within), and the
-            // loop header itself, are already marked as complete, meaning that
-            // all exits and backedges will be ignored, and the recursion will
-            // only find more SCCs within the loop body (i.e. nested loops).
-            self.scc_state[node] = SccState::Complete(eventual_cfg_exits);
-            let loop_body_range = scc_start + 1..self.scc_stack.len();
-            for &scc_node in &self.scc_stack[loop_body_range.clone()] {
-                self.scc_state.remove(scc_node);
-            }
-            for i in loop_body_range.clone() {
-                self.find_earliest_scc_root_of(self.scc_stack[i]);
-            }
-            assert_eq!(self.scc_stack.len(), loop_body_range.end);
-
-            // Remove the entire SCC from the accumulation stack all at once.
-            self.scc_stack.truncate(scc_start);
-
-            return (None, eventual_cfg_exits);
-        }
-
-        // Not actually in an SCC at all, just some node outside any CFG cycles.
-        if earliest_scc_root.is_none() {
-            assert!(self.scc_stack.pop() == Some(node));
-            self.scc_state[node] = SccState::Complete(eventual_cfg_exits);
-        }
-
-        (earliest_scc_root, eventual_cfg_exits)
-    }
-}
 
 #[allow(rustdoc::private_intra_doc_links)]
 /// Control-flow "structurizer", which attempts to convert as much of the CFG
@@ -464,6 +54,8 @@ pub struct Structurizer<'a> {
     /// Scrutinee value for [`SelectionKind::BoolCond`], for the "else" case.
     const_false: Const,
 
+    func_ret_types: &'a [Type],
+
     func_def_body: &'a mut FuncDefBody,
 
     // FIXME(eddyb) this feels a bit inefficient (are many-exit loops rare?).
@@ -480,80 +72,33 @@ pub struct Structurizer<'a> {
     // FIXME(eddyb) use `EntityOrientedDenseMap` (which lacks iteration by design).
     structurize_region_state: FxIndexMap<Region, StructurizeRegionState>,
 
-    /// Accumulated rewrites (caused by e.g. `target_inputs`s, but not only),
-    /// i.e.: `Value::RegionInput { region, input_idx }` must be
-    /// rewritten based on `region_input_rewrites[region]`, as either
-    /// the original `region` wasn't reused, or its inputs were renumbered.
-    region_input_rewrites: EntityOrientedDenseMap<Region, RegionInputRewrites>,
+    // FIXME(eddyb) perhaps come up with a centralized abstraction for this
+    // (in theory `VarDecl`s could indicate aliases, but that's a tradeoff).
+    var_replacements: EntityOrientedDenseMap<Var, Value>,
 }
 
-/// How all `Value::RegionInput { region, input_idx }` for a `region`
-/// must be rewritten (see also `region_input_rewrites` docs).
-enum RegionInputRewrites {
-    /// Complete replacement with another value (which can take any form), as
-    /// `region` wasn't kept in its original form in the final structured IR.
-    ///
-    /// **Note**: such replacement can be chained, i.e. a replacement value can
-    /// be `Value::RegionInput { region: other_region, .. }`, and then
-    /// `other_region` itself may have its inputs written.
-    ReplaceWith(SmallVec<[Value; 2]>),
+// FIXME(eddyb) maybe this should be provided by `transform`.
+struct VarReplacer<'a>(&'a EntityOrientedDenseMap<Var, Value>);
+impl Transformer for VarReplacer<'_> {
+    fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
+        let mut new_v = *v;
 
-    /// The value may remain an input of the same `region`, only changing its
-    /// `input_idx` (e.g. if indices need compaction after removing some inputs),
-    /// or get replaced anyway, depending on the `Result` for `input_idx`.
-    ///
-    /// **Note**: renumbering can only be the last rewrite step of a value,
-    /// as `region` must've been chosen to be kept in the final structured IR,
-    /// but the `Err` cases are transitive just like `ReplaceWith`.
-    //
-    // FIXME(eddyb) this is a bit silly, maybe try to rely more on hermeticity
-    // to get rid of this?
-    RenumberOrReplaceWith(SmallVec<[Result<u32, Value>; 2]>),
-}
-
-impl RegionInputRewrites {
-    // HACK(eddyb) this is here because it depends on a field of `Structurizer`
-    // and borrowing issues ensue if it's made a method of `Structurizer`.
-    fn rewrite_all(
-        rewrites: &EntityOrientedDenseMap<Region, Self>,
-    ) -> impl crate::transform::Transformer + '_ {
-        // FIXME(eddyb) maybe this should be provided by `transform`.
-        use crate::transform::*;
-        struct ReplaceValueWith<F>(F);
-        impl<F: Fn(Value) -> Option<Value>> Transformer for ReplaceValueWith<F> {
-            fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
-                self.0(*v).map_or(Transformed::Unchanged, Transformed::Changed)
-            }
+        // NOTE(eddyb) this needs to be able to apply multiple replacements,
+        // due to the input potentially having redundantly chained `OpPhi`s.
+        //
+        // FIXME(eddyb) union-find-style "path compression" could record the
+        // final value inside `self.0` while replacements are being made,
+        // (e.g. using the type `EntityOrientedDenseMap<Var, Cell<Value>>`?)
+        // to avoid going through a chain more than once (and some of these
+        // replacements could also be applied early).
+        while let Value::Var(var) = new_v {
+            new_v = match self.0.get(var) {
+                Some(&v) => v,
+                None => break,
+            };
         }
 
-        ReplaceValueWith(move |v| {
-            let mut new_v = v;
-            while let Value::RegionInput { region, input_idx } = new_v {
-                match rewrites.get(region) {
-                    // NOTE(eddyb) this needs to be able to apply multiple replacements,
-                    // due to the input potentially having redundantly chained `OpPhi`s.
-                    //
-                    // FIXME(eddyb) union-find-style "path compression" could record the
-                    // final value inside `rewrites` while replacements are being made,
-                    // to avoid going through a chain more than once (and some of these
-                    // replacements could also be applied early).
-                    Some(RegionInputRewrites::ReplaceWith(replacements)) => {
-                        new_v = replacements[input_idx as usize];
-                    }
-                    Some(RegionInputRewrites::RenumberOrReplaceWith(
-                        renumbering_and_replacements,
-                    )) => match renumbering_and_replacements[input_idx as usize] {
-                        Ok(new_idx) => {
-                            new_v = Value::RegionInput { region, input_idx: new_idx };
-                            break;
-                        }
-                        Err(replacement) => new_v = replacement,
-                    },
-                    None => break,
-                }
-            }
-            (v != new_v).then_some(new_v)
-        })
+        (*v != new_v).then_some(new_v).map_or(Transformed::Unchanged, Transformed::Changed)
     }
 }
 
@@ -599,18 +144,26 @@ enum StructurizeRegionState {
 /// **Note**: `target` has a generic type `T` to reduce redundancy when it's
 /// already implied (e.g. by the key in [`DeferredEdgeBundleSet`]'s map).
 struct IncomingEdgeBundle<T> {
+    /// Attributes from the original `thunk`s (likely debuginfo), kept when
+    /// merging only when exactly identical, which can naturally be the case
+    /// for debuginfo (e.g. for branches from inside `if`-`else`/`switch` to
+    /// a common merge point, just after the whole control-flow construct).
+    //
+    // FIXME(eddyb) semantically filter these, maybe focus on debuginfo?
+    attrs: AttrSet,
+
     target: T,
     accumulated_count: IncomingEdgeCount,
 
-    /// The [`Value`]s that `Value::RegionInput { region, .. }` will get
+    /// The [`Value`]s that `VarKind::RegionInput { region, .. }` will get
     /// on entry into `region`, through this "edge bundle".
     target_inputs: SmallVec<[Value; 2]>,
 }
 
 impl<T> IncomingEdgeBundle<T> {
     fn with_target<U>(self, target: U) -> IncomingEdgeBundle<U> {
-        let IncomingEdgeBundle { target: _, accumulated_count, target_inputs } = self;
-        IncomingEdgeBundle { target, accumulated_count, target_inputs }
+        let IncomingEdgeBundle { attrs, target: _, accumulated_count, target_inputs } = self;
+        IncomingEdgeBundle { attrs, target, accumulated_count, target_inputs }
     }
 }
 
@@ -669,7 +222,7 @@ impl<T> DeferredEdgeBundle<T> {
 
 /// A recipe for computing a control-flow-sensitive (boolean) condition [`Value`],
 /// potentially requiring merging through an arbitrary number of `Select`s
-/// (via per-case outputs and [`Value::NodeOutput`], for each `Select`).
+/// (via per-case outputs and [`VarKind::NodeOutput`], for each `Select`).
 ///
 /// This should largely be equivalent to eagerly generating all region outputs
 /// that might be needed, and then removing the unused ones, but this way we
@@ -684,28 +237,29 @@ enum LazyCond {
     False,
     True,
 
-    Merge(Rc<LazyCondMerge>),
+    Dyn(Rc<LazyCondDyn>),
 }
 
-enum LazyCondMerge {
-    Select {
-        node: Node,
-        // FIXME(eddyb) the lowest level of `LazyCond` ends up containing only
-        // `LazyCond::{Undef,False,True}`, and that could more efficiently be
-        // expressed using e.g. bitsets, but the `Rc` in `LazyCond::Merge`
-        // means that this is more compact than it would otherwise be.
-        per_case_conds: SmallVec<[LazyCond; 4]>,
-    },
+struct LazyCondDyn {
+    node: Node,
+
+    // FIXME(eddyb) the lowest level of `LazyCond` ends up containing only
+    // `LazyCond::{Undef,False,True}`, and that could more efficiently be
+    // expressed using e.g. bitsets, but the `Rc` in `LazyCond::Dyn`
+    // means that this is more compact than it would otherwise be.
+    per_child_region_conds: SmallVec<[LazyCond; 4]>,
 }
 
 /// A target for one of the edge bundles in a [`DeferredEdgeBundleSet`], mostly
 /// separate from [`Region`] to allow expressing returns as well.
+//
+// FIXME(eddyb) consider reusing `ControlTarget` for this.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 enum DeferredTarget {
     Region(Region),
 
     /// Structured "return" out of the function (with `target_inputs` used for
-    /// the function body `output`s, i.e. inputs of [`ControlInstKind::Return`]).
+    /// the function body `output`s).
     Return,
 }
 
@@ -716,7 +270,7 @@ enum DeferredTarget {
 /// that exactly one [`DeferredEdgeBundle`] condition must be `true` at any
 /// given time (the only non-trivial case, [`DeferredEdgeBundleSet::Choice`],
 /// satisfies it because it's only used for merging `Select` cases, and so
-/// all the conditions will end up using disjoint [`LazyCond::Merge`]s).
+/// all the conditions will end up using disjoint [`LazyCond::Dyn`]s).
 enum DeferredEdgeBundleSet {
     Unreachable,
 
@@ -838,6 +392,7 @@ impl DeferredEdgeBundleSet {
         search_target: DeferredTarget,
     ) -> Option<DeferredEdgeBundle<()>> {
         let steal_edge_bundle = |edge_bundle: &mut IncomingEdgeBundle<()>| IncomingEdgeBundle {
+            attrs: edge_bundle.attrs,
             target: (),
             accumulated_count: edge_bundle.accumulated_count,
             target_inputs: mem::take(&mut edge_bundle.target_inputs),
@@ -929,6 +484,7 @@ impl DeferredEdgeBundleSet {
                         DeferredEdgeBundle {
                             condition: LazyCond::False,
                             edge_bundle: IncomingEdgeBundle {
+                                attrs: Default::default(),
                                 target: Default::default(),
                                 accumulated_count: Default::default(),
                                 target_inputs: Default::default(),
@@ -972,12 +528,12 @@ struct ClaimedRegion {
     // perspective of being "inside" `structured_body` (wrt hermeticity).
     structured_body: Region,
 
-    /// The [`Value`]s that `Value::RegionInput { region: structured_body, .. }`
+    /// The [`Value`]s that `VarKind::RegionInput { region: structured_body, .. }`
     /// will get on entry into `structured_body`, when this region ends up
     /// merged into a larger region, or as a child of a new [`Node`].
     //
-    // FIXME(eddyb) don't replace `Value::RegionInput { region: structured_body, .. }`
-    // with `region_inputs` when `structured_body` ends up a `Node` child,
+    // FIXME(eddyb) don't replace `VarKind::RegionInput { region: structured_body, .. }`
+    // with `structured_body_inputs` when `structured_body` ends up a `Node` child,
     // but instead make all `Region`s entirely hermetic wrt inputs.
     structured_body_inputs: SmallVec<[Value; 2]>,
 
@@ -993,44 +549,24 @@ struct ClaimedRegion {
 }
 
 impl<'a> Structurizer<'a> {
-    pub fn new(cx: &'a Context, func_def_body: &'a mut FuncDefBody) -> Self {
-        // FIXME(eddyb) SPIR-T should have native booleans itself.
-        let wk = &spv::spec::Spec::get().well_known;
-        let type_bool = cx.intern(TypeKind::SpvInst {
-            spv_inst: wk.OpTypeBool.into(),
-            type_and_const_inputs: [].into_iter().collect(),
-        });
-        let const_true = cx.intern(ConstDef {
-            attrs: AttrSet::default(),
-            ty: type_bool,
-            kind: ConstKind::SpvInst {
-                spv_inst_and_const_inputs: Rc::new((
-                    wk.OpConstantTrue.into(),
-                    [].into_iter().collect(),
-                )),
-            },
-        });
-        let const_false = cx.intern(ConstDef {
-            attrs: AttrSet::default(),
-            ty: type_bool,
-            kind: ConstKind::SpvInst {
-                spv_inst_and_const_inputs: Rc::new((
-                    wk.OpConstantFalse.into(),
-                    [].into_iter().collect(),
-                )),
-            },
-        });
+    pub fn new(cx: &'a Context, func_decl: &'a mut crate::FuncDecl) -> Self {
+        // TODO(eddyb) find a way to change this so it doesn't need to panic.
+        let crate::DeclDef::Present(func_def_body) = &mut func_decl.def else {
+            unreachable!();
+        };
+
+        let type_bool = cx.intern(scalar::Type::Bool);
+        let const_true = cx.intern(scalar::Const::TRUE);
+        let const_false = cx.intern(scalar::Const::FALSE);
 
         let (loop_header_to_exit_targets, incoming_edge_counts_including_loop_exits) =
             func_def_body
                 .unstructured_cfg
                 .as_ref()
                 .map(|cfg| {
-                    let loop_header_to_exit_targets = {
-                        let mut loop_finder = LoopFinder::new(cfg);
-                        loop_finder.find_earliest_scc_root_of(func_def_body.body);
-                        loop_finder.loop_header_to_exit_targets
-                    };
+                    let loop_header_to_exit_targets =
+                        LoopFinder::new(cx, func_def_body.at(()), cfg)
+                            .find_all_loops_starting_at(func_def_body.body);
 
                     let mut state = TraversalState {
                         incoming_edge_counts: EntityOrientedDenseMap::new(),
@@ -1064,13 +600,14 @@ impl<'a> Structurizer<'a> {
             const_true,
             const_false,
 
+            func_ret_types: &func_decl.ret_types,
             func_def_body,
 
             loop_header_to_exit_targets,
             incoming_edge_counts_including_loop_exits,
 
             structurize_region_state: FxIndexMap::default(),
-            region_input_rewrites: EntityOrientedDenseMap::new(),
+            var_replacements: EntityOrientedDenseMap::new(),
         }
     }
 
@@ -1086,6 +623,7 @@ impl<'a> Structurizer<'a> {
             let func_entry_pseudo_edge = {
                 let target = self.func_def_body.body;
                 move || IncomingEdgeBundle {
+                    attrs: Default::default(),
                     target,
                     accumulated_count: IncomingEdgeCount::ONE,
                     target_inputs: [].into_iter().collect(),
@@ -1110,30 +648,16 @@ impl<'a> Structurizer<'a> {
         };
 
         match func_body_deferred_edges {
-            // FIXME(eddyb) also support structured return when the whole body
-            // is divergent, by generating undef constants (needs access to the
-            // whole `FuncDecl`, not just `FuncDefBody`, to get the right types).
+            // FIXME(eddyb) is there a way to do this without returning `undef`s?
             DeferredEdgeBundleSet::Unreachable => {
-                // HACK(eddyb) replace the CFG with one that only contains an
-                // `Unreachable` terminator for the body, comparable to what
-                // `rebuild_cfg_from_unclaimed_region_deferred_edges` would do
-                // in the general case (but special-cased because this is very
-                // close to being structurizable, just needs a bit of plumbing).
-                let mut control_inst_on_exit_from = EntityOrientedDenseMap::new();
-                control_inst_on_exit_from.insert(
-                    self.func_def_body.body,
-                    ControlInst {
-                        attrs: AttrSet::default(),
-                        kind: ControlInstKind::Unreachable,
-                        inputs: [].into_iter().collect(),
-                        targets: [].into_iter().collect(),
-                        target_inputs: FxIndexMap::default(),
-                    },
-                );
-                self.func_def_body.unstructured_cfg = Some(ControlFlowGraph {
-                    control_inst_on_exit_from,
-                    loop_merge_to_loop_header: Default::default(),
-                });
+                let undef_outputs = self
+                    .func_ret_types
+                    .iter()
+                    .map(|&ty| Value::Const(self.const_undef(ty)))
+                    .collect();
+                let body_def = self.func_def_body.at_mut_body().def();
+                body_def.outputs = undef_outputs;
+                self.func_def_body.unstructured_cfg = None;
             }
 
             // Structured return, the function is fully structurized.
@@ -1165,15 +689,13 @@ impl<'a> Structurizer<'a> {
             }
         }
 
-        // The last step of structurization is applying rewrites accumulated
-        // while structurizing (i.e. `region_input_rewrites`).
+        // The last step of structurization is applying replacements accumulated
+        // while structurizing (i.e. `var_replacements`).
         //
         // FIXME(eddyb) obsolete this by fully taking advantage of hermeticity,
-        // and only replacing `Value::RegionInput { region, .. }` within
+        // and only replacing `VarKind::RegionInput { region, .. }` within
         // `region`'s children, shallowly, whenever `region` gets claimed.
-        self.func_def_body.inner_in_place_transform_with(&mut RegionInputRewrites::rewrite_all(
-            &self.region_input_rewrites,
-        ));
+        self.func_def_body.inner_in_place_transform_with(&mut VarReplacer(&self.var_replacements));
     }
 
     fn try_claim_edge_bundle(
@@ -1248,6 +770,10 @@ impl<'a> Structurizer<'a> {
             // the loop body itself was originally.
             // NOTE(eddyb) both input declarations and the child `Loop` node are
             // added later down below, after the `Loop` node is created.
+            //
+            // TODO(eddyb) does the above comment even make sense? output-side
+            // hermetic loops are now implemented, but the wrapper is for the
+            // input side, instead.
             let wrapper_region = self.func_def_body.regions.define(self.cx, RegionDef::default());
 
             // Any loop body region inputs, which must receive values from both
@@ -1258,8 +784,11 @@ impl<'a> Structurizer<'a> {
             // FIXME(eddyb) `Loop` `Node`s should be changed to be hermetic
             // and have the loop state be output from the whole node itself,
             // for any outside uses of values defined within the loop body.
-            let body_def = self.func_def_body.at_mut(body).def();
-            let original_input_decls = mem::take(&mut body_def.inputs);
+            //
+            // TODO(eddyb) update above comment (and other comments elsewhere!)
+            // for the actual implementation of hermetic loops.
+            let body_def = &mut self.func_def_body.regions[body];
+            let original_body_input_vars = mem::take(&mut body_def.inputs);
             assert!(body_def.outputs.is_empty());
 
             // HACK(eddyb) some dataflow through the loop body is redundant,
@@ -1269,42 +798,54 @@ impl<'a> Structurizer<'a> {
             // feasible to move `body`'s children into a new region without
             // wasting it completely (i.e. can't swap with `wrapper_region`).
             let mut initial_inputs = SmallVec::<[_; 2]>::new();
-            let body_input_rewrites = RegionInputRewrites::RenumberOrReplaceWith(
-                backedge
-                    .target_inputs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(original_idx, mut backedge_value)| {
-                        RegionInputRewrites::rewrite_all(&self.region_input_rewrites)
-                            .transform_value_use(&backedge_value)
-                            .apply_to(&mut backedge_value);
 
-                        let original_idx = u32::try_from(original_idx).unwrap();
-                        if backedge_value
-                            == (Value::RegionInput { region: body, input_idx: original_idx })
-                        {
-                            // FIXME(eddyb) does this have to be general purpose,
-                            // or could this be handled as `None` with a single
-                            // `wrapper_region` per `RegionInputRewrites`?
-                            Err(Value::RegionInput {
-                                region: wrapper_region,
-                                input_idx: original_idx,
-                            })
-                        } else {
-                            let renumbered_idx = u32::try_from(body_def.inputs.len()).unwrap();
-                            initial_inputs.push(Value::RegionInput {
-                                region: wrapper_region,
-                                input_idx: original_idx,
-                            });
-                            body_def.inputs.push(original_input_decls[original_idx as usize]);
-                            body_def.outputs.push(backedge_value);
-                            Ok(renumbered_idx)
-                        }
-                    })
-                    .collect(),
-            );
-            self.region_input_rewrites.insert(body, body_input_rewrites);
+            // FIXME(eddyb) optimize this (also, maybe it's worth introducing
+            // a high-level `retain` for `body_def.inputs`, also updating decls).
+            for (original_body_input_var, mut backedge_value) in
+                original_body_input_vars.into_iter().zip_eq(backedge.target_inputs)
+            {
+                VarReplacer(&self.var_replacements)
+                    .transform_value_use(&backedge_value)
+                    .apply_to(&mut backedge_value);
 
+                // FIXME(eddyb) this fully duplicates attributes, could be messy?
+                let input_var_decl = self.func_def_body.vars[original_body_input_var].clone();
+
+                let wrapper_region_input_vars =
+                    &mut self.func_def_body.regions[wrapper_region].inputs;
+                let wrapper_region_input_decl = VarDecl {
+                    def_parent: Either::Left(wrapper_region),
+                    def_idx: wrapper_region_input_vars.len().try_into().unwrap(),
+                    ..input_var_decl.clone()
+                };
+
+                if backedge_value == Value::Var(original_body_input_var) {
+                    // Move this redundant input to `wrapper_region`, instead of
+                    // allocating a new `Var`, to avoid wasting the now-unused
+                    // `original_body_input_var` (which would've also needed a
+                    // `var_replacements` entry, mapping it to the new `Var`).
+                    self.func_def_body.vars[original_body_input_var] = wrapper_region_input_decl;
+                    wrapper_region_input_vars.push(original_body_input_var);
+                } else {
+                    let wrapper_region_input_var =
+                        self.func_def_body.vars.define(self.cx, wrapper_region_input_decl);
+                    wrapper_region_input_vars.push(wrapper_region_input_var);
+
+                    initial_inputs.push(Value::Var(wrapper_region_input_var));
+
+                    let body_def = &mut self.func_def_body.regions[body];
+                    self.func_def_body.vars[original_body_input_var] = VarDecl {
+                        def_parent: Either::Left(body),
+                        def_idx: body_def.inputs.len().try_into().unwrap(),
+                        ..input_var_decl
+                    };
+                    body_def.inputs.push(original_body_input_var);
+
+                    body_def.outputs.push(backedge_value);
+                }
+            }
+
+            let body_def = &mut self.func_def_body.regions[body];
             assert_eq!(initial_inputs.len(), body_def.inputs.len());
             assert_eq!(body_def.outputs.len(), body_def.inputs.len());
 
@@ -1312,39 +853,145 @@ impl<'a> Structurizer<'a> {
             let loop_node = self.func_def_body.nodes.define(
                 self.cx,
                 NodeDef {
-                    kind: NodeKind::Loop { initial_inputs, body, repeat_condition },
+                    // FIXME(eddyb) could it be possible to synthesize attrs
+                    // from thunks' attrs and/or `OpLoopMerge`'s?
+                    attrs: AttrSet::default(),
+                    kind: NodeKind::Loop {
+                        // TODO(eddyb) make this a regular body output (first one?).
+                        repeat_condition,
+                    },
+                    inputs: initial_inputs,
+                    child_regions: [body].into_iter().collect(),
                     outputs: [].into_iter().collect(),
                 }
                 .into(),
             );
 
-            let wrapper_region_def = &mut self.func_def_body.regions[wrapper_region];
-            wrapper_region_def.inputs = original_input_decls;
-            wrapper_region_def.children.insert_last(loop_node, &mut self.func_def_body.nodes);
+            // HACK(eddyb) create matching `loop_node` output `Var`s, for all the
+            // "loop state" (body inputs->outputs etc.).
+            // FIXME(eddyb) could these be decoupled somehow?
+            self.func_def_body.nodes[loop_node].outputs = self.func_def_body.regions[body]
+                .inputs
+                .iter()
+                .map(|&input_var| {
+                    // FIXME(eddyb) this fully duplicates attributes, could be messy?
+                    let input_var_decl = self.func_def_body.vars[input_var].clone();
+                    self.func_def_body.vars.define(
+                        self.cx,
+                        VarDecl { def_parent: Either::Right(loop_node), ..input_var_decl },
+                    )
+                })
+                .collect();
 
-            // HACK(eddyb) we've treated loop exits as extra "false edges", so
-            // here they have to be added to the loop (potentially unlocking
-            // structurization to the outside of the loop, in the caller).
-            if let Some(exit_targets) = self.loop_header_to_exit_targets.get(&target) {
-                for &exit_target in exit_targets {
-                    // FIXME(eddyb) what if this is `None`, is that impossible?
-                    if let Some(exit_edge_bundle) = deferred_edges
-                        .get_edge_bundle_mut_by_target(DeferredTarget::Region(exit_target))
-                    {
-                        exit_edge_bundle.accumulated_count += IncomingEdgeCount::ONE;
+            // TODO(eddyb) WIP hermetic loops (output-side).
+            match &mut deferred_edges {
+                DeferredEdgeBundleSet::Unreachable | DeferredEdgeBundleSet::Always { .. } => {}
+                DeferredEdgeBundleSet::Choice { target_to_deferred } => {
+                    for deferred in target_to_deferred.values_mut() {
+                        match deferred.condition {
+                            LazyCond::Undef | LazyCond::False | LazyCond::True => {}
+
+                            LazyCond::Dyn(_) => {
+                                deferred.condition = LazyCond::Dyn(Rc::new(LazyCondDyn {
+                                    node: loop_node,
+                                    per_child_region_conds: [deferred.condition.clone()]
+                                        .into_iter()
+                                        .collect(),
+                                }));
+                            }
+                        }
                     }
                 }
             }
+            let all_deferred_edge_inputs = deferred_edges
+                .iter_targets_with_edge_bundle_mut()
+                .flat_map(|(_, edge_bundle)| &mut edge_bundle.target_inputs);
+            for v in all_deferred_edge_inputs {
+                VarReplacer(&self.var_replacements).transform_value_use(v).apply_to(v);
+
+                let var = match v {
+                    Value::Const(_) => continue,
+                    Value::Var(var) => var,
+                };
+
+                // FIXME(eddyb) this fully duplicates attributes, could be messy?
+                let var_decl = self.func_def_body.vars[*var].clone();
+
+                if var_decl.def_parent == Either::Left(wrapper_region) {
+                    continue;
+                }
+
+                // FIXME(eddyb) reuse loop outputs for repeats of the same `var`,
+                // instead of introducing new ones for every single occurence.
+
+                let undef_of_var_ty = self.const_undef(var_decl.ty);
+
+                let body_def = &mut self.func_def_body.regions[body];
+
+                let next_loop_var_idx = body_def.inputs.len();
+                body_def.inputs.push(self.func_def_body.vars.define(
+                    self.cx,
+                    VarDecl {
+                        def_parent: Either::Left(body),
+                        def_idx: next_loop_var_idx.try_into().unwrap(),
+                        ..var_decl.clone()
+                    },
+                ));
+
+                assert_eq!(body_def.outputs.len(), next_loop_var_idx);
+                body_def.outputs.push(Value::Var(*var));
+
+                let loop_node_def = &mut self.func_def_body.nodes[loop_node];
+
+                assert_eq!(loop_node_def.inputs.len(), next_loop_var_idx);
+                loop_node_def.inputs.push(Value::Const(undef_of_var_ty));
+
+                assert_eq!(loop_node_def.outputs.len(), next_loop_var_idx);
+                *var = self.func_def_body.vars.define(
+                    self.cx,
+                    VarDecl {
+                        def_parent: Either::Right(loop_node),
+                        def_idx: next_loop_var_idx.try_into().unwrap(),
+                        ..var_decl.clone()
+                    },
+                );
+                loop_node_def.outputs.push(*var);
+            }
+
+            self.func_def_body.regions[wrapper_region]
+                .children
+                .insert_last(loop_node, &mut self.func_def_body.nodes);
 
             wrapper_region
         } else {
             target
         };
-        Ok(ClaimedRegion {
-            structured_body,
-            structured_body_inputs: edge_bundle.target_inputs,
-            deferred_edges,
-        })
+
+        // HACK(eddyb) we've treated loop exits as extra "false edges", so
+        // here they have to be added to the loop (potentially unlocking
+        // structurization to the outside of the loop, in the caller).
+        //
+        // NOTE(eddyb) this is applied in all cases, not just loops, because
+        // SPIR-V allows `OpLoopMerge` to exist without a reachable backedge,
+        // and without this adjustment, structurization would remain incomplete.
+        if let Some(exit_targets) = self.loop_header_to_exit_targets.get(&target) {
+            for &exit_target in exit_targets {
+                // FIXME(eddyb) what if this is `None`, is that impossible?
+                if let Some(exit_edge_bundle) = deferred_edges
+                    .get_edge_bundle_mut_by_target(DeferredTarget::Region(exit_target))
+                {
+                    exit_edge_bundle.accumulated_count += IncomingEdgeCount::ONE;
+                }
+            }
+        }
+
+        let IncomingEdgeBundle { attrs, target: _, accumulated_count: _, target_inputs } =
+            edge_bundle;
+
+        // FIXME(eddyb) this loses `attrs`.
+        let _ = attrs;
+
+        Ok(ClaimedRegion { structured_body, structured_body_inputs: target_inputs, deferred_edges })
     }
 
     /// Structurize `region` by absorbing into it the entire CFG subgraph which
@@ -1371,56 +1018,118 @@ impl<'a> Structurizer<'a> {
             }
         }
 
-        let control_inst_on_exit = self
-            .func_def_body
-            .unstructured_cfg
-            .as_mut()
-            .unwrap()
-            .control_inst_on_exit_from
-            .remove(region)
-            .expect(
-                "cfg::Structurizer::structurize_region: missing \
-                   `ControlInst` (CFG wasn't unstructured in the first place?)",
+        // FIXME(eddyb) `ControlFlowGraph::edges_from_thunk_tailed_region`
+        // overlaps a lot with this, but is only traversing, not "stealing",
+        // so there might not be an easy way to deduplicate between the two.
+        // HACK(eddyb) only not a method because of its very limited usability
+        // (e.g. it modifies the function in such a way to guarantee that being
+        // called twice with the same arguments would result in panics).
+        //
+        // FIXME(eddyb) consider keeping `thunk`s in, initially, plumbing them
+        // in the same way that the "deferred edge" conditions and target inputs
+        // are today, but instead of generating `if`-`else` on conditions, using
+        // some kind of "`thunk` `switch`" node (handling only claimed regions),
+        // which would leave behind the subset of unhandled cases, merged with
+        // new potential destinations from within the handled cases, and doing
+        // this "unfolding" of the CFG would be the main point of structurization,
+        // with actual encodings for the remaining `thunk`s being implemented
+        // as a separate step (with optimizations such as integers replacing
+        // the "one-hot" `bool` condition encoding, reusing output slots with
+        // the same type - or even the same bit width - between targets, etc.).
+        fn steal_tail_thunk_from_region(
+            this: &mut Structurizer<'_>,
+            edge_source_region: Region,
+            thunk_binding_region: Region,
+        ) -> Result<ClaimedRegion, DeferredEdgeBundleSet> {
+            let thunk =
+                mem::take(&mut this.func_def_body.at_mut(thunk_binding_region).def().outputs)
+                    .into_iter()
+                    .exactly_one()
+                    .ok()
+                    .unwrap();
+
+            let thunk_node = match thunk {
+                Value::Var(thunk) => match this.func_def_body.at(thunk).decl().kind() {
+                    VarKind::NodeOutput { node, output_idx: 0 } => node,
+                    _ => unreachable!(),
+                },
+                Value::Const(ct) => match this.cx[ct].kind {
+                    ConstKind::Undef => return Err(DeferredEdgeBundleSet::Unreachable),
+                    _ => unreachable!(),
+                },
+            };
+
+            let thunk_node_def = mem::replace(
+                this.func_def_body.at_mut(thunk_node).def(),
+                // HACK(eddyb) there isn't a good "tombstone" to use here,
+                // but really the only thing we care about is no
+                // heap allocations remain around.
+                // FIXME(eddyb) come up with a better "nop" or add first-class
+                // tombstones (maybe with generational entity refs?).
+                NodeDef {
+                    attrs: Default::default(),
+                    kind: NodeKind::Select(SelectionKind::BoolCond),
+                    inputs: Default::default(),
+                    child_regions: Default::default(),
+                    outputs: Default::default(),
+                },
             );
 
-        // Start with the concatenation of `region` and `control_inst_on_exit`,
-        // always appending `Node`s (including the children of entire
-        // `ClaimedRegion`s) to `region`'s definition itself.
-        let mut deferred_edges = {
-            let ControlInst { attrs, kind, inputs, targets, target_inputs } = control_inst_on_exit;
+            assert!(
+                Value::Var(thunk_node_def.outputs.into_iter().exactly_one().ok().unwrap()) == thunk
+            );
 
-            // FIXME(eddyb) this loses `attrs`.
-            let _ = attrs;
+            let thunk_binding_def = &mut this.func_def_body.regions[thunk_binding_region];
+            {
+                let thunk_binding_region_children = thunk_binding_def.children.iter();
+                assert!(thunk_binding_region_children.last == Some(thunk_node));
+                if edge_source_region != thunk_binding_region {
+                    assert!(
+                        thunk_binding_region_children.first == thunk_binding_region_children.last
+                    );
+                }
+            }
+            thunk_binding_def.children.remove(thunk_node, &mut this.func_def_body.nodes);
 
-            let target_regions: SmallVec<[_; 8]> = targets
-                .iter()
-                .map(|&target| {
-                    self.try_claim_edge_bundle(IncomingEdgeBundle {
+            match thunk_node_def.kind {
+                NodeKind::ThunkBind(target) => {
+                    let target = match target {
+                        ControlTarget::Region(target) => target,
+                        ControlTarget::Return => {
+                            return Err(DeferredEdgeBundleSet::Always {
+                                target: DeferredTarget::Return,
+                                edge_bundle: IncomingEdgeBundle {
+                                    attrs: thunk_node_def.attrs,
+                                    accumulated_count: IncomingEdgeCount::default(),
+                                    target: (),
+                                    target_inputs: thunk_node_def.inputs,
+                                },
+                            });
+                        }
+                    };
+                    this.try_claim_edge_bundle(IncomingEdgeBundle {
+                        attrs: thunk_node_def.attrs,
                         target,
                         accumulated_count: IncomingEdgeCount::ONE,
-                        target_inputs: target_inputs.get(&target).cloned().unwrap_or_default(),
+                        target_inputs: thunk_node_def.inputs,
                     })
                     .map_err(|edge_bundle| {
                         // HACK(eddyb) special-case "shared `unreachable`" to
                         // always inline it and avoid awkward "merges".
                         // FIXME(eddyb) should this be in a separate CFG pass?
                         // (i.e. is there a risk of other logic needing this?)
-                        let target_is_trivial_unreachable =
-                            match self.structurize_region_state.get(&edge_bundle.target) {
-                                Some(StructurizeRegionState::Ready {
-                                    region_deferred_edges: DeferredEdgeBundleSet::Unreachable,
-                                    ..
-                                }) => {
-                                    // FIXME(eddyb) DRY this "is empty region" check.
-                                    self.func_def_body
-                                        .at(edge_bundle.target)
-                                        .at_children()
-                                        .into_iter()
-                                        .next()
-                                        .is_none()
-                                }
-                                _ => false,
-                            };
+                        let target_is_trivial_unreachable = match this
+                            .structurize_region_state
+                            .get(&edge_bundle.target)
+                        {
+                            Some(StructurizeRegionState::Ready {
+                                region_deferred_edges: DeferredEdgeBundleSet::Unreachable,
+                                ..
+                            }) => {
+                                this.func_def_body.at(edge_bundle.target).def().children.is_empty()
+                            }
+                            _ => false,
+                        };
                         if target_is_trivial_unreachable {
                             DeferredEdgeBundleSet::Unreachable
                         } else {
@@ -1430,81 +1139,39 @@ impl<'a> Structurizer<'a> {
                             }
                         }
                     })
-                })
-                .collect();
-
-            match kind {
-                ControlInstKind::Unreachable => {
-                    assert_eq!((inputs.len(), target_regions.len()), (0, 0));
-
-                    // FIXME(eddyb) this may result in lost optimizations over
-                    // actually encoding it in `Node`/`Region`
-                    // (e.g. a new `NodeKind`, or replacing region `outputs`),
-                    // but it's simpler to handle it like this.
-                    //
-                    // NOTE(eddyb) actually, this encoding is lossless *during*
-                    // structurization, and a divergent region can only end up as:
-                    // - the function body, where it implies the function can
-                    //   never actually return: not fully structurized currently
-                    //   (but only for a silly reason, and is entirely fixable)
-                    // - a `Select` case, where it implies that case never merges
-                    //   back into the `Select` node, and potentially that the
-                    //   case can never be taken: this is where a structured
-                    //   encoding can be introduced, by pruning unreachable
-                    //   cases, and potentially even introducing `assume`s
-                    // - a `Loop` body is not actually possible when divergent
-                    //   (as there can be no backedge to form a cyclic CFG)
-                    DeferredEdgeBundleSet::Unreachable
                 }
+                // FIXME(eddyb) try to reuse the existing node and regions,
+                // which housed the individual thunks for CFG edges, in the
+                // final structured control-flow.
+                NodeKind::Select(kind) => {
+                    assert!(edge_source_region == thunk_binding_region);
 
-                ControlInstKind::ExitInvocation(kind) => {
-                    assert_eq!(target_regions.len(), 0);
+                    let scrutinee = thunk_node_def.inputs.into_iter().exactly_one().ok().unwrap();
 
-                    let node = self.func_def_body.nodes.define(
-                        self.cx,
-                        NodeDef {
-                            kind: NodeKind::ExitInvocation { kind, inputs },
-                            outputs: [].into_iter().collect(),
-                        }
-                        .into(),
-                    );
-                    self.func_def_body.regions[region]
-                        .children
-                        .insert_last(node, &mut self.func_def_body.nodes);
+                    let cases = thunk_node_def
+                        .child_regions
+                        .into_iter()
+                        .map(|case| steal_tail_thunk_from_region(this, edge_source_region, case))
+                        .collect();
 
-                    DeferredEdgeBundleSet::Unreachable
+                    Err(this.structurize_select_into(
+                        edge_source_region,
+                        thunk_node_def.attrs,
+                        kind,
+                        Ok(scrutinee),
+                        cases,
+                    ))
                 }
-
-                ControlInstKind::Return => {
-                    assert_eq!(target_regions.len(), 0);
-
-                    DeferredEdgeBundleSet::Always {
-                        target: DeferredTarget::Return,
-                        edge_bundle: IncomingEdgeBundle {
-                            accumulated_count: IncomingEdgeCount::default(),
-                            target: (),
-                            target_inputs: inputs,
-                        },
-                    }
-                }
-
-                ControlInstKind::Branch => {
-                    assert_eq!((inputs.len(), target_regions.len()), (0, 1));
-
-                    self.append_maybe_claimed_region(
-                        region,
-                        target_regions.into_iter().next().unwrap(),
-                    )
-                }
-
-                ControlInstKind::SelectBranch(kind) => {
-                    assert_eq!(inputs.len(), 1);
-
-                    let scrutinee = inputs[0];
-
-                    self.structurize_select_into(region, kind, Ok(scrutinee), target_regions)
-                }
+                _ => unreachable!(),
             }
+        }
+
+        // Start with the concatenation of `region` and its unstructured thunk,
+        // always appending `Node`s (including the children of entire
+        // `ClaimedRegion`s) to `region`'s definition itself.
+        let mut deferred_edges = {
+            let tail_thunk = steal_tail_thunk_from_region(self, region, region);
+            self.append_maybe_claimed_region(region, tail_thunk)
         };
 
         // Try to resolve deferred edges that may have accumulated, and keep
@@ -1520,8 +1187,9 @@ impl<'a> Structurizer<'a> {
                     DeferredTarget::Return => return Err(deferred),
                 };
 
+                let edge_bundle_attrs = edge_bundle.attrs;
                 match self.try_claim_edge_bundle(edge_bundle) {
-                    Ok(claimed_region) => Ok((condition, claimed_region)),
+                    Ok(claimed_region) => Ok((edge_bundle_attrs, condition, claimed_region)),
 
                     Err(new_edge_bundle) => {
                         let new_target = DeferredTarget::Region(new_edge_bundle.target);
@@ -1532,13 +1200,14 @@ impl<'a> Structurizer<'a> {
                     }
                 }
             });
-            let Some((condition, then_region)) = claimed else {
+            let Some((branch_attrs, condition, then_region)) = claimed else {
                 deferred_edges = else_deferred_edges;
                 break;
             };
 
             deferred_edges = self.structurize_select_into(
                 region,
+                branch_attrs,
                 SelectionKind::BoolCond,
                 Err(&condition),
                 [Ok(then_region), Err(else_deferred_edges)].into_iter().collect(),
@@ -1580,6 +1249,8 @@ impl<'a> Structurizer<'a> {
     fn structurize_select_into(
         &mut self,
         parent_region: Region,
+        // FIXME(eddyb) semantically filter these, maybe focus on debuginfo?
+        attrs: AttrSet,
         kind: SelectionKind,
         scrutinee: Result<Value, &LazyCond>,
         mut cases: SmallVec<[Result<ClaimedRegion, DeferredEdgeBundleSet>; 8]>,
@@ -1606,7 +1277,7 @@ impl<'a> Structurizer<'a> {
             // "`Select` node insertion cursor" (into `parent_region`), and
             // stashing `convergent_case`'s deferred edges to return later.
             let deferred_edges =
-                self.structurize_select_into(parent_region, kind, scrutinee, cases);
+                self.structurize_select_into(parent_region, attrs, kind, scrutinee, cases);
             assert!(matches!(deferred_edges, DeferredEdgeBundleSet::Unreachable));
 
             // The sole convergent case goes in the `parent_region`, and its
@@ -1615,8 +1286,106 @@ impl<'a> Structurizer<'a> {
             return self.append_maybe_claimed_region(parent_region, convergent_case);
         }
 
+        // Extends a debug location "forward", from `initial_loc` (typically
+        // the location of the conditional branch/switch being structurized),
+        // to end at a later location in the same file, before any merge targets,
+        // but after all of the cases (i.e. returns `None` if the `Select` is
+        // made up of disjoint source ranges).
+        let extend_dbg_src_loc =
+            |this: &Self,
+             mut initial_loc: DbgSrcLoc,
+             cases: &[Result<ClaimedRegion, DeferredEdgeBundleSet>]| {
+                // HACK(eddyb) see comment on `if initial_start_line == start_line` below.
+                let mut shrink_initial_start_col = initial_loc.start_line_col.1;
+
+                let mut relevant_dbg_src_loc = |attrs: AttrSet| {
+                    attrs
+                        .dbg_src_loc(this.cx)
+                        .filter(|dbg_src_loc| {
+                            // FIXME(eddyb) walk up `inlined_callee_name_and_call_site`
+                            // in case `initial_loc` is e.g. next to some callsite.
+                            dbg_src_loc.file_path == initial_loc.file_path
+                                && dbg_src_loc.inlined_callee_name_and_call_site
+                                    == initial_loc.inlined_callee_name_and_call_site
+                        })
+                        .filter(|dbg_src_loc| {
+                            let (initial_start_line, initial_start_col) =
+                                initial_loc.start_line_col;
+                            let (start_line, start_col) = dbg_src_loc.start_line_col;
+
+                            if (initial_start_line, initial_start_col) <= (start_line, start_col) {
+                                return true;
+                            }
+
+                            // HACK(eddyb) this only exists because the debuginfo
+                            // emited by Rust-GPU for `if cond { ... } else { ... }`'s
+                            // conditional branch points to the start of `cond`,
+                            // instead of at the `if`, but the merges *do* point
+                            // at the whole `if` (or rather its start).
+                            if initial_start_line == start_line {
+                                shrink_initial_start_col = shrink_initial_start_col.min(start_col);
+                            }
+
+                            false
+                        })
+                };
+
+                let max_cases_line_col = cases
+                    .iter()
+                    .filter_map(|case| {
+                        let &ClaimedRegion { structured_body, .. } = case.as_ref().ok()?;
+                        this.func_def_body
+                            .at(structured_body)
+                            .at_children()
+                            .into_iter()
+                            .map(|func_at_child| func_at_child.def().attrs)
+                            .rev()
+                            .find_map(&mut relevant_dbg_src_loc)
+                            .map(|dbg_src_loc| dbg_src_loc.end_line_col)
+                    })
+                    .max();
+                let min_merges_line_col = cases
+                    .iter()
+                    .flat_map(|case| {
+                        let case_deferred_edges = match case {
+                            Ok(ClaimedRegion { deferred_edges, .. }) | Err(deferred_edges) => {
+                                deferred_edges
+                            }
+                        };
+                        case_deferred_edges.iter_targets_with_edge_bundle().map(|(_, e)| e.attrs)
+                    })
+                    .filter_map(&mut relevant_dbg_src_loc)
+                    .map(|dbg_src_loc| dbg_src_loc.start_line_col)
+                    .min();
+
+                // HACK(eddyb) see comment on `if initial_start_line == start_line` above.
+                initial_loc.start_line_col.1 = shrink_initial_start_col;
+
+                // HACK(eddyb) prefers merges because otherwise the end location
+                // ends up pointing into one of the cases (e.g. at the end of
+                // `expr` in `if ... { ... } else { ... expr }`).
+                // FIXME(eddyb) this doesn't pan out because the merges point
+                // at the *start* of the `if` in Rust-GPU-emitted debuginfo
+                // currently (it's likely a range being shrunk to its start
+                // point - Rust-GPU's custom debuginfo could probably fix that).
+                let end_line_col =
+                    min_merges_line_col.or(max_cases_line_col).unwrap_or(initial_loc.end_line_col);
+
+                if let Some(max_cases_line_col) = max_cases_line_col {
+                    // NOTE(eddyb) can only realistically be the case if
+                    // some of the merges are inside a larger high-level
+                    // control-flow construct that doesn't map to fully
+                    // structured control-flow (e.g. `switch` fallthrough).
+                    if max_cases_line_col > end_line_col {
+                        return None;
+                    }
+                }
+
+                Some(DbgSrcLoc { end_line_col, ..initial_loc })
+            };
+
         // Support lazily defining the `Select` node, as soon as it's necessary
-        // (i.e. to plumb per-case dataflow through `Value::NodeOutput`s),
+        // (i.e. to plumb per-case dataflow through `VarKind::NodeOutput`s),
         // but also if any of the cases actually have non-empty regions, which
         // is checked after the special-cases (which return w/o a `Select` at all).
         //
@@ -1625,6 +1394,13 @@ impl<'a> Structurizer<'a> {
         let mut non_move_kind = Some(kind);
         let mut get_or_define_select_node = |this: &mut Self, cases: &[_]| {
             *cached_select_node.get_or_insert_with(|| {
+                let mut attrs = attrs;
+                if let Some(select_dbg_src_loc) = attrs.dbg_src_loc(this.cx)
+                    && let Some(dbg_src_loc) = extend_dbg_src_loc(this, select_dbg_src_loc, cases)
+                {
+                    attrs.set_dbg_src_loc(this.cx, dbg_src_loc);
+                }
+
                 let kind = non_move_kind.take().unwrap();
                 let cases = cases
                     .iter()
@@ -1647,7 +1423,10 @@ impl<'a> Structurizer<'a> {
                 let select_node = this.func_def_body.nodes.define(
                     this.cx,
                     NodeDef {
-                        kind: NodeKind::Select { kind, scrutinee, cases },
+                        attrs,
+                        kind: NodeKind::Select(kind),
+                        inputs: [scrutinee].into_iter().collect(),
+                        child_regions: cases,
                         outputs: [].into_iter().collect(),
                     }
                     .into(),
@@ -1691,12 +1470,12 @@ impl<'a> Structurizer<'a> {
             }
         }
 
-        // FIXME(eddyb) `region_input_rewrites` mappings, generated
+        // FIXME(eddyb) `var_replacements` (`Var` -> `Value`) mappings, generated
         // for every `ClaimedRegion` that has been merged into a larger region,
         // only get applied after structurization fully completes, but here it's
         // very useful to have the fully resolved values across all `cases`'
         // incoming/outgoing edges (note, however, that within outgoing edges,
-        // i.e. `case_deferred_edges`' `target_inputs`, `Value::RegionInput`
+        // i.e. `case_deferred_edges`' `target_inputs`, `VarKind::RegionInput`
         // are not resolved using the contents of `case_structured_body_inputs`,
         // which is kept hermetic until just before `structurize_select` returns).
         for case in &mut cases {
@@ -1712,9 +1491,7 @@ impl<'a> Structurizer<'a> {
                     .flat_map(|(_, edge_bundle)| &mut edge_bundle.target_inputs),
             );
             for v in all_values {
-                RegionInputRewrites::rewrite_all(&self.region_input_rewrites)
-                    .transform_value_use(v)
-                    .apply_to(v);
+                VarReplacer(&self.var_replacements).transform_value_use(v).apply_to(v);
             }
         }
 
@@ -1773,12 +1550,14 @@ impl<'a> Structurizer<'a> {
                                     ..
                                 }) => match v {
                                     Value::Const(_) => Ok(v),
-                                    Value::RegionInput { region, input_idx }
-                                        if region == *structured_body =>
-                                    {
-                                        Ok(structured_body_inputs[input_idx as usize])
-                                    }
-                                    _ => Err(()),
+                                    Value::Var(v) => match self.func_def_body.at(v).decl().kind() {
+                                        VarKind::RegionInput { region, input_idx }
+                                            if region == *structured_body =>
+                                        {
+                                            Ok(structured_body_inputs[input_idx as usize])
+                                        }
+                                        _ => Err(()),
+                                    },
                                 },
 
                                 // `case` has no region of its own, so everything
@@ -1794,7 +1573,10 @@ impl<'a> Structurizer<'a> {
 
                     let ty = match target {
                         DeferredTarget::Region(target) => {
-                            self.func_def_body.at(target).def().inputs[target_input_idx].ty
+                            self.func_def_body
+                                .at(self.func_def_body.at(target).def().inputs[target_input_idx])
+                                .decl()
+                                .ty
                         }
                         // HACK(eddyb) in the absence of `FuncDecl`, infer the
                         // type from each returned value (and require they match).
@@ -1809,24 +1591,28 @@ impl<'a> Structurizer<'a> {
                     };
 
                     let select_node = get_or_define_select_node(self, &cases);
-                    let output_decls = &mut self.func_def_body.at_mut(select_node).def().outputs;
-                    let output_idx = output_decls.len();
-                    output_decls.push(NodeOutputDecl { attrs: AttrSet::default(), ty });
+                    let output_vars = &mut self.func_def_body.nodes[select_node].outputs;
+                    let output_idx = output_vars.len();
+                    let output_var = self.func_def_body.vars.define(
+                        self.cx,
+                        VarDecl {
+                            attrs: AttrSet::default(),
+                            ty,
+                            def_parent: Either::Right(select_node),
+                            def_idx: output_idx.try_into().unwrap(),
+                        },
+                    );
+                    output_vars.push(output_var);
                     for (case_idx, v) in per_case_target_input.enumerate() {
                         let v = v.unwrap_or_else(|| Value::Const(self.const_undef(ty)));
 
-                        let case_region = match &self.func_def_body.at(select_node).def().kind {
-                            NodeKind::Select { cases, .. } => cases[case_idx],
-                            _ => unreachable!(),
-                        };
+                        let case_region =
+                            self.func_def_body.at(select_node).def().child_regions[case_idx];
                         let outputs = &mut self.func_def_body.at_mut(case_region).def().outputs;
                         assert_eq!(outputs.len(), output_idx);
                         outputs.push(v);
                     }
-                    Value::NodeOutput {
-                        node: select_node,
-                        output_idx: output_idx.try_into().unwrap(),
-                    }
+                    Value::Var(output_var)
                 })
                 .collect();
 
@@ -1846,15 +1632,24 @@ impl<'a> Structurizer<'a> {
             {
                 LazyCond::True
             } else {
-                LazyCond::Merge(Rc::new(LazyCondMerge::Select {
+                LazyCond::Dyn(Rc::new(LazyCondDyn {
                     node: get_or_define_select_node(self, &cases),
-                    per_case_conds: per_case_conds.cloned().collect(),
+                    per_child_region_conds: per_case_conds.cloned().collect(),
                 }))
             };
 
             DeferredEdgeBundle {
                 condition,
                 edge_bundle: IncomingEdgeBundle {
+                    // FIXME(eddyb) merge debug locations when attributes differ.
+                    attrs: per_case_deferred
+                        .iter()
+                        .filter_map(|d| d.as_ref().ok())
+                        .map(|e| e.edge_bundle.attrs)
+                        .unique()
+                        .exactly_one()
+                        .ok()
+                        .unwrap_or_default(),
                     target,
                     accumulated_count: total_edge_count,
                     target_inputs,
@@ -1863,22 +1658,20 @@ impl<'a> Structurizer<'a> {
         });
         let deferred_edges = deferred_edges.collect();
 
-        // Only as the very last step, can per-case `region_inputs` be added to
-        // `region_input_rewrites`.
+        // Only as the very last step, can per-case `structured_body_inputs` be added to
+        // `var_replacements`.
         //
-        // FIXME(eddyb) don't replace `Value::RegionInput { region, .. }`
-        // with `region_inputs` when the `region` ends up a `Node` child,
+        // FIXME(eddyb) don't replace `VarKind::RegionInput { region, .. }`
+        // with `structured_body_inputs` when the `region` ends up a `Node` child,
         // but instead make all `Region`s entirely hermetic wrt inputs.
         #[allow(clippy::manual_flatten)]
         for case in cases {
-            if let Ok(ClaimedRegion { structured_body, structured_body_inputs, .. }) = case
-                && !structured_body_inputs.is_empty()
-            {
-                self.region_input_rewrites.insert(
-                    structured_body,
-                    RegionInputRewrites::ReplaceWith(structured_body_inputs),
-                );
-                self.func_def_body.at_mut(structured_body).def().inputs.clear();
+            if let Ok(ClaimedRegion { structured_body, structured_body_inputs, .. }) = case {
+                let input_vars =
+                    mem::take(&mut self.func_def_body.at_mut(structured_body).def().inputs);
+                for (input_var, v) in input_vars.into_iter().zip_eq(structured_body_inputs) {
+                    self.var_replacements.insert(input_var, v);
+                }
             }
         }
 
@@ -1894,58 +1687,83 @@ impl<'a> Structurizer<'a> {
             LazyCond::False => Value::Const(self.const_false),
             LazyCond::True => Value::Const(self.const_true),
 
-            // `LazyCond::Merge` was only created in the first place if a merge
+            // `LazyCond::Dyn` was only created in the first place if a merge
             // was actually necessary, so there shouldn't be simplifications to
             // do here (i.e. the value provided is if `materialize_lazy_cond`
             // never gets called because the target has become unconditional).
             //
             // FIXME(eddyb) there is still an `if cond { true } else { false }`
-            // special-case (repalcing with just `cond`), that cannot be expressed
+            // special-case (replacing with just `cond`), that cannot be expressed
             // currently in `LazyCond` itself (but maybe it should be).
-            LazyCond::Merge(merge) => {
-                let LazyCondMerge::Select { node, ref per_case_conds } = **merge;
+            LazyCond::Dyn(merge) => {
+                let LazyCondDyn { node, ref per_child_region_conds } = **merge;
 
                 // HACK(eddyb) this won't actually allocate most of the time,
                 // and avoids complications later below, when mutating the cases.
-                let per_case_conds: SmallVec<[_; 8]> = per_case_conds
+                let per_child_region_conds: SmallVec<[_; 8]> = per_child_region_conds
                     .into_iter()
                     .map(|cond| self.materialize_lazy_cond(cond))
                     .collect();
 
-                let NodeDef { kind, outputs: output_decls } = &mut *self.func_def_body.nodes[node];
-                let cases = match kind {
-                    NodeKind::Select { kind, scrutinee, cases } => {
-                        assert_eq!(cases.len(), per_case_conds.len());
+                let NodeDef { attrs: _, kind, inputs, child_regions, outputs: output_vars } =
+                    &mut *self.func_def_body.nodes[node];
 
-                        if let SelectionKind::BoolCond = kind {
-                            let [val_false, val_true] =
-                                [self.const_false, self.const_true].map(Value::Const);
-                            if per_case_conds[..] == [val_true, val_false] {
-                                return *scrutinee;
-                            } else if per_case_conds[..] == [val_false, val_true] {
-                                // FIXME(eddyb) this could also be special-cased,
-                                // at least when called from the topmost level,
-                                // where which side is `false`/`true` doesn't
-                                // matter (or we could even generate `!cond`?).
-                                let _not_cond = *scrutinee;
-                            }
-                        }
+                assert_eq!(child_regions.len(), per_child_region_conds.len());
 
-                        cases
+                if let NodeKind::Select(SelectionKind::BoolCond) = kind {
+                    let cond = inputs[0];
+
+                    let [val_false, val_true] =
+                        [self.const_false, self.const_true].map(Value::Const);
+                    if per_child_region_conds[..] == [val_true, val_false] {
+                        return cond;
+                    } else if per_child_region_conds[..] == [val_false, val_true] {
+                        // FIXME(eddyb) this could also be special-cased,
+                        // at least when called from the topmost level,
+                        // where which side is `false`/`true` doesn't
+                        // matter (or we could even generate `!cond`?).
+                        let _not_cond = cond;
                     }
-                    _ => unreachable!(),
-                };
-
-                let output_idx = u32::try_from(output_decls.len()).unwrap();
-                output_decls.push(NodeOutputDecl { attrs: AttrSet::default(), ty: self.type_bool });
-
-                for (&case, cond) in cases.iter().zip_eq(per_case_conds) {
-                    let RegionDef { outputs, .. } = &mut self.func_def_body.regions[case];
-                    outputs.push(cond);
-                    assert_eq!(outputs.len(), output_decls.len());
                 }
 
-                Value::NodeOutput { node, output_idx }
+                let output_var = self.func_def_body.vars.define(
+                    self.cx,
+                    VarDecl {
+                        attrs: AttrSet::default(),
+                        ty: self.type_bool,
+                        def_parent: Either::Right(node),
+                        def_idx: output_vars.len().try_into().unwrap(),
+                    },
+                );
+                output_vars.push(output_var);
+
+                for (&case, cond) in child_regions.iter().zip_eq(per_child_region_conds) {
+                    let RegionDef { outputs, .. } = &mut self.func_def_body.regions[case];
+                    outputs.push(cond);
+                    assert_eq!(outputs.len(), output_vars.len());
+                }
+
+                // `Loop`s outputs have to have matching loop body inputs
+                // (and also initial loop inputs).
+                if let NodeKind::Loop { .. } = kind {
+                    let body = child_regions[0];
+                    let input_vars = &mut self.func_def_body.regions[body].inputs;
+                    let input_var = self.func_def_body.vars.define(
+                        self.cx,
+                        VarDecl {
+                            attrs: AttrSet::default(),
+                            ty: self.type_bool,
+                            def_parent: Either::Left(body),
+                            def_idx: input_vars.len().try_into().unwrap(),
+                        },
+                    );
+                    input_vars.push(input_var);
+
+                    let initial_input = Value::Const(self.const_undef(self.type_bool));
+                    self.func_def_body.nodes[node].inputs.push(initial_input);
+                }
+
+                Value::Var(output_var)
             }
         }
     }
@@ -1962,14 +1780,14 @@ impl<'a> Structurizer<'a> {
     ) -> DeferredEdgeBundleSet {
         match maybe_claimed_region {
             Ok(ClaimedRegion { structured_body, structured_body_inputs, deferred_edges }) => {
-                if !structured_body_inputs.is_empty() {
-                    self.region_input_rewrites.insert(
-                        structured_body,
-                        RegionInputRewrites::ReplaceWith(structured_body_inputs),
-                    );
+                let structured_body_def = self.func_def_body.at_mut(structured_body).def();
+
+                let input_vars = mem::take(&mut structured_body_def.inputs);
+                for (input_var, v) in input_vars.into_iter().zip_eq(structured_body_inputs) {
+                    self.var_replacements.insert(input_var, v);
                 }
-                let new_children =
-                    mem::take(&mut self.func_def_body.at_mut(structured_body).def().children);
+
+                let new_children = mem::take(&mut structured_body_def.children);
                 self.func_def_body.regions[parent_region]
                     .children
                     .append(new_children, &mut self.func_def_body.nodes);
@@ -1980,8 +1798,8 @@ impl<'a> Structurizer<'a> {
     }
 
     /// When structurization is only partial, and there remain unclaimed regions,
-    /// they have to be reintegrated into the CFG, putting back [`ControlInst`]s
-    /// where `structurize_region` has taken them from.
+    /// they have to be reintegrated into the CFG, putting back `thunk`s where
+    /// `structurize_region` has taken them from.
     ///
     /// This function handles one region at a time to make it more manageable,
     /// despite it having a single call site (in a loop in `structurize_func`).
@@ -1997,131 +1815,150 @@ impl<'a> Structurizer<'a> {
              after it takes `structurize_region_state`"
         );
 
+        let cx = self.cx;
+
+        let thunk_ty = cx.intern(TypeKind::Thunk);
+        let build_thunk = |func_at_region: FuncAtMut<'_, Region>, (target, target_inputs)| {
+            let region = func_at_region.position;
+            let func = func_at_region.at(());
+
+            let target = match target {
+                DeferredTarget::Region(target) => ControlTarget::Region(target),
+                DeferredTarget::Return => ControlTarget::Return,
+            };
+
+            let thunk_node = func.nodes.define(
+                cx,
+                NodeDef {
+                    attrs: AttrSet::default(),
+                    kind: NodeKind::ThunkBind(target),
+                    inputs: target_inputs,
+                    child_regions: [].into_iter().collect(),
+                    outputs: [].into_iter().collect(),
+                }
+                .into(),
+            );
+            func.regions[region].children.insert_last(thunk_node, func.nodes);
+
+            let thunk_var = func.vars.define(
+                cx,
+                VarDecl {
+                    attrs: AttrSet::default(),
+                    ty: thunk_ty,
+
+                    def_parent: Either::Right(thunk_node),
+                    def_idx: 0,
+                },
+            );
+            func.nodes[thunk_node].outputs.push(thunk_var);
+
+            Value::Var(thunk_var)
+        };
+
         // Build a chain of conditional branches to apply deferred edges.
         let mut control_source = Some(region);
         loop {
             let taken_then;
-            (taken_then, deferred_edges) =
-                deferred_edges.split_out_matching(|deferred| match deferred.edge_bundle.target {
-                    DeferredTarget::Region(target) => {
-                        Ok((deferred.condition, (target, deferred.edge_bundle.target_inputs)))
-                    }
-                    DeferredTarget::Return => Err(deferred),
-                });
-            let Some((condition, then_target_and_inputs)) = taken_then else {
+            (taken_then, deferred_edges) = deferred_edges.split_out_matching(|deferred| {
+                Ok((
+                    deferred.condition,
+                    (deferred.edge_bundle.target, deferred.edge_bundle.target_inputs),
+                ))
+            });
+            let Some((condition, then_edge)) = taken_then else {
                 break;
             };
+
             let branch_source = control_source.take().unwrap();
-            let else_target_and_inputs = match deferred_edges {
+            let else_edge = match deferred_edges {
                 // At most one deferral left, so it can be used as the "else"
                 // case, or the branch left unconditional in its absence.
                 DeferredEdgeBundleSet::Unreachable => None,
-                DeferredEdgeBundleSet::Always {
-                    target: DeferredTarget::Region(else_target),
-                    edge_bundle,
-                } => {
+                DeferredEdgeBundleSet::Always { target: else_target, edge_bundle } => {
                     deferred_edges = DeferredEdgeBundleSet::Unreachable;
                     Some((else_target, edge_bundle.target_inputs))
                 }
 
-                // Either more branches, or a deferred return, are needed, so
-                // the "else" case must be a `Region` that itself can
-                // have a `ControlInst` attached to it later on.
-                _ => {
+                // More branches are needed, so the "else" case must be a `Region`
+                // that itself can have a `thunk` attached to it later on.
+                DeferredEdgeBundleSet::Choice { .. } => {
                     let new_empty_region =
-                        self.func_def_body.regions.define(self.cx, RegionDef::default());
+                        self.func_def_body.regions.define(cx, RegionDef::default());
                     control_source = Some(new_empty_region);
-                    Some((new_empty_region, [].into_iter().collect()))
+                    Some((DeferredTarget::Region(new_empty_region), [].into_iter().collect()))
                 }
             };
 
-            let condition = Some(condition)
-                .filter(|_| else_target_and_inputs.is_some())
-                .map(|cond| self.materialize_lazy_cond(&cond));
-            let branch_control_inst = ControlInst {
-                attrs: AttrSet::default(),
-                kind: if condition.is_some() {
-                    ControlInstKind::SelectBranch(SelectionKind::BoolCond)
-                } else {
-                    ControlInstKind::Branch
-                },
-                inputs: condition.into_iter().collect(),
-                targets: [&then_target_and_inputs]
-                    .into_iter()
-                    .chain(&else_target_and_inputs)
-                    .map(|&(target, _)| target)
-                    .collect(),
-                target_inputs: [then_target_and_inputs]
-                    .into_iter()
-                    .chain(else_target_and_inputs)
-                    .filter(|(_, inputs)| !inputs.is_empty())
-                    .collect(),
-            };
-            assert!(
-                self.func_def_body
-                    .unstructured_cfg
-                    .as_mut()
-                    .unwrap()
-                    .control_inst_on_exit_from
-                    .insert(branch_source, branch_control_inst)
-                    .is_none()
-            );
-        }
+            let thunk = if let Some(else_edge) = else_edge {
+                let condition = self.materialize_lazy_cond(&condition);
 
-        let deferred_return = match deferred_edges {
-            DeferredEdgeBundleSet::Unreachable => None,
-            DeferredEdgeBundleSet::Always { target: DeferredTarget::Return, edge_bundle } => {
-                Some(edge_bundle.target_inputs)
-            }
-            _ => unreachable!(),
-        };
+                let cases = [then_edge, else_edge]
+                    .into_iter()
+                    .map(|target_with_inputs| {
+                        let case = self.func_def_body.regions.define(cx, RegionDef::default());
+                        let thunk =
+                            build_thunk(self.func_def_body.at_mut(case), target_with_inputs);
+                        self.func_def_body.regions[case].outputs.push(thunk);
+                        case
+                    })
+                    .collect();
+
+                let select_node = self.func_def_body.nodes.define(
+                    cx,
+                    NodeDef {
+                        attrs: AttrSet::default(),
+                        kind: NodeKind::Select(SelectionKind::BoolCond),
+                        inputs: [condition].into_iter().collect(),
+                        child_regions: cases,
+                        outputs: [].into_iter().collect(),
+                    }
+                    .into(),
+                );
+                self.func_def_body.regions[branch_source]
+                    .children
+                    .insert_last(select_node, &mut self.func_def_body.nodes);
+
+                let select_thunk_var = self.func_def_body.vars.define(
+                    cx,
+                    VarDecl {
+                        attrs: AttrSet::default(),
+                        ty: thunk_ty,
+
+                        def_parent: Either::Right(select_node),
+                        def_idx: 0,
+                    },
+                );
+                self.func_def_body.nodes[select_node].outputs.push(select_thunk_var);
+
+                Value::Var(select_thunk_var)
+            } else {
+                build_thunk(self.func_def_body.at_mut(branch_source), then_edge)
+            };
+
+            self.func_def_body.regions[branch_source].outputs = [thunk].into_iter().collect();
+        }
 
         let final_source = match control_source {
             Some(region) => region,
-            None => {
-                // The loop above handled all the targets, nothing left to do.
-                assert!(deferred_return.is_none());
-                return;
-            }
+            // The loop above handled all the targets, nothing left to do.
+            None => return,
         };
 
-        // Final deferral is either a `Return` (if needed), or an `Unreachable`
-        // (only when truly divergent, i.e. no `deferred_edges`/`deferred_return`).
-        let final_control_inst = {
-            let (kind, inputs) = match deferred_return {
-                Some(return_values) => (ControlInstKind::Return, return_values),
-                None => (ControlInstKind::Unreachable, [].into_iter().collect()),
-            };
-            ControlInst {
-                attrs: AttrSet::default(),
-                kind,
-                inputs,
-                targets: [].into_iter().collect(),
-                target_inputs: FxIndexMap::default(),
-            }
-        };
-        assert!(
-            self.func_def_body
-                .unstructured_cfg
-                .as_mut()
-                .unwrap()
-                .control_inst_on_exit_from
-                .insert(final_source, final_control_inst)
-                .is_none()
-        );
+        // Final deferral is unreachable (only when truly divergent,
+        // i.e. no `deferred_edges`).
+        // FIXME(eddyb) this should probably be special-cased at the start of
+        // this function, instead of here at the end.
+        let final_thunk = Value::Const(cx.intern(ConstDef {
+            attrs: AttrSet::default(),
+            ty: thunk_ty,
+            kind: ConstKind::Undef,
+        }));
+        self.func_def_body.regions[final_source].outputs = [final_thunk].into_iter().collect();
     }
 
     /// Create an undefined constant (as a placeholder where a value needs to be
     /// present, but won't actually be used), of type `ty`.
     fn const_undef(&self, ty: Type) -> Const {
-        // FIXME(eddyb) SPIR-T should have native undef itself.
-        let wk = &spv::spec::Spec::get().well_known;
-        self.cx.intern(ConstDef {
-            attrs: AttrSet::default(),
-            ty,
-            kind: ConstKind::SpvInst {
-                spv_inst_and_const_inputs: Rc::new((wk.OpUndef.into(), [].into_iter().collect())),
-            },
-        })
+        self.cx.intern(ConstDef { attrs: AttrSet::default(), ty, kind: ConstKind::Undef })
     }
 }

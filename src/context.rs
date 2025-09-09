@@ -484,11 +484,11 @@ impl<K: EntityOrientedMapKey<V>, V> std::ops::IndexMut<K> for EntityOrientedDens
 /// [`EntityListNode<E, _>`] (to hold the "previous/next node" links).
 ///
 /// Fields are private to avoid arbitrary user interactions.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct EntityList<E: sealed::Entity>(Option<FirstLast<E, E>>);
 
 // HACK(eddyb) this only exists to give field names to the non-empty case.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 struct FirstLast<F, L> {
     first: F,
     last: L,
@@ -604,6 +604,49 @@ impl<E: sealed::Entity<Def = EntityListNode<E, D>>, D> EntityList<E> {
                 );
 
                 self.0.as_mut().unwrap().first = new_node;
+            }
+        }
+    }
+
+    /// Insert `new_node` (defined in `defs`) into `self`, after `prev`.
+    //
+    // FIXME(eddyb) unify this with the other insert methods, maybe with a new
+    // "insert position" type?
+    #[track_caller]
+    pub fn insert_after(&mut self, new_node: E, prev: E, defs: &mut EntityDefs<E>) {
+        let next = defs[prev].next.replace(new_node);
+
+        let new_node_def = &mut defs[new_node];
+        assert!(
+            new_node_def.next.is_none() && new_node_def.prev.is_none(),
+            "EntityList::insert_before: new node already linked into a (different?) list"
+        );
+
+        new_node_def.next = next;
+        new_node_def.prev = Some(prev);
+
+        match next {
+            Some(next) => {
+                let old_next_prev = defs[next].prev.replace(new_node);
+
+                // FIXME(eddyb) this situation should be impossible anyway, as it
+                // involves the `EntityListNode`s links, which should be unforgeable.
+                assert!(
+                    old_next_prev == Some(prev),
+                    "invalid EntityListNode: `node->next->prev != node`"
+                );
+            }
+            None => {
+                // FIXME(eddyb) this situation should be impossible anyway, as it
+                // involves the `EntityListNode`s links, which should be unforgeable,
+                // but it's still possible to keep around outdated `EntityList`s
+                // (should `EntityList` not implement `Copy`/`Clone` *at all*?)
+                assert!(
+                    self.0.map(|this| this.last) == Some(prev),
+                    "invalid EntityList: `node->next == None` but `node != last`"
+                );
+
+                self.0.as_mut().unwrap().last = new_node;
             }
         }
     }
@@ -736,6 +779,10 @@ impl<E: sealed::Entity<Def = EntityListNode<E, D>>, D> EntityListIter<E> {
         let Self { first, last } = self;
         let current = first?;
         let next = defs[current].next;
+
+        // HACK(eddyb) without this, `last` is ignored for forward iteration.
+        let next = next.filter(|_| Some(current) != last);
+
         match next {
             // FIXME(eddyb) this situation should be impossible anyway, as it
             // involves the `EntityListNode`s links, which should be unforgeable.
@@ -757,6 +804,10 @@ impl<E: sealed::Entity<Def = EntityListNode<E, D>>, D> EntityListIter<E> {
         let Self { first, last } = self;
         let current = last?;
         let prev = defs[current].prev;
+
+        // HACK(eddyb) without this, `first` is ignored for backwards iteration.
+        let prev = prev.filter(|_| Some(current) != first);
+
         match prev {
             // FIXME(eddyb) this situation should be impossible anyway, as it
             // involves the `EntityListNode`s links, which should be unforgeable.
@@ -957,5 +1008,5 @@ entities! {
     Func => chunk_size(0x1_0000) crate::FuncDecl,
     Region => chunk_size(0x1000) crate::RegionDef,
     Node => chunk_size(0x1000) EntityListNode<Node, crate::NodeDef>,
-    DataInst => chunk_size(0x1000) EntityListNode<DataInst, crate::DataInstDef>,
+    Var => chunk_size(0x1000) crate::VarDecl,
 }
