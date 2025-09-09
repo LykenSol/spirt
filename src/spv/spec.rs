@@ -152,6 +152,8 @@ def_well_known! {
         OpBranchConditional,
         OpSwitch,
 
+        OpSelect,
+
         OpFunctionCall,
 
         OpImageTexelPointer,

@@ -12,7 +12,7 @@ use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstKind, Context, DataInstKind, DeclDef, Diag,
     ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind, OrdAssertEq, Type,
-    TypeKind, Value, Var, VarKind,
+    TypeKind, Value, Var, VarKind, scalar,
 };
 use itertools::Either;
 use rustc_hash::FxHashMap;
@@ -30,6 +30,7 @@ use crate::mem::layout::*;
 struct AnalysisError(Diag);
 
 struct AccessMerger<'a> {
+    cx: &'a Context,
     layout_cache: &'a LayoutCache<'a>,
 }
 
@@ -134,14 +135,18 @@ impl AccessMerger<'_> {
                 #[derive(PartialEq, Eq, PartialOrd, Ord)]
                 enum TypeStrictness {
                     Any,
-                    Array,
+                    Array {
+                        // HACK(eddyb) this allows ending up with the larger stride
+                        // on the left.
+                        stride: NonZeroU32,
+                    },
                     Exact,
                 }
                 #[allow(clippy::match_same_arms)]
                 let type_strictness = match happ.kind {
                     DataHappKind::Dead | DataHappKind::Disjoint(_) => TypeStrictness::Any,
 
-                    DataHappKind::Repeated { .. } => TypeStrictness::Array,
+                    DataHappKind::Repeated { stride, .. } => TypeStrictness::Array { stride },
 
                     // FIXME(eddyb) this should be `Any`, even if in theory it
                     // could contain arrays or structs that need decomposition
@@ -268,7 +273,7 @@ impl AccessMerger<'_> {
         let kind = match a.kind {
             // `Dead`s are always ignored.
             DataHappKind::Dead => {
-                // NOTE(eddyb) this is handled near the start of `merge_mem_at`.
+                // NOTE(eddyb) this is handled near the start of `merge_data_at`.
                 assert_eq!(b_offset_in_a, 0);
 
                 // HACK(eddyb) in lieu of flags-preserving nesting of `b` into `a`.
@@ -295,11 +300,13 @@ impl AccessMerger<'_> {
                 let ty = if Some(a_type) == b_type_at_offset_0 {
                     MergeResult::ok(a_type)
                 } else {
-                    // Returns `Some(MergeResult::ok(ty))` iff `happ` is valid
-                    // for type `ty`, and `None` iff invalid w/o layout errors
-                    // (see `mem_layout_supports_happ_at_offset` for more details).
-                    let type_supporting_happ_at_offset = |ty, happ_offset, happ| {
-                        let supports_happ = match self.layout_of(ty) {
+                    let type_supporting_happ_at_offset = |a: &DataHapp, b_offset_in_a, b| {
+                        let (a_type, a_is_strict) = match a.kind {
+                            DataHappKind::StrictlyTyped(ty) => (ty, true),
+                            DataHappKind::Direct(ty) => (ty, false),
+                            _ => unreachable!(),
+                        };
+                        match self.layout_of(a_type) {
                             // FIXME(eddyb) should this be `unreachable!()`? also, is
                             // it possible to end up with `ty` being an `OpTypeStruct`
                             // decorated with `Block`, showing up as a `Buffer` handle?
@@ -312,25 +319,28 @@ impl AccessMerger<'_> {
                                     "merge_data: impossible handle type for DataHapp".into(),
                                 ])))
                             }
-                            Ok(TypeLayout::Concrete(concrete)) => {
-                                Ok(concrete.supports_happ_at_offset(happ_offset, happ))
-                            }
+                            Ok(TypeLayout::Concrete(concrete)) => Ok(
+                                concrete.type_supporting_happ_at_offset(self.cx, b_offset_in_a, b)
+                            ),
 
                             Err(e) => Err(e),
-                        };
-                        match supports_happ {
-                            Ok(false) => None,
-                            Ok(true) | Err(_) => {
-                                Some(MergeResult { merged: ty, error: supports_happ.err() })
-                            }
                         }
+                        .transpose()
+                        .and_then(|ty_or_err| {
+                            let ty = ty_or_err.as_ref().ok().copied().unwrap_or(a_type);
+
+                            if a_is_strict && ty != a_type {
+                                return None;
+                            }
+
+                            Some(MergeResult { merged: ty, error: ty_or_err.err() })
+                        })
                     };
 
-                    type_supporting_happ_at_offset(a_type, b_offset_in_a, &b)
+                    type_supporting_happ_at_offset(&a, b_offset_in_a, &b)
                         .or_else(|| {
-                            b_type_at_offset_0.and_then(|b_type_at_offset_0| {
-                                type_supporting_happ_at_offset(b_type_at_offset_0, 0, &a)
-                            })
+                            b_type_at_offset_0
+                                .and_then(|_| type_supporting_happ_at_offset(&b, 0, &a))
                         })
                         .unwrap_or_else(|| {
                             MergeResult {
@@ -366,13 +376,31 @@ impl AccessMerger<'_> {
             DataHappKind::Repeated { element: mut a_element, stride: a_stride } => {
                 let b_offset_in_a_element = b_offset_in_a % a_stride;
 
-                // Array-like dynamic offsetting needs to always merge any HAPP that
-                // fits inside the stride, with its "element" HAPP, no matter how
-                // complex it may be (notably, this is needed for nested arrays).
-                if b.max_size
+                let mut b = b;
+                let b_fits_in_a_element = b
+                    .max_size
                     .and_then(|b_max_size| b_max_size.checked_add(b_offset_in_a_element))
                     .is_some_and(|b_in_a_max_size| b_in_a_max_size <= a_stride.get())
-                {
+                    || match b.kind {
+                        // HACK(eddyb) special-case for when a whole number N
+                        // of `b_element`s fit in each `a_element` (which does
+                        // complicate lifting, needing new `/ N` and `% N` ops,
+                        // but it's better than no support at all).
+                        DataHappKind::Repeated { element: _, stride: b_stride }
+                            if b_offset_in_a_element == 0
+                                && a_stride > b_stride
+                                && a_stride.get().is_multiple_of(b_stride.get()) =>
+                        {
+                            b.max_size = Some(a_stride.get());
+                            true
+                        }
+                        _ => false,
+                    };
+
+                // Array-like dynamic offsetting needs to always merge any accesses
+                // that fit inside the stride, with its "element" HAPP, no matter
+                // how complex it may be (notably, this is needed for nested arrays).
+                if b_fits_in_a_element {
                     // FIXME(eddyb) this in-place merging dance only needed due to `Rc`.
                     ({
                         let a_element_mut = Rc::make_mut(&mut a_element);
@@ -404,10 +432,6 @@ impl AccessMerger<'_> {
                             })
                         }
                         _ => {
-                            // FIXME(eddyb) implement somehow (by adjusting stride?).
-                            // NOTE(eddyb) with `b` as an `Repeated`/`Disjoint`, it could
-                            // also be possible to superimpose its offset patterns onto `a`,
-                            // though that's easier for `Disjoint` than `Repeated`.
                             // HACK(eddyb) needed due to `a` being moved out of.
                             let a = DataHapp {
                                 max_size: a.max_size,
@@ -417,6 +441,47 @@ impl AccessMerger<'_> {
                                     stride: a_stride,
                                 },
                             };
+
+                            // FIXME(eddyb) implement somehow (by adjusting stride?).
+                            // NOTE(eddyb) with `b` as an `Repeated`/`Disjoint`, it could
+                            // also be possible to superimpose its offset patterns onto `a`,
+                            // though that's easier for `Disjoint` than `Repeated`.
+
+                            // HACK(eddyb) special-case "small element" indexing
+                            // vs a single "large element", by indexing the latter.
+                            let max_size_and_stride_for_repeating_b = b
+                                .max_size
+                                .and_then(|b_max_size| {
+                                    Some((a.max_size, NonZeroU32::new(b_max_size)?))
+                                })
+                                .filter(|&(max_size, stride)| {
+                                    match b.kind {
+                                        // HACK(eddyb) refuse nesting `Repeated`s.
+                                        DataHappKind::Repeated { .. } => false,
+
+                                        _ => {
+                                            b_offset_in_a_element == 0
+                                                && max_size.is_none_or(|size| {
+                                                    size >= stride.get()
+                                                        && size.is_multiple_of(stride.get())
+                                                })
+                                        }
+                                    }
+                                });
+                            if let Some((max_size, stride)) = max_size_and_stride_for_repeating_b {
+                                return self.merge_data(
+                                    a,
+                                    DataHapp {
+                                        max_size,
+                                        flags: b.flags.propagate_outwards(),
+                                        kind: DataHappKind::Repeated {
+                                            element: Rc::new(b),
+                                            stride,
+                                        },
+                                    },
+                                );
+                            }
+
                             MergeResult {
                                 merged: a.kind.clone(),
                                 error: Some(AnalysisError(Diag::bug([
@@ -573,16 +638,25 @@ impl AccessMerger<'_> {
 }
 
 impl MemTypeLayout {
-    /// Determine if this layout is compatible with `happ` at `happ_offset`.
+    /// Determine if this layout is compatible with `happ` at `happ_offset`,
+    /// returning `Some(compatible_type)` if so.
     ///
     /// That is, all typed leaves of `happ` must be found inside `self`, at
     /// their respective offsets, and all [`DataHappKind::Repeated`]s must
     /// find a same-stride array inside `self` (to allow dynamic indexing).
+    ///
+    /// The returned `compatible_type` can be either `self.original_type`, or
+    /// a "similarly shaped" type (e.g. `f32` -> `u32`) improving compatibility.
     //
     // FIXME(eddyb) consider using `Result` to make it unambiguous.
-    fn supports_happ_at_offset(&self, happ_offset: u32, happ: &DataHapp) -> bool {
+    fn type_supporting_happ_at_offset(
+        &self,
+        cx: &Context,
+        happ_offset: u32,
+        happ: &DataHapp,
+    ) -> Option<Type> {
         if let DataHappKind::Dead = happ.kind {
-            return true;
+            return Some(self.original_type);
         }
 
         // "Fast accept" based on type alone (expected as recursion base case).
@@ -590,7 +664,7 @@ impl MemTypeLayout {
             && happ_offset == 0
             && self.original_type == happ_type
         {
-            return true;
+            return Some(self.original_type);
         }
 
         {
@@ -605,7 +679,7 @@ impl MemTypeLayout {
                     .then_some(self.mem_layout.fixed_base.size),
             };
             if !extent.includes(&happ_extent) {
-                return false;
+                return None;
             }
         }
 
@@ -619,40 +693,72 @@ impl MemTypeLayout {
                 match &self.components {
                     Components::Scalar => unreachable!(),
                     Components::Elements { stride, elem, .. } => {
-                        elem.supports_happ_at_offset(happ_offset % stride.get(), happ)
+                        // FIXME(eddyb) support rebuilding an array type.
+                        elem.type_supporting_happ_at_offset(cx, happ_offset % stride.get(), happ)
+                            == Some(elem.original_type)
                     }
                     Components::Fields { offsets, layouts, .. } => {
-                        layouts[idx].supports_happ_at_offset(happ_offset - offsets[idx], happ)
+                        // FIXME(eddyb) support rebuilding a struct type.
+                        let field = &layouts[idx];
+                        field.type_supporting_happ_at_offset(cx, happ_offset - offsets[idx], happ)
+                            == Some(field.original_type)
                     }
                 }
             })
         };
         match &happ.kind {
-            _ if any_component_supports(happ_offset, happ) => true,
+            _ if any_component_supports(happ_offset, happ) => Some(self.original_type),
 
             DataHappKind::Dead => unreachable!(),
 
-            DataHappKind::StrictlyTyped(_) | DataHappKind::Direct(_) => false,
+            &DataHappKind::StrictlyTyped(access_type) | &DataHappKind::Direct(access_type) => {
+                if access_type.as_scalar(cx).is_some() {
+                    let original_scalar_type = self.original_type.as_scalar(cx)?;
+                    match original_scalar_type {
+                        // FIXME(eddyb) not sure if this even a realistic situation.
+                        scalar::Type::Bool => return None,
+
+                        // HACK(eddyb) only unsigned integers are easy to support
+                        // directly, without incurring extra bit-shifts, though
+                        // any other type that allows bitcasting, could also work.
+                        scalar::Type::UInt(_) => {
+                            return Some(self.original_type);
+                        }
+
+                        scalar::Type::SInt(_) | scalar::Type::Float(_) => {}
+                    }
+                    return Some(cx.intern(scalar::Type::UInt(scalar::IntWidth::try_from_bits(
+                        original_scalar_type.bit_width(),
+                    )?)));
+                }
+
+                None
+            }
 
             DataHappKind::Disjoint(entries) => {
-                entries.iter().all(|(&sub_offset, sub_happ)| {
-                    // FIXME(eddyb) maybe this overflow should be propagated up,
-                    // as a sign that `happ` is malformed?
-                    happ_offset.checked_add(sub_offset).is_some_and(|combined_offset| {
-                        // NOTE(eddyb) the reason this is only applicable to
-                        // offset `0` is that *in all other cases*, every
-                        // individual `Disjoint` requires its own type, to
-                        // allow performing offsets *in steps* (even if the
-                        // offsets could easily be constant-folded, they'd
-                        // *have to* be constant-folded *before* analysis,
-                        // to ensure there is no need for the intermediaries).
-                        if combined_offset == 0 {
-                            self.supports_happ_at_offset(0, sub_happ)
-                        } else {
-                            any_component_supports(combined_offset, sub_happ)
-                        }
+                entries
+                    .iter()
+                    .all(|(&sub_offset, sub_happ)| {
+                        // FIXME(eddyb) maybe this overflow should be propagated up,
+                        // as a sign that `happ` is malformed?
+                        happ_offset.checked_add(sub_offset).is_some_and(|combined_offset| {
+                            // NOTE(eddyb) the reason this is only applicable to
+                            // offset `0` is that *in all other cases*, every
+                            // individual `Disjoint` requires its own type, to
+                            // allow performing offsets *in steps* (even if the
+                            // offsets could easily be constant-folded, they'd
+                            // *have to* be constant-folded *before* analysis,
+                            // to ensure there is no need for the intermediaries).
+                            if combined_offset == 0 {
+                                // FIXME(eddyb) support rebuilding a struct type.
+                                self.type_supporting_happ_at_offset(cx, 0, sub_happ)
+                                    == Some(self.original_type)
+                            } else {
+                                any_component_supports(combined_offset, sub_happ)
+                            }
+                        })
                     })
-                })
+                    .then_some(self.original_type)
             }
 
             // Finding an array entirely nested in a component was handled above,
@@ -674,7 +780,30 @@ impl MemTypeLayout {
                     // Dynamic offsetting into non-arrays is not supported, and it'd
                     // only make sense for legalization (or small-length arrays where
                     // selecting elements based on the index may be a practical choice).
-                    Components::Scalar | Components::Fields { .. } => false,
+                    Components::Scalar | Components::Fields { .. } => {
+                        // HACK(eddyb) as per the comment above: this is really
+                        // only here as a form of legalization.
+                        happ_fixed_len
+                            .ok()
+                            .flatten()
+                            .is_some_and(|happ_fixed_len| {
+                                (0..happ_fixed_len.get()).all(|i| {
+                                    let elem_offset = i.checked_mul(happ_stride.get()).unwrap();
+                                    // FIXME(eddyb) maybe this overflow should be propagated up,
+                                    // as a sign that `happ` is malformed?
+                                    happ_offset.checked_add(elem_offset).is_some_and(
+                                        |combined_offset| {
+                                            self.type_supporting_happ_at_offset(
+                                                cx,
+                                                combined_offset,
+                                                happ_elem,
+                                            ) == Some(self.original_type)
+                                        },
+                                    )
+                                })
+                            })
+                            .then_some(self.original_type)
+                    }
 
                     Components::Elements {
                         stride: layout_stride,
@@ -702,12 +831,19 @@ impl MemTypeLayout {
                         // FIXME(eddyb) this could maybe be allowed if there is still
                         // some kind of divisibility relation between the strides.
                         if ext_happ_offset != 0 {
-                            return false;
+                            return None;
                         }
 
-                        layout_stride == happ_stride
+                        if layout_stride == happ_stride
                             && Ok(*layout_fixed_len) == ext_happ_fixed_len
-                            && layout_elem.supports_happ_at_offset(0, happ_elem)
+                        {
+                            // FIXME(eddyb) support rebuilding an array type.
+                            (layout_elem.type_supporting_happ_at_offset(cx, 0, happ_elem)
+                                == Some(layout_elem.original_type))
+                            .then_some(self.original_type)
+                        } else {
+                            None
+                        }
                     }
                 }
             }
@@ -1016,7 +1152,7 @@ impl<'a> GatherAccesses<'a> {
                 };
                 *slot = Some(match slot.take() {
                     Some(old) => old.and_then(|old| {
-                        AccessMerger { layout_cache: &this.layout_cache }
+                        AccessMerger { cx: &this.cx, layout_cache: &this.layout_cache }
                             .merge(old, new_accesses?)
                             .into_result()
                     }),
@@ -1268,7 +1404,7 @@ impl<'a> GatherAccesses<'a> {
                                 // of `happ`, by demanding it *also* support
                                 // dynamic indexing with `stride`.
                                 let strided_happ =
-                                    AccessMerger { layout_cache: &self.layout_cache }
+                                    AccessMerger { cx: &self.cx, layout_cache: &self.layout_cache }
                                         .merge_data(
                                             happ,
                                             DataHapp {
@@ -1282,14 +1418,17 @@ impl<'a> GatherAccesses<'a> {
                                             },
                                         )
                                         .into_result()?;
-                                let intra_stride_happ = match strided_happ.kind {
+                                // HACK(eddyb) `merged_stride > stride` is now
+                                // possible, with `qptr::lift` being expected to
+                                // emulate finer-grained offsetting in that case.
+                                let flags = match &strided_happ.kind {
                                     DataHappKind::Repeated { element, stride: merged_stride }
-                                        if merged_stride == stride
+                                        if *merged_stride >= stride
                                             && element
                                                 .max_size
-                                                .is_some_and(|s| s <= stride.get()) =>
+                                                .is_some_and(|s| s <= merged_stride.get()) =>
                                     {
-                                        element
+                                        element.flags.propagate_outwards()
                                     }
 
                                     _ => {
@@ -1306,11 +1445,8 @@ impl<'a> GatherAccesses<'a> {
 
                                 Ok(MemAccesses::Data(DataHapp {
                                     max_size,
-                                    flags: intra_stride_happ.flags.propagate_outwards(),
-                                    kind: DataHappKind::Repeated {
-                                        element: intra_stride_happ,
-                                        stride,
-                                    },
+                                    flags,
+                                    kind: strided_happ.kind,
                                 }))
                             }),
                     );
