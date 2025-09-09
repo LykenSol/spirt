@@ -6,6 +6,7 @@ use crate::{scalar, spv};
 
 // NOTE(eddyb) all the modules are declared here, but they're documented "inside"
 // (i.e. using inner doc comments).
+pub mod callgraph;
 pub mod cfgssa;
 pub mod structurize;
 pub mod unstructured;

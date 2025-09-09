@@ -502,6 +502,9 @@ pub enum DiagMsgPart {
     Type(Type),
     Const(Const),
     MemAccesses(mem::MemAccesses),
+
+    // TODO(eddyb) this is potentially problematic!!!
+    Func(Func),
 }
 
 /// Wrapper to limit `Ord` for interned index types (e.g. [`InternedStr`])

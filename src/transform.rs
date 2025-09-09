@@ -8,11 +8,12 @@ use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, DataInstKind, DbgSrcLoc,
     DeclDef, EntityListIter, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
     GlobalVar, GlobalVarDecl, GlobalVarDefBody, GlobalVarInit, Import, Module, ModuleDebugInfo,
-    ModuleDialect, Node, NodeDef, NodeKind, OrdAssertEq, Region, RegionDef, Type, TypeDef,
-    TypeKind, TypeOrConst, Value, Var, VarDecl, spv,
+    ModuleDialect, Node, NodeDef, NodeKind, OrdAssertEq, Region, Type, TypeDef, TypeKind,
+    TypeOrConst, Value, Var, VarDecl, spv,
 };
 use std::cmp::Ordering;
 use std::rc::Rc;
+use std::slice;
 
 /// The result of a transformation (which is not in-place).
 #[must_use]
@@ -171,6 +172,13 @@ pub trait Transformer: Sized {
     }
     fn transform_const_def(&mut self, ct_def: &ConstDef) -> Transformed<ConstDef> {
         ct_def.inner_transform_with(self)
+    }
+    // HACK(eddyb) transition existing impls to the new form.
+    fn transform_value_use_in_func(
+        &mut self,
+        func_at_val: FuncAtMut<'_, Value>,
+    ) -> Transformed<Value> {
+        self.transform_value_use(&func_at_val.position)
     }
     fn transform_value_use(&mut self, v: &Value) -> Transformed<Value> {
         v.inner_transform_with(self)
@@ -619,24 +627,42 @@ impl InnerInPlaceTransform for FuncDefBody {
     }
 }
 
+impl<P: Copy> FuncAtMut<'_, P> {
+    // HACK(eddyb) this avoids writing the same cursed loop everywhere it's needed.
+    // FIXME(eddyb) come up with something less inefficient for this purpose.
+    fn in_place_transform_many<T: Copy>(
+        &mut self,
+        get_all_mut: impl Fn(FuncAtMut<'_, P>) -> &mut [T],
+        mut transform: impl FnMut(FuncAtMut<'_, T>) -> Transformed<T>,
+    ) {
+        let count = get_all_mut(self.reborrow()).len();
+        for i in 0..count {
+            let x = get_all_mut(self.reborrow())[i];
+            match transform(self.reborrow().at(x)) {
+                Transformed::Unchanged => {}
+                Transformed::Changed(new) => get_all_mut(self.reborrow())[i] = new,
+            }
+        }
+    }
+}
+
 impl InnerInPlaceTransform for FuncAtMut<'_, Region> {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        // HACK(eddyb) handle the fields of `Region` separately, to
-        // allow reborrowing `FuncAtMut` (for recursing into `Node`s).
-        let RegionDef { inputs, children: _, outputs: _ } = self.reborrow().def();
-
-        // FIXME(eddyb) dedup with the future `FuncAtMut<Value>` solution.
-        for input_idx in 0..inputs.len() {
-            let input = self.reborrow().def().inputs[input_idx];
-            transformer.in_place_transform_var_decl(self.reborrow().at(input));
-        }
+        self.in_place_transform_many(
+            |this| &mut this.def().inputs,
+            |func_at_var| {
+                transformer.in_place_transform_var_decl(func_at_var);
+                // HACK(eddyb) `Var` references themselves don't change.
+                Transformed::Unchanged
+            },
+        );
 
         self.reborrow().at_children().into_iter().inner_in_place_transform_with(transformer);
 
-        let RegionDef { inputs: _, children: _, outputs } = self.reborrow().def();
-        for v in outputs {
-            transformer.transform_value_use(v).apply_to(v);
-        }
+        self.in_place_transform_many(
+            |this| &mut this.def().outputs,
+            |func_at_val| transformer.transform_value_use_in_func(func_at_val),
+        );
     }
 }
 
@@ -685,28 +711,37 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
             }
         }
 
-        for v in &mut self.reborrow().def().inputs {
-            transformer.transform_value_use(v).apply_to(v);
-        }
+        self.in_place_transform_many(
+            |this| &mut this.def().inputs,
+            |func_at_val| transformer.transform_value_use_in_func(func_at_val),
+        );
 
-        for child_region_idx in 0..self.reborrow().def().child_regions.len() {
-            let child_region = self.reborrow().def().child_regions[child_region_idx];
-            transformer.in_place_transform_region_def(self.reborrow().at(child_region));
-        }
-
-        let NodeDef { attrs: _, kind, inputs: _, child_regions: _, outputs } =
-            self.reborrow().def();
+        self.in_place_transform_many(
+            |this| &mut this.def().child_regions,
+            |func_at_region| {
+                transformer.in_place_transform_region_def(func_at_region);
+                // HACK(eddyb) `Region` references themselves don't change.
+                Transformed::Unchanged
+            },
+        );
 
         // HACK(eddyb) semantically, `repeat_condition` is a body region output.
-        if let NodeKind::Loop { repeat_condition } = kind {
-            transformer.transform_value_use(repeat_condition).apply_to(repeat_condition);
-        }
+        self.in_place_transform_many(
+            |this| match &mut this.def().kind {
+                NodeKind::Loop { repeat_condition } => slice::from_mut(repeat_condition),
+                _ => &mut [],
+            },
+            |func_at_val| transformer.transform_value_use_in_func(func_at_val),
+        );
 
-        // FIXME(eddyb) dedup with the future `FuncAtMut<Value>` solution.
-        for output_idx in 0..outputs.len() {
-            let output = self.reborrow().def().outputs[output_idx];
-            transformer.in_place_transform_var_decl(self.reborrow().at(output));
-        }
+        self.in_place_transform_many(
+            |this| &mut this.def().outputs,
+            |func_at_var| {
+                transformer.in_place_transform_var_decl(func_at_var);
+                // HACK(eddyb) `Var` references themselves don't change.
+                Transformed::Unchanged
+            },
+        );
     }
 }
 
@@ -748,6 +783,7 @@ impl InnerInPlaceTransform for cf::unstructured::ControlInst {
                 SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
             ) => {}
         }
+        // FIXME(eddyb) these can't use `transform_value_use_in_func`.
         for v in inputs {
             transformer.transform_value_use(v).apply_to(v);
         }

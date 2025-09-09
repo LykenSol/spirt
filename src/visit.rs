@@ -355,6 +355,8 @@ impl InnerVisit for Vec<DiagMsgPart> {
                 &DiagMsgPart::Type(ty) => visitor.visit_type_use(ty),
                 &DiagMsgPart::Const(ct) => visitor.visit_const_use(ct),
                 DiagMsgPart::MemAccesses(accesses) => accesses.inner_visit_with(visitor),
+
+                &DiagMsgPart::Func(func) => visitor.visit_func_use(func),
             }
         }
     }

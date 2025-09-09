@@ -155,6 +155,7 @@ def_well_known! {
         OpSelect,
 
         OpFunctionCall,
+        OpFunctionPointerCallINTEL,
 
         OpImageTexelPointer,
 

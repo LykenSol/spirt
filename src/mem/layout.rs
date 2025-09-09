@@ -323,6 +323,31 @@ impl<'a> LayoutCache<'a> {
         u32::try_from(ct.as_scalar(&self.cx)?.int_as_i32()?).ok()
     }
 
+    // HACK(eddyb) `pub(crate)` for callgraph's stack emulation.
+    pub(crate) fn fixed_mem_layout_of(
+        &self,
+        ty: Type,
+        reason: &str,
+    ) -> Result<shapes::MemLayout, Diag> {
+        let err = |kind| {
+            Err(Diag::bug([
+                format!("{kind} type `").into(),
+                ty.into(),
+                format!("` cannot be used for {reason}").into(),
+            ]))
+        };
+        match self.layout_of(ty).map_err(|LayoutError(err)| err)? {
+            TypeLayout::Handle(_) | TypeLayout::HandleArray(..) => err("handle"),
+            TypeLayout::Concrete(layout) => {
+                if layout.mem_layout.dyn_unit_stride.is_some() {
+                    err("dynamically sized")
+                } else {
+                    Ok(layout.mem_layout.fixed_base)
+                }
+            }
+        }
+    }
+
     /// Attempt to compute a `TypeLayout` for a given (SPIR-V) `Type`.
     pub(crate) fn layout_of(&self, ty: Type) -> Result<TypeLayout, LayoutError> {
         if let Some(cached) = self.cache.borrow().get(&ty).cloned() {
