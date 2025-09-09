@@ -102,57 +102,6 @@ impl AccessMerger<'_> {
     }
 
     fn merge_data(&self, a: DataHapp, b: DataHapp) -> MergeResult<DataHapp> {
-        // NOTE(eddyb) this is doable because it's currently impossible for
-        // the merged HAPP to be outside the bounds of *both* `a` and `b`.
-        let max_size = match (a.max_size, b.max_size) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (None, _) | (_, None) => None,
-        };
-
-        // Ensure that `a` is "larger" than `b`, or at least the same size
-        // (when either they're identical, or one is a "newtype" of the other),
-        // to make it easier to handle all the possible interactions below,
-        // by skipping (or deprioritizing, if supported) the "wrong direction".
-        let mut sorted = [a, b];
-        sorted.sort_by_key(|happ| {
-            #[derive(PartialEq, Eq, PartialOrd, Ord)]
-            enum MaxSize<T> {
-                Fixed(T),
-                // FIXME(eddyb) this probably needs to track "min size"?
-                Dynamic,
-            }
-            let max_size = happ.max_size.map_or(MaxSize::Dynamic, MaxSize::Fixed);
-
-            // When sizes are equal, pick the more restrictive side.
-            #[derive(PartialEq, Eq, PartialOrd, Ord)]
-            enum TypeStrictness {
-                Any,
-                Array,
-                Exact,
-            }
-            #[allow(clippy::match_same_arms)]
-            let type_strictness = match happ.kind {
-                DataHappKind::Dead | DataHappKind::Disjoint(_) => TypeStrictness::Any,
-
-                DataHappKind::Repeated { .. } => TypeStrictness::Array,
-
-                // FIXME(eddyb) this should be `Any`, even if in theory it
-                // could contain arrays or structs that need decomposition
-                // (note that, for typed reads/write, arrays do not need to be
-                // *indexed* to work, i.e. they *do not* require `DynOffset`s,
-                // `Offset`s suffice, and for them `Repeated` is at most
-                // a "run-length"/deduplication optimization over `Disjoint`).
-                // NOTE(eddyb) this should still prefer `OpTypeVector` over `Repeated`!
-                DataHappKind::Direct(_) => TypeStrictness::Exact,
-
-                DataHappKind::StrictlyTyped(_) => TypeStrictness::Exact,
-            };
-
-            (max_size, type_strictness)
-        });
-        let [b, a] = sorted;
-        assert_eq!(max_size, a.max_size);
-
         self.merge_data_at(a, 0, b)
     }
 
@@ -160,13 +109,78 @@ impl AccessMerger<'_> {
     // like "make `a` compatible with `offset => b`".
     fn merge_data_at(&self, a: DataHapp, b_offset_in_a: u32, b: DataHapp) -> MergeResult<DataHapp> {
         // NOTE(eddyb) this is doable because it's currently impossible for
-        // the merged HAPP to be outside the bounds of *both* `a` and `b`.
+        // the merged HAPP to be outside the bounds of *both* `a` and `offset => b`.
         let max_size = match (a.max_size, b.max_size) {
             (Some(a), Some(b)) => Some(a.max(b.checked_add(b_offset_in_a).unwrap())),
             (None, _) | (_, None) => None,
         };
 
-        // HACK(eddyb) we require biased `a` vs `b` (see `merge_data` method above).
+        let [a, b] = if b_offset_in_a == 0 {
+            // Ensure that `a` is "larger" than `b`, or at least the same size
+            // (when either they're identical, or one is a "newtype" of the other),
+            // to make it easier to handle all the possible interactions below,
+            // by skipping (or deprioritizing, if supported) the "wrong direction".
+            let mut sorted = [a, b];
+            sorted.sort_by_key(|happ| {
+                #[derive(PartialEq, Eq, PartialOrd, Ord)]
+                enum MaxSize<T> {
+                    Fixed(T),
+                    // FIXME(eddyb) this probably needs to track "min size"?
+                    Dynamic,
+                }
+                let max_size = happ.max_size.map_or(MaxSize::Dynamic, MaxSize::Fixed);
+
+                // When sizes are equal, pick the more restrictive side.
+                #[derive(PartialEq, Eq, PartialOrd, Ord)]
+                enum TypeStrictness {
+                    Any,
+                    Array,
+                    Exact,
+                }
+                #[allow(clippy::match_same_arms)]
+                let type_strictness = match happ.kind {
+                    DataHappKind::Dead | DataHappKind::Disjoint(_) => TypeStrictness::Any,
+
+                    DataHappKind::Repeated { .. } => TypeStrictness::Array,
+
+                    // FIXME(eddyb) this should be `Any`, even if in theory it
+                    // could contain arrays or structs that need decomposition
+                    // (note that, for typed reads/write, arrays do not need to be
+                    // *indexed* to work, i.e. they *do not* require `DynOffset`s,
+                    // `Offset`s suffice, and for them `Repeated` is at most
+                    // a "run-length"/deduplication optimization over `Disjoint`).
+                    // NOTE(eddyb) this should still prefer `OpTypeVector` over `Repeated`!
+                    DataHappKind::Direct(_) => TypeStrictness::Exact,
+
+                    DataHappKind::StrictlyTyped(_) => TypeStrictness::Exact,
+                };
+
+                (max_size, type_strictness)
+            });
+            let [b, a] = sorted;
+            [a, b]
+        } else {
+            // HACK(eddyb) to avoid callers having to account for this, treat
+            // `a` too small to fit `offset => b` as a new `Disjoint`.
+            let a_min_req_max_size = max_size.unwrap_or(b_offset_in_a);
+            if a.max_size.is_some_and(|a| a < a_min_req_max_size) {
+                [
+                    DataHapp {
+                        max_size,
+                        flags: a.flags.propagate_outwards(),
+                        kind: DataHappKind::Disjoint(Rc::new(
+                            Some((0, a))
+                                .filter(|(_, a)| !matches!(a.kind, DataHappKind::Dead))
+                                .into_iter()
+                                .collect(),
+                        )),
+                    },
+                    b,
+                ]
+            } else {
+                [a, b]
+            }
+        };
         assert_eq!(max_size, a.max_size);
 
         let mut flags = a.flags;
@@ -179,85 +193,84 @@ impl AccessMerger<'_> {
         };
 
         // Decompose the "smaller" and/or "less strict" side (`b`) first.
-        match b.kind {
-            // `Dead`s are always ignored.
-            DataHappKind::Dead
-                if {
-                    // HACK(eddyb) see similar comment below, but also the comment
-                    // above is invalidated by this condition - the issue is that
-                    // only an unused offset of `0` is a true noop, otherwise
-                    // there is a dead `qptr.offset` instruction which still
-                    // needs a field to reference.
-                    b_offset_in_a == 0 && flags.contains(b.flags)
-                } =>
-            {
-                let mut a = a;
-                a.flags = flags;
-                return MergeResult::ok(a);
-            }
+        let can_flatten_b = {
+            // HACK(eddyb) this check was added later, after it turned out
+            // that *deep* flattening of arbitrary offsets in `b` would've
+            // required constant-folding of `qptr.offset` in `qptr::lift`,
+            // to not need all the type nesting levels for `OpAccessChain`.
+            b_offset_in_a == 0
+            // HACK(eddyb) this second check also avoids flattening e.g.
+            // a smaller copy from/to offset 0 of a larger variable.
+            && flags.contains(b.flags)
+        };
+        if can_flatten_b {
+            match b.kind {
+                // `Dead`s are always ignored.
+                DataHappKind::Dead => {
+                    let mut a = a;
+                    a.flags = flags;
+                    return MergeResult::ok(a);
+                }
 
-            DataHappKind::Disjoint(b_entries)
-                if {
-                    // HACK(eddyb) this check was added later, after it turned out
-                    // that *deep* flattening of arbitrary offsets in `b` would've
-                    // required constant-folding of `qptr.offset` in `qptr::lift`,
-                    // to not need all the type nesting levels for `OpAccessChain`.
-                    b_offset_in_a == 0
-                    // HACK(eddyb) this second check also avoids flattening e.g.
-                    // a smaller copy from/to offset 0 of a larger variable.
-                    && flags.contains(b.flags)
-                } =>
-            {
-                // FIXME(eddyb) this whole dance only needed due to `Rc`.
-                let b_entries = Rc::try_unwrap(b_entries);
-                let b_entries = match b_entries {
-                    Ok(entries) => Either::Left(entries.into_iter()),
-                    Err(ref entries) => Either::Right(entries.iter().map(|(&k, v)| (k, v.clone()))),
-                };
+                DataHappKind::Disjoint(b_entries) => {
+                    // FIXME(eddyb) this whole dance only needed due to `Rc`.
+                    let b_entries = Rc::try_unwrap(b_entries);
+                    let b_entries = match b_entries {
+                        Ok(entries) => Either::Left(entries.into_iter()),
+                        Err(ref entries) => {
+                            Either::Right(entries.iter().map(|(&k, v)| (k, v.clone())))
+                        }
+                    };
 
-                let mut ab = a;
-                ab.flags = flags;
-                let mut all_errors = None;
-                for (b_offset, b_sub_happ) in b_entries {
-                    let MergeResult { merged, error: new_error } = self.merge_data_at(
-                        ab,
-                        b_offset.checked_add(b_offset_in_a).unwrap(),
-                        b_sub_happ,
-                    );
-                    ab = merged;
+                    let mut ab = a;
+                    ab.flags = flags;
+                    let mut all_errors = None;
+                    for (b_offset, b_sub_happ) in b_entries {
+                        let MergeResult { merged, error: new_error } = self.merge_data_at(
+                            ab,
+                            b_offset.checked_add(b_offset_in_a).unwrap(),
+                            b_sub_happ,
+                        );
+                        ab = merged;
 
-                    // FIXME(eddyb) move some of this into `MergeResult`!
-                    if let Some(AnalysisError(e)) = new_error {
-                        let all_errors =
-                            &mut all_errors.get_or_insert(AnalysisError(Diag::bug([]))).0.message;
+                        // FIXME(eddyb) move some of this into `MergeResult`!
+                        if let Some(AnalysisError(e)) = new_error {
+                            let all_errors = &mut all_errors
+                                .get_or_insert(AnalysisError(Diag::bug([])))
+                                .0
+                                .message;
+                            // FIXME(eddyb) should this mean `MergeResult` should
+                            // use `errors: Vec<AnalysisError>` instead of `Option`?
+                            if !all_errors.is_empty() {
+                                all_errors.push("\n".into());
+                            }
+                            // FIXME(eddyb) this is scuffed because the error might
+                            // (or really *should*) already refer to the right offset!
+                            all_errors.push(format!("+{b_offset} => ").into());
+                            all_errors.extend(e.message);
+                        }
+                    }
+                    return MergeResult {
+                        merged: ab,
                         // FIXME(eddyb) should this mean `MergeResult` should
                         // use `errors: Vec<AnalysisError>` instead of `Option`?
-                        if !all_errors.is_empty() {
-                            all_errors.push("\n".into());
-                        }
-                        // FIXME(eddyb) this is scuffed because the error might
-                        // (or really *should*) already refer to the right offset!
-                        all_errors.push(format!("+{b_offset} => ").into());
-                        all_errors.extend(e.message);
-                    }
+                        error: all_errors.map(|AnalysisError(mut e)| {
+                            e.message.insert(0, "merge_data: conflicts:\n".into());
+                            AnalysisError(e)
+                        }),
+                    };
                 }
-                return MergeResult {
-                    merged: ab,
-                    // FIXME(eddyb) should this mean `MergeResult` should
-                    // use `errors: Vec<AnalysisError>` instead of `Option`?
-                    error: all_errors.map(|AnalysisError(mut e)| {
-                        e.message.insert(0, "merge_data: conflicts:\n".into());
-                        AnalysisError(e)
-                    }),
-                };
-            }
 
-            _ => {}
+                _ => {}
+            }
         }
 
         let kind = match a.kind {
             // `Dead`s are always ignored.
             DataHappKind::Dead => {
+                // NOTE(eddyb) this is handled near the start of `merge_mem_at`.
+                assert_eq!(b_offset_in_a, 0);
+
                 // HACK(eddyb) in lieu of flags-preserving nesting of `b` into `a`.
                 flags |= b.flags;
 
@@ -364,13 +377,8 @@ impl AccessMerger<'_> {
                     ({
                         let a_element_mut = Rc::make_mut(&mut a_element);
                         let a_element = mem::replace(a_element_mut, DataHapp::DEAD);
-                        // FIXME(eddyb) remove this silliness by making `merge_data_at` do symmetrical sorting.
-                        if b_offset_in_a_element == 0 {
-                            self.merge_data(a_element, b)
-                        } else {
-                            self.merge_data_at(a_element, b_offset_in_a_element, b)
-                        }
-                        .map(|merged| *a_element_mut = merged)
+                        self.merge_data_at(a_element, b_offset_in_a_element, b)
+                            .map(|merged| *a_element_mut = merged)
                     })
                     .map(|()| DataHappKind::Repeated { element: a_element, stride: a_stride })
                 } else {
@@ -522,15 +530,10 @@ impl AccessMerger<'_> {
                                 self.merge_data_at(a_sub_happ, b_offset_in_a - a_sub_offset, b),
                             )
                         } else {
-                            // FIXME(eddyb) remove this silliness by making `merge_data_at` do symmetrical sorting.
-                            if a_sub_offset - b_offset_in_a == 0 {
-                                (b_offset_in_a, self.merge_data(b, a_sub_happ))
-                            } else {
-                                (
-                                    b_offset_in_a,
-                                    self.merge_data_at(b, a_sub_offset - b_offset_in_a, a_sub_happ),
-                                )
-                            }
+                            (
+                                b_offset_in_a,
+                                self.merge_data_at(b, a_sub_offset - b_offset_in_a, a_sub_happ),
+                            )
                         };
 
                     // FIXME(eddyb) move some of this into `MergeResult`!

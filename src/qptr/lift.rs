@@ -1479,7 +1479,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 (
                     Components::Elements { stride: array_stride, elem, .. },
                     MaybeDynOffset::Dyn { index, stride: index_stride, .. },
-                ) if index_stride.get() % array_stride.get() == 0 => {
+                ) if index_stride.get().is_multiple_of(array_stride.get()) => {
                     let index_multiplier = index_stride.get() / array_stride.get();
 
                     let index = if index_multiplier == 1 {
