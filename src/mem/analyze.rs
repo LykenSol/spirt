@@ -1137,6 +1137,7 @@ impl<'a> GatherAccesses<'a> {
                         max_size: None,
                         flags: DataHappFlags::empty(),
                         kind: DataHappKind::Repeated {
+                            // FIXME(eddyb) allocating `Rc` a bit wasteful here.
                             element: Rc::new(DataHapp::DEAD),
                             stride: dyn_unit_stride,
                         },
@@ -1199,8 +1200,8 @@ impl<'a> GatherAccesses<'a> {
                                         .map(|max_size| {
                                             offset.checked_add(max_size).ok_or_else(|| {
                                                 AnalysisError(Diag::bug([format!(
-                                                    "Offset({offset}): size overflow \
-                                                     ({offset}+{max_size})"
+                                                    "Offset({offset}): \
+                                                     size overflow ({offset}+{max_size})"
                                                 )
                                                 .into()]))
                                             })
@@ -1217,6 +1218,7 @@ impl<'a> GatherAccesses<'a> {
                 }
                 DataInstKind::QPtr(QPtrOp::DynOffset { stride, index_bounds }) => {
                     assert_eq!(per_output_accesses.len(), 1);
+                    let (stride, index_bounds) = (*stride, index_bounds.clone());
                     generate_accesses(
                         self,
                         data_inst_def.inputs[0],
@@ -1232,50 +1234,79 @@ impl<'a> GatherAccesses<'a> {
                                     }
                                     MemAccesses::Data(happ) => happ,
                                 };
-                                match happ.max_size {
-                                    None => {
-                                        return Err(AnalysisError(Diag::bug([
-                                            "DynOffset: unsized element".into(),
-                                        ])));
-                                    }
-                                    // FIXME(eddyb) support this by "folding"
-                                    // the HAPP onto itself (i.e. applying
-                                    // `%= stride` on all offsets inside).
-                                    Some(max_size) if max_size > stride.get() => {
-                                        return Err(AnalysisError(Diag::bug([
-                                            "DynOffset: element max_size exceeds stride".into(),
-                                        ])));
-                                    }
-                                    Some(_) => {}
-                                }
-                                Ok(MemAccesses::Data(DataHapp {
-                                    // FIXME(eddyb) does the `None` case allow
-                                    // for negative offsets?
-                                    max_size: index_bounds
-                                        .as_ref()
-                                        .map(|index_bounds| {
-                                            if index_bounds.start < 0 || index_bounds.end < 0 {
-                                                return Err(AnalysisError(Diag::bug([
-                                                    "DynOffset: potentially negative offset".into(),
-                                                ])));
-                                            }
-                                            let index_bounds_end =
-                                                u32::try_from(index_bounds.end).unwrap();
-                                            index_bounds_end.checked_mul(stride.get()).ok_or_else(
-                                                || {
-                                                    AnalysisError(Diag::bug([format!(
-                                                        "DynOffset: size overflow \
-                                                         ({index_bounds_end}*{stride})"
-                                                    )
-                                                    .into()]))
+
+                                // FIXME(eddyb) does the `None` case allow
+                                // for negative offsets?
+                                // FIXME(eddyb) LLVM's new `nuw`/`nusw` flags
+                                // on GEPs are likely a good starting point
+                                // for offset signedness disambiguation.
+                                let max_size = index_bounds
+                                    .map(|index_bounds| {
+                                        if index_bounds.start < 0 || index_bounds.end < 0 {
+                                            return Err(AnalysisError(Diag::bug([
+                                                "DynOffset: potentially negative offset".into(),
+                                            ])));
+                                        }
+                                        let index_bounds_end =
+                                            u32::try_from(index_bounds.end).unwrap();
+                                        index_bounds_end.checked_mul(stride.get()).ok_or_else(
+                                            || {
+                                                AnalysisError(Diag::bug([format!(
+                                                    "DynOffset: size overflow \
+                                                     ({index_bounds_end} × {stride})"
+                                                )
+                                                .into()]))
+                                            },
+                                        )
+                                    })
+                                    .transpose()?;
+
+                                // HACK(eddyb) force an array-like "reshaping"
+                                // of `happ`, by demanding it *also* support
+                                // dynamic indexing with `stride`.
+                                let strided_happ =
+                                    AccessMerger { layout_cache: &self.layout_cache }
+                                        .merge_data(
+                                            happ,
+                                            DataHapp {
+                                                max_size: None,
+                                                flags: DataHappFlags::empty(),
+                                                kind: DataHappKind::Repeated {
+                                                    // FIXME(eddyb) allocating `Rc` a bit wasteful here.
+                                                    element: Rc::new(DataHapp::DEAD),
+                                                    stride,
                                                 },
+                                            },
+                                        )
+                                        .into_result()?;
+                                let intra_stride_happ = match strided_happ.kind {
+                                    DataHappKind::Repeated { element, stride: merged_stride }
+                                        if merged_stride == stride
+                                            && element
+                                                .max_size
+                                                .is_some_and(|s| s <= stride.get()) =>
+                                    {
+                                        element
+                                    }
+
+                                    _ => {
+                                        return Err(AnalysisError(Diag::bug([
+                                            format!(
+                                                "DynOffset: unexpected strided \
+                                                 (N × {stride}) reshaping result: "
                                             )
-                                        })
-                                        .transpose()?,
-                                    flags: happ.flags.propagate_outwards(),
+                                            .into(),
+                                            MemAccesses::Data(strided_happ).into(),
+                                        ])));
+                                    }
+                                };
+
+                                Ok(MemAccesses::Data(DataHapp {
+                                    max_size,
+                                    flags: intra_stride_happ.flags.propagate_outwards(),
                                     kind: DataHappKind::Repeated {
-                                        element: Rc::new(happ),
-                                        stride: *stride,
+                                        element: intra_stride_happ,
+                                        stride,
                                     },
                                 }))
                             }),

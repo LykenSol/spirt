@@ -8,6 +8,7 @@ use itertools::Either;
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::fmt;
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::rc::Rc;
@@ -189,6 +190,18 @@ pub(crate) struct Extent<T> {
     pub(crate) start: T,
     // FIXME(eddyb) would `Option<RangeTo<T>>` be clearer?
     pub(crate) end: Option<T>,
+}
+
+impl<T: fmt::Display> fmt::Display for Extent<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { start, end } = self;
+        start.fmt(f)?;
+        f.write_str("..")?;
+        if let Some(end) = end {
+            end.fmt(f)?;
+        }
+        Ok(())
+    }
 }
 
 // HACK(eddyb) comparison helper for `Option<T>` so that `Some(_) < None`.
