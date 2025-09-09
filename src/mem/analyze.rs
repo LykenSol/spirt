@@ -931,7 +931,8 @@ impl<'a> GatherAccesses<'a> {
                     continue;
                 }
 
-                DataInstKind::FuncCall(_)
+                DataInstKind::Scalar(_)
+                | DataInstKind::FuncCall(_)
                 | DataInstKind::Mem(_)
                 | DataInstKind::QPtr(_)
                 | DataInstKind::SpvInst(_)
@@ -948,6 +949,8 @@ impl<'a> GatherAccesses<'a> {
                 NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
                     unreachable!()
                 }
+
+                DataInstKind::Scalar(_) => {}
 
                 &DataInstKind::FuncCall(callee) => {
                     match self.gather_accesses_in_func(module, callee) {
