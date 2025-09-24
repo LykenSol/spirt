@@ -123,6 +123,7 @@ def_well_known! {
         OpTypeStruct,
         OpTypeForwardPointer,
         OpTypePointer,
+        OpTypeUntypedPointerKHR,
         OpTypeFunction,
 
         // FIXME(eddyb) hide these from code, lowering should handle most cases.

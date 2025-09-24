@@ -520,7 +520,7 @@ impl<'a> LayoutCache<'a> {
             spv::Imm::Short(_, x) => x,
             _ => unreachable!(),
         };
-        Ok(if spv_inst.opcode == wk.OpTypePointer {
+        Ok(if [wk.OpTypePointer, wk.OpTypeUntypedPointerKHR].contains(&spv_inst.opcode) {
             // FIXME(eddyb) make this properly abstract instead of only configurable.
             // FIXME(eddyb) categorize `OpTypePointer` by storage class and split on
             // logical vs physical here.
