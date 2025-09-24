@@ -405,9 +405,9 @@ impl<'a> LowerFromSpvPtrs<'a> {
                 // HACK(eddyb) keep function pointers separate, perhaps eventually
                 // adding an `OpTypeUntypedPointerKHR CodeSectionINTEL` equivalent
                 // to SPIR-T itself (after `SPV_KHR_untyped_pointers` support).
-                if sc == self.wk.CodeSectionINTEL {
-                    return None;
-                }
+                //if sc == self.wk.CodeSectionINTEL {
+                //    return None;
+                //}
 
                 let pointee = match type_and_const_inputs[..] {
                     [TypeOrConst::Type(elem_type)] => elem_type,
@@ -450,8 +450,24 @@ impl Transformer for EraseSpvPtrs<'_> {
     // "hidden" in composites (which should be handled in SPIR-T explicitly).
     fn transform_type_use(&mut self, ty: Type) -> Transformed<Type> {
         // FIXME(eddyb) maybe cache this remap (in `LowerFromSpvPtrs`, globally).
-        if self.lowerer.as_spv_ptr_type(ty).is_some() {
-            Transformed::Changed(self.lowerer.qptr_type())
+        if let Some((addr_space, _)) = self.lowerer.as_spv_ptr_type(ty) {
+            let wk = self.lowerer.wk;
+            // HACK(eddyb) temporarily trying out some fn ptr stuff.
+            if addr_space == AddrSpace::SpvStorageClass(wk.CodeSectionINTEL) {
+                Transformed::Changed(
+                    self.lowerer.cx.intern(
+                        spv::Inst {
+                            opcode: wk.OpTypeUntypedPointerKHR,
+                            imms: [spv::Imm::Short(wk.StorageClass, wk.CodeSectionINTEL)]
+                                .into_iter()
+                                .collect(),
+                        }
+                        .into_canonical_type_with(&self.lowerer.cx, [].into_iter().collect()),
+                    ),
+                )
+            } else {
+                Transformed::Changed(self.lowerer.qptr_type())
+            }
         } else {
             Transformed::Unchanged
         }
@@ -479,7 +495,7 @@ impl Transformer for EraseSpvPtrs<'_> {
             Transformed::Changed(erased_ct_def) => erased_ct_def,
         };
         match &erased_ct_def.kind {
-            ConstKind::Undef | ConstKind::PtrToGlobalVar { .. } => {
+            ConstKind::Undef | ConstKind::PtrToGlobalVar { .. } | ConstKind::PtrToFunc(_) => {
                 Transformed::Changed(cx.intern(erased_ct_def))
             }
 
