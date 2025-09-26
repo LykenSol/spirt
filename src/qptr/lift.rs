@@ -977,7 +977,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 // FIXME(eddyb) this is awkward (or at least its needs DRY-ing)
                 // because only an approximation is needed, most checks are
                 // done by `adjust_pointer_for_offset_and_accesses`.
-                let access_mem_accesses = match self.lifter.layout_of(access_type)? {
+                let approx_mem_accesses = match self.lifter.layout_of(access_type)? {
                     TypeLayout::HandleArray(..) => {
                         return Err(LiftError(Diag::bug([
                             "cannot access whole HandleArray".into()
@@ -989,12 +989,24 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     TypeLayout::Handle(shapes::Handle::Buffer(as_, _)) => {
                         MemAccesses::Handles(shapes::Handle::Buffer(as_, DataHapp::DEAD))
                     }
-                    TypeLayout::Concrete(concrete) => MemAccesses::Data(DataHapp {
-                        max_size: (concrete.mem_layout.dyn_unit_stride.is_none())
-                            .then_some(concrete.mem_layout.fixed_base.size),
-                        flags: DataHappFlags::empty(),
-                        kind: DataHappKind::Direct(concrete.original_type),
-                    }),
+                    TypeLayout::Concrete(concrete) => {
+                        let ty = concrete.original_type;
+                        // HACK(eddyb) shrink scalar accesses to mere bytes.
+                        let (approx_ty, approx_size) = if ty.as_scalar(cx).is_some() {
+                            (cx.intern(scalar::Type::UInt(scalar::IntWidth::I8)), Some(1))
+                        } else {
+                            (
+                                ty,
+                                (concrete.mem_layout.dyn_unit_stride.is_none())
+                                    .then_some(concrete.mem_layout.fixed_base.size),
+                            )
+                        };
+                        MemAccesses::Data(DataHapp {
+                            max_size: approx_size,
+                            flags: DataHappFlags::empty(),
+                            kind: DataHappKind::Direct(approx_ty),
+                        })
+                    }
                 };
 
                 let mut func = func_at_data_inst.reborrow().at(());
@@ -1003,7 +1015,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     .adjust_pointer_for_offset_and_accesses(
                         data_inst_def.inputs[0],
                         MaybeDynOffset::Const(offset.map_or(0, |o| o.get())),
-                        &access_mem_accesses,
+                        &approx_mem_accesses,
                         Some(&mut partial_offset),
                         func.reborrow(),
                         insert_aux_data_inst,
@@ -1112,7 +1124,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                                     self.lifter.layout_cache.config.abstract_bool_size_align.1 * 8
                                 }
                                 _ => access_scalar_type.bit_width(),
-                            })?;
+                            })
+                            .filter(|&w| w <= pointee_uint_width)?;
 
                         let le_bit_offset = partial_bit_offset;
                         let access_bit_offset_in_pointee =
