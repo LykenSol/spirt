@@ -15,9 +15,9 @@ use crate::visit::{InnerVisit, Visitor};
 use crate::{
     AttrSet, Const, ConstDef, ConstKind, Context, Func, FuncDefBody, FxIndexMap, FxIndexSet,
     GlobalVar, Node, NodeDef, NodeKind, Region, RegionDef, Type, TypeKind, Value, Var, VarDecl,
-    vector,
+    scalar, vector,
 };
-use itertools::Either;
+use itertools::{Either, Itertools as _};
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::num::{NonZeroI32, NonZeroU32};
@@ -527,7 +527,10 @@ impl PropagateLocalContents<'_> {
             let scalar_access_type = access_type.as_scalar(self.cx)?;
             let legal_vector = local.size.is_multiple_of(access_size)
                 && offset.is_multiple_of(access_size)
-                && (2..=4).contains(&inferred_vector_len);
+                && (2..=4).contains(&inferred_vector_len)
+                && /* HACK(eddyb) avoid ever generating u8×4 */ local.size > 4
+                && /* HACK(eddyb) avoid ever generating u64×N */ access_size < 8
+                && false;
             if !legal_vector {
                 return None;
             }
@@ -539,6 +542,19 @@ impl PropagateLocalContents<'_> {
                 Some(u8::try_from(elem_idx).unwrap()),
             )
         };
+
+        // HACK(eddyb) booleans cannot be bitcast.
+        let mismatched_boolness = local.ty.is_some_and(|ty| {
+            let common_boolness = [ty, inferred_local_type]
+                .into_iter()
+                .map(|ty| ty.as_scalar(self.cx) == Some(scalar::Type::Bool))
+                .dedup()
+                .exactly_one();
+            common_boolness.is_err()
+        });
+        if mismatched_boolness {
+            return None;
+        }
 
         // HACK(eddyb) allow bitcasts in general by only requiring type equality
         // when a vector type was synthesized (for accessing a single element).
