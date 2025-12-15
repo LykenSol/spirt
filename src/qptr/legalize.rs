@@ -1225,6 +1225,12 @@ impl<'a> LegalizePtrs<'a> {
             a_sort_key.cmp(&b_sort_key)
         });
 
+        eprintln!("qptr::legalize: {} escaped global bases", base_maps.escaped.bases.len());
+
+        if false {
+            assert!(base_maps.escaped.bases.len() <= 16);
+        }
+
         // NOTE(eddyb) there is still no interaction *between* escaped bases here,
         // e.g. if an escaped base already has a lower stride, that will not end
         // up propagating to other bases, as `write_back_escaped_ptr_offset_shape`

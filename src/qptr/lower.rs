@@ -1499,20 +1499,67 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     Value::Var(output_var)
                 });
 
-                let copy_inst = func.nodes.define(
-                    cx,
-                    DataInstDef {
-                        // FIXME(eddyb) filter attributes into debuginfo and
-                        // semantic, and understand the semantic ones.
-                        attrs,
-                        kind: MemOp::Copy { size: stride }.into(),
-                        inputs: [dst_elem_ptr, src_elem_ptr].into_iter().collect(),
-                        child_regions: [].into_iter().collect(),
-                        outputs: [].into_iter().collect(),
-                    }
-                    .into(),
-                );
-                if_any_left_then_region_def.children.insert_last(copy_inst, func.nodes);
+                // TODO(eddyb) replace this with an integer load/store,
+                // if the `stride` is small enough, esp. `1` for `u8`,
+                // where it can't possibly be floats or anything else.
+                // HACK(eddyb) ^^ WIP.
+                if stride.get() == 1 {
+                    let load_data_inst = func.nodes.define(
+                        cx,
+                        DataInstDef {
+                            // FIXME(eddyb) filter attributes into debuginfo and
+                            // semantic, and understand the semantic ones.
+                            attrs,
+                            kind: MemOp::Load { offset: None }.into(),
+                            inputs: [src_ptr].into_iter().collect(),
+                            child_regions: [].into_iter().collect(),
+                            outputs: [].into_iter().collect(),
+                        }
+                        .into(),
+                    );
+                    let load_output_var = func.vars.define(
+                        cx,
+                        VarDecl {
+                            attrs: Default::default(),
+                            ty: cx.intern(scalar::Type::UInt(scalar::IntWidth::I8)),
+                            def_parent: Either::Right(load_data_inst),
+                            def_idx: 0,
+                        },
+                    );
+                    func.nodes[load_data_inst].outputs.push(load_output_var);
+
+                    let store_data_inst = func.nodes.define(
+                        cx,
+                        DataInstDef {
+                            // FIXME(eddyb) filter attributes into debuginfo and
+                            // semantic, and understand the semantic ones.
+                            attrs,
+                            kind: MemOp::Store { offset: None }.into(),
+                            inputs: [dst_ptr, Value::Var(load_output_var)].into_iter().collect(),
+                            child_regions: [].into_iter().collect(),
+                            outputs: [].into_iter().collect(),
+                        }
+                        .into(),
+                    );
+
+                    if_any_left_then_region_def.children.insert_last(load_data_inst, func.nodes);
+                    if_any_left_then_region_def.children.insert_last(store_data_inst, func.nodes);
+                } else {
+                    let copy_inst = func.nodes.define(
+                        cx,
+                        DataInstDef {
+                            // FIXME(eddyb) filter attributes into debuginfo and
+                            // semantic, and understand the semantic ones.
+                            attrs,
+                            kind: MemOp::Copy { size: stride }.into(),
+                            inputs: [dst_elem_ptr, src_elem_ptr].into_iter().collect(),
+                            child_regions: [].into_iter().collect(),
+                            outputs: [].into_iter().collect(),
+                        }
+                        .into(),
+                    );
+                    if_any_left_then_region_def.children.insert_last(copy_inst, func.nodes);
+                }
 
                 return Ok(Transformed::Changed(NodeDef {
                     attrs,
@@ -1535,7 +1582,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             let size = NonZeroU32::new(size)
                 .ok_or_else(|| LowerError(Diag::bug(["`OpCopyMemorySized` of 0 bytes".into()])))?;
 
-            // FIXME(eddyb) do something similar for `OpCopyMemory` as well?
+            // TODO(eddyb) do something similar for `OpCopyMemory` as well?
             (MemOp::Copy { size }.into(), [dst_ptr, src_ptr].into_iter().collect())
         } else if spv_inst.opcode == wk.OpCopyMemory {
             if disaggregated_output_or_inputs_during_lowering {
@@ -1589,6 +1636,27 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             // FIXME(eddyb) support memory operands somehow.
             if !spv_inst.imms.is_empty() {
                 return Ok(Transformed::Unchanged);
+            }
+
+            // TODO(eddyb) properly integrate this (and move it into `mem.copy`),
+            // maybe remove the load/store nonsense lower below, entirely?
+            if [dst_base_offset, src_base_offset] == [0, 0] && true {
+                if let Ok(mem_data_layout) = mem_data_layout_or_opaque_handle_type {
+                    let size = mem_data_layout.mem_layout.fixed_base.size;
+
+                    // FIXME(eddyb) remove instruction if `size == 0`?
+                    let size = NonZeroU32::new(size).ok_or_else(|| {
+                        LowerError(Diag::bug(["`OpCopyMemory` of 0 bytes".into()]))
+                    })?;
+
+                    return Ok(Transformed::Changed(DataInstDef {
+                        attrs,
+                        kind: MemOp::Copy { size }.into(),
+                        inputs: [dst_ptr, src_ptr].into_iter().collect(),
+                        child_regions: [].into_iter().collect(),
+                        outputs,
+                    }));
+                }
             }
 
             // HACK(eddyb) this is speculative, so we just give up if we hit

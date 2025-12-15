@@ -450,6 +450,9 @@ impl spv::Inst {
                 match ct {
                     scalar::Const::FALSE => mo.OpConstantFalse.into(),
                     scalar::Const::TRUE => mo.OpConstantTrue.into(),
+                    // TODO(eddyb) also create larger `OpUndef/OpConstantNull`
+                    // in `spv::lift` reaggregation!
+                    _ if ct.bits() == 0 => mo.OpConstantNull.into(),
                     _ => {
                         spv::Inst { opcode: mo.OpConstant, imms: ct.encode_as_spv_imms().collect() }
                     }
@@ -457,6 +460,9 @@ impl spv::Inst {
                 [].into_iter().collect(),
             )),
 
+            ConstKind::Vector(ct) if ct.elems().all(|elem| elem.bits() == 0) => {
+                Some((mo.OpConstantNull.into(), [].into_iter().collect()))
+            }
             ConstKind::Vector(ct) => Some((
                 wk.OpConstantComposite.into(),
                 ct.elems().map(|elem| cx.intern(elem)).collect(),

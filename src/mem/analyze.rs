@@ -14,7 +14,7 @@ use crate::{
     ExportKey, Exportee, Func, FxIndexMap, GlobalVar, Module, Node, NodeKind, OrdAssertEq, Type,
     TypeKind, Value, Var, scalar,
 };
-use itertools::Either;
+use itertools::{Either, Itertools};
 use smallvec::SmallVec;
 use std::mem;
 use std::num::NonZeroU32;
@@ -430,6 +430,37 @@ impl AccessMerger<'_> {
                                 stride: a_stride,
                             })
                         }
+
+                        // HACK(eddyb) merge `N`-strided and `M`-strided indexing
+                        // using a stride that's a common divisor of `N` and `M`.
+                        // TODO(eddyb) implement? idk
+                        #[cfg(any())]
+                        DataHappKind::Repeated { element: b_element, stride: b_stride }
+                            if b_offset_in_a_element == 0 && max_size == b.max_size =>
+                        {
+                            // HACK(eddyb) instead of computing GCD, just use
+                            // the largest power of 2 they have in common.
+                            let common_stride = NonZeroU32::new(
+                                1 << a_stride.trailing_zeros().min(b_stride.trailing_zeros()),
+                            )
+                            .unwrap();
+
+                            return self.merge_data(
+                                self.merge_data(
+                                    a,
+                                    DataHapp {
+                                        max_size,
+                                        flags: DataHappFlags::empty(),
+                                        kind: DataHappKind::Repeated {
+                                            element: Rc::new(DataHapp::DEAD),
+                                            stride: common_stride,
+                                        },
+                                    },
+                                )?,
+                                b,
+                            );
+                        }
+
                         _ => {
                             // HACK(eddyb) needed due to `a` being moved out of.
                             let a = DataHapp {
@@ -448,6 +479,9 @@ impl AccessMerger<'_> {
 
                             // HACK(eddyb) special-case "small element" indexing
                             // vs a single "large element", by indexing the latter.
+                            // TODO(eddyb) doesn't this mean that the large element
+                            // being accessed at an arbitrary small-granularity
+                            // offset, will produce coarser granularity???
                             let max_size_and_stride_for_repeating_b = b
                                 .max_size
                                 .and_then(|b_max_size| {
@@ -712,10 +746,16 @@ impl MemTypeLayout {
 
             &DataHappKind::StrictlyTyped(access_type) | &DataHappKind::Direct(access_type) => {
                 if access_type.as_scalar(cx).is_some() {
-                    let original_scalar_type = self.original_type.as_scalar(cx)?;
-                    match original_scalar_type {
-                        // FIXME(eddyb) not sure if this even a realistic situation.
-                        scalar::Type::Bool => return None,
+                    let bit_width = match self.original_type.as_scalar(cx)? {
+                        // HACK(eddyb) this treats booleans as integers,
+                        // sized by the `LayoutConfig`, at the cost of
+                        // introducing conversion complications later.
+                        scalar::Type::Bool => {
+                            // HACK(eddyb) no direct `LayoutConfig` access,
+                            // but the boolean layout must've been computed
+                            // using the `LayoutConfig` anyway.
+                            self.mem_layout.fixed_base.size * 8
+                        }
 
                         // HACK(eddyb) only unsigned integers are easy to support
                         // directly, without incurring extra bit-shifts, though
@@ -724,11 +764,11 @@ impl MemTypeLayout {
                             return Some(self.original_type);
                         }
 
-                        scalar::Type::SInt(_) | scalar::Type::Float(_) => {}
-                    }
-                    return Some(cx.intern(scalar::Type::UInt(scalar::IntWidth::try_from_bits(
-                        original_scalar_type.bit_width(),
-                    )?)));
+                        ty => ty.bit_width(),
+                    };
+                    return Some(
+                        cx.intern(scalar::Type::UInt(scalar::IntWidth::try_from_bits(bit_width)?)),
+                    );
                 }
 
                 None
@@ -782,26 +822,20 @@ impl MemTypeLayout {
                     Components::Scalar | Components::Fields { .. } => {
                         // HACK(eddyb) as per the comment above: this is really
                         // only here as a form of legalization.
-                        happ_fixed_len
-                            .ok()
-                            .flatten()
-                            .is_some_and(|happ_fixed_len| {
-                                (0..happ_fixed_len.get()).all(|i| {
-                                    let elem_offset = i.checked_mul(happ_stride.get()).unwrap();
-                                    // FIXME(eddyb) maybe this overflow should be propagated up,
+                        (0..happ_fixed_len.ok()??.get())
+                            .map(|i| {
+                                let elem_offset = i.checked_mul(happ_stride.get()).unwrap();
+                                self.type_supporting_happ_at_offset(
+                                    cx,
+                                    // FIXME(eddyb) maybe an overflow should be propagated up,
                                     // as a sign that `happ` is malformed?
-                                    happ_offset.checked_add(elem_offset).is_some_and(
-                                        |combined_offset| {
-                                            self.type_supporting_happ_at_offset(
-                                                cx,
-                                                combined_offset,
-                                                happ_elem,
-                                            ) == Some(self.original_type)
-                                        },
-                                    )
-                                })
+                                    happ_offset.checked_add(elem_offset)?,
+                                    happ_elem,
+                                )
                             })
-                            .then_some(self.original_type)
+                            .dedup()
+                            .exactly_one()
+                            .ok()?
                     }
 
                     Components::Elements {

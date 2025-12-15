@@ -4,7 +4,7 @@ use crate::mem::shapes;
 use crate::{
     AddrSpace, Attr, Const, Context, Diag, FxIndexMap, Type, TypeKind, TypeOrConst, scalar, spv,
 };
-use itertools::Either;
+use itertools::{Either, Itertools};
 use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -288,14 +288,34 @@ impl Components {
                 offsets
                     .iter()
                     .zip(layouts)
-                    .map(|(&field_offset, field)| {
-                        Extent {
+                    .map(|(&field_offset, field)| (Some(field_offset), Some(field)))
+                    .chain([(None, None)])
+                    .tuple_windows()
+                    .map(|((field_offset, field), (next_field_offset, _))| {
+                        let field_offset = field_offset.unwrap();
+                        let field = field.unwrap();
+
+                        let mut field_extent = Extent {
                             start: 0,
                             end: (field.mem_layout.dyn_unit_stride.is_none())
                                 .then_some(field.mem_layout.fixed_base.size),
                         }
                         .checked_add(field_offset)
-                        .unwrap()
+                        .unwrap();
+
+                        // HACK(eddyb) can't really trust the inherent size of
+                        // a type, because it may be wrapped in another type
+                        // which treats it as "packed" (but is that even sound?).
+                        // TODO(eddyb) audit everything else that interacts with
+                        // offsets and sizes because this hints at other problems.
+                        // FIXME(eddyb) consider the `CPacked` decoration.
+                        if let (Some(field_end), Some(next_field_start)) =
+                            (&mut field_extent.end, next_field_offset)
+                        {
+                            *field_end = (*field_end).min(next_field_start);
+                        }
+
+                        field_extent
                     })
                     .enumerate(),
             ),

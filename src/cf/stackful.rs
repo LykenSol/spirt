@@ -285,7 +285,16 @@ impl<'a> CallStackEmulator<'a> {
         // (or in none at all, if they contain no recursive/indirect calls),
         // so now all of their `CallEmuGroup`s have to be artificially unified.
         if let Some(indirect_callee_emu_group) = indirect_callee_emu_group {
-            for &func in &call_graph.indirect_callees {
+            for func in call_graph.indirect_callees.iter().copied().chain(
+                // HACK(eddyb) also include indirect *callers*, hoping to reduce
+                // the impact of quasi-exponential inlining amplification.
+                // TODO(eddyb) remove or make configurable.
+                call_graph
+                    .caller_to_callees
+                    .iter()
+                    .filter(|(_, callees)| !callees.indirect.is_empty() && false)
+                    .map(|(&caller, _)| caller),
+            ) {
                 let emu_group = func_emu_summary[func].emu_group;
                 if emu_group == Some(indirect_callee_emu_group) {
                     continue;
