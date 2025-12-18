@@ -779,6 +779,10 @@ impl<E: sealed::Entity<Def = EntityListNode<E, D>>, D> EntityListIter<E> {
         let Self { first, last } = self;
         let current = first?;
         let next = defs[current].next;
+
+        // HACK(eddyb) without this, `last` is ignored for forward iteration.
+        let next = next.filter(|_| Some(current) != last);
+
         match next {
             // FIXME(eddyb) this situation should be impossible anyway, as it
             // involves the `EntityListNode`s links, which should be unforgeable.
@@ -800,6 +804,10 @@ impl<E: sealed::Entity<Def = EntityListNode<E, D>>, D> EntityListIter<E> {
         let Self { first, last } = self;
         let current = last?;
         let prev = defs[current].prev;
+
+        // HACK(eddyb) without this, `first` is ignored for backwards iteration.
+        let prev = prev.filter(|_| Some(current) != first);
+
         match prev {
             // FIXME(eddyb) this situation should be impossible anyway, as it
             // involves the `EntityListNode`s links, which should be unforgeable.
