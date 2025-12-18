@@ -19,6 +19,7 @@ use crate::{
 use itertools::{Either, Itertools as _};
 use smallvec::SmallVec;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::mem;
 use std::num::{NonZeroI32, NonZeroU32};
 use std::ops::RangeInclusive;
@@ -307,14 +308,104 @@ impl<'a> LiftToSpvPtrs<'a> {
     }
 
     fn strip_mem_accesses_attr(&self, attrs: AttrSet) -> AttrSet {
-        self.cx.intern(AttrSetDef {
+        let mut had_mem_accesses = false;
+        let mut new_attrs = AttrSetDef {
             attrs: self.cx[attrs]
                 .attrs
                 .iter()
-                .filter(|attr| !matches!(attr, Attr::Mem(MemAttr::Accesses(_))))
+                .filter(|attr| {
+                    let is_mem_accesses = matches!(attr, Attr::Mem(MemAttr::Accesses(_)));
+                    had_mem_accesses |= is_mem_accesses;
+                    !is_mem_accesses
+                })
                 .cloned()
                 .collect(),
-        })
+        };
+
+        // HACK(eddyb) if the attribute wasn't found in the first place, but
+        // there wasn't an error preventing `strip_mem_accesses_attr` from
+        // being called, that means the fallback kicked in, and all of the BUGs
+        // that `mem::analyze` had emitted, can be discarded.
+        // FIXME(eddyb) figure out a better way to negocitate this, maybe move
+        // the fallback logic into `mem::analyze` itself, auto-degrading as-needed?
+        if !had_mem_accesses && !new_attrs.diags().is_empty() {
+            new_attrs.mutate_diags(|diags| {
+                let Some(src_path_prefix) = Diag::bug_src_path_prefix().filter(|src_path_prefix| {
+                    std::panic::Location::caller().file().strip_prefix(src_path_prefix).is_some_and(
+                        |qptr_lift_suffix| {
+                            qptr_lift_suffix.starts_with("qptr")
+                                && qptr_lift_suffix.ends_with("lift.rs")
+                        },
+                    )
+                }) else {
+                    return;
+                };
+                diags.retain(|diag| {
+                    let remove_diag = match diag.level {
+                        DiagLevel::Bug(loc) => {
+                            loc.file().strip_prefix(src_path_prefix).is_some_and(|suffix| {
+                                suffix.starts_with("mem") && suffix.ends_with("analyze.rs")
+                            })
+                        }
+                        _ => false,
+                    };
+                    !remove_diag
+                });
+            });
+        }
+
+        self.cx.intern(new_attrs)
+    }
+
+    // HACK(eddyb) try to deduce an array-like fallback, from alignment.
+    fn fallback_accesses_from_shape(&self, shape: shapes::GlobalVarShape) -> Option<MemAccesses> {
+        let fallback_data_happ_from_layout = |mem_layout: shapes::MaybeDynMemLayout| {
+            let align = mem_layout.fixed_base.align;
+            (align.is_power_of_two()
+                && align <= 8
+                && mem_layout.fixed_base.size.is_multiple_of(align)
+                && mem_layout
+                    .dyn_unit_stride
+                    .is_none_or(|stride| stride.get().is_multiple_of(align)))
+            .then(|| {
+                // TODO(eddyb) remove temporary hack of using 4 where possible.
+                let element_size =
+                    if mem_layout.dyn_unit_stride.is_some() && false { 4 } else { align };
+                let element = DataHapp {
+                    max_size: Some(element_size),
+                    flags: DataHappFlags::empty(),
+                    kind: DataHappKind::Direct(self.cx.intern(scalar::Type::UInt(
+                        scalar::IntWidth::try_from_bits(element_size * 8).unwrap(),
+                    ))),
+                };
+                DataHapp {
+                    max_size: mem_layout
+                        .dyn_unit_stride
+                        .is_none()
+                        .then_some(mem_layout.fixed_base.size),
+                    flags: DataHappFlags::empty(),
+                    kind: DataHappKind::Repeated {
+                        element: Rc::new(element),
+                        stride: NonZeroU32::new(element_size).unwrap(),
+                    },
+                }
+            })
+        };
+        match shape {
+            shapes::GlobalVarShape::Handles {
+                handle: shapes::Handle::Buffer(addr_space, buf),
+                fixed_count: _,
+            } => fallback_data_happ_from_layout(buf)
+                .map(|happ| MemAccesses::Handles(shapes::Handle::Buffer(addr_space, happ))),
+            shapes::GlobalVarShape::UntypedData(mem_layout) => {
+                fallback_data_happ_from_layout(shapes::MaybeDynMemLayout {
+                    fixed_base: mem_layout,
+                    dyn_unit_stride: None,
+                })
+                .map(MemAccesses::Data)
+            }
+            _ => None,
+        }
     }
 
     fn spv_pointee_type_and_addr_space_for_global_var(
@@ -323,10 +414,18 @@ impl<'a> LiftToSpvPtrs<'a> {
     ) -> Result<(Type, AddrSpace), LiftError> {
         let wk = self.wk;
 
-        let mem_accesses = self.require_mem_accesses_attr(global_var_decl.attrs)?;
-
         let shape =
             global_var_decl.shape.ok_or_else(|| LiftError(Diag::bug(["missing shape".into()])))?;
+
+        let mem_accesses;
+        let mem_accesses = match self.require_mem_accesses_attr(global_var_decl.attrs) {
+            Ok(mem_accesses) => mem_accesses,
+            Err(e) => {
+                mem_accesses = self.fallback_accesses_from_shape(shape).ok_or(e)?;
+                &mem_accesses
+            }
+        };
+
         let pointee_type = self.pointee_type_for_shape_and_accesses(shape, mem_accesses)?;
         let storage_class = match (global_var_decl.addr_space, shape) {
             (AddrSpace::Handles, shapes::GlobalVarShape::Handles { handle, fixed_count: _ }) => {
@@ -429,6 +528,7 @@ impl<'a> LiftToSpvPtrs<'a> {
                             opcode: wk.OpDecorate,
                             imms: [spv::Imm::Short(wk.Decoration, wk.Block)].into_iter().collect(),
                         });
+                        // FIXME(eddyb) this doesn't handle flags!
                         match &data_happ.kind {
                             DataHappKind::Dead => {
                                 self.spv_op_type_struct([], [attr_spv_decorate_block])?
@@ -497,62 +597,212 @@ impl<'a> LiftToSpvPtrs<'a> {
         // FIXME(eddyb) does this make sense across all flags?
         let effective_flags = outer_effective_flags | happ.flags;
 
-        // TODO(eddyb) implement (or at least validate that there are no gaps).
-        if effective_flags.contains(DataHappFlags::COPY_SRC_AND_DST) {
-            let already_valid = match &happ.kind {
-                // FIXME(eddyb) support more cases.
-                &DataHappKind::StrictlyTyped(ty) | &DataHappKind::Direct(ty) => ty
-                    .as_scalar(&self.cx)
-                    .is_some_and(|ty| happ.max_size == Some(ty.bit_width() / 8)),
-                _ => false,
-            };
+        // Memory used as a destination for some copies, and a source for others,
+        // must not have any padding bytes in its type, as they make it impossible
+        // to fully preserve (all bytes of) the value being copied through it.
+        let disallow_padding = effective_flags.contains(DataHappFlags::COPY_SRC_AND_DST);
 
-            if !already_valid {
-                return Err(LiftError(Diag::bug([
-                    "unimplemented `mem.copy` src+dst (gap filling) for ".into(),
-                    MemAccesses::Data(happ.clone()).into(),
-                ])));
-            }
-        }
+        // FIXME(eddyb) the naive expansion of copies (to uint loads and stores)
+        // lacks any kind of pointee type awareness, so it can't skip over padding
+        // in either the source or the destination - easier to make this stricter.
+        let disallow_padding =
+            disallow_padding || effective_flags.intersects(DataHappFlags::COPY_SRC_AND_DST);
+
+        let size_of = |ty| match self.layout_of(ty).ok()? {
+            TypeLayout::HandleArray(..) | TypeLayout::Handle(_) => None,
+            TypeLayout::Concrete(concrete) => (concrete.mem_layout.dyn_unit_stride.is_none())
+                .then_some(concrete.mem_layout.fixed_base.size),
+        };
+        let mk_padding_err = || {
+            LiftError(Diag::bug([
+                "failed to guarantee a padding-free type for ".into(),
+                MemAccesses::Data(happ.clone()).into(),
+            ]))
+        };
 
         match &happ.kind {
-            DataHappKind::Dead => self.spv_op_type_struct([], []),
-            &DataHappKind::StrictlyTyped(ty) | &DataHappKind::Direct(ty) => Ok(ty),
-            DataHappKind::Disjoint(fields) => {
-                // HACK(eddyb) force the size of `OpTypeStruct`s that would be
-                // otherwise undersized (as e.g. `mem.copy` src/dst).
-                let size_forcing_zst_tail_field = happ
-                    .max_size
-                    .filter(|&size| {
-                        let inherent_unaligned_size =
-                            fields.last_key_value().map_or(0, |(&field_offset, field_happ)| {
-                                field_offset.checked_add(field_happ.max_size.unwrap()).unwrap()
-                            });
-                        size > inherent_unaligned_size
-                    })
-                    .map(|size| Ok((size, self.spv_op_type_struct([], [])?)));
+            &DataHappKind::StrictlyTyped(ty) | &DataHappKind::Direct(ty) => {
+                let is_strict = matches!(happ.kind, DataHappKind::StrictlyTyped(_));
 
-                self.spv_op_type_struct(
-                    fields
-                        .iter()
-                        .map(|(&field_offset, field_happ)| {
-                            Ok((
-                                field_offset,
-                                self.pointee_type_for_data_happ(
-                                    field_happ,
-                                    effective_flags,
-                                    max_size_allowed_by_shape
-                                        .and_then(|max| max.checked_sub(field_offset)),
-                                )?,
-                            ))
-                        })
-                        .chain(size_forcing_zst_tail_field),
-                    [],
-                )
+                // HACK(eddyb) in order to support loads and stores that copies
+                // might need to generate, the scalar leaves have to all be
+                // unsigned integers, even without `disallow_padding`.
+                if effective_flags.intersects(DataHappFlags::COPY_SRC_AND_DST) {
+                    // FIXME(eddyb) the boolean silliness here results in a few
+                    // `&&`/`||` uses that maybe should be `Option`/`Result`.
+                    let already_valid = match self.cx[ty].kind {
+                        // FIXME(eddyb) consider supporting more types here.
+                        TypeKind::Scalar(ty) => {
+                            let bit_width = ty.bit_width();
+                            let mem_size = match ty {
+                                scalar::Type::Bool => {
+                                    self.layout_cache.config.abstract_bool_size_align.0
+                                }
+                                _ => bit_width / 8,
+                            };
+
+                            // FIXME(eddyb) should this consider increasing the
+                            // width of type and/or adding extra filler?
+                            // (is this even possible?)
+                            happ.max_size == Some(mem_size) && {
+                                let mem_uint = scalar::Type::UInt(
+                                    scalar::IntWidth::try_from_bits(mem_size * 8).unwrap(),
+                                );
+
+                                ty == mem_uint || {
+                                    if !is_strict {
+                                        return Ok(self.cx.intern(mem_uint));
+                                    }
+
+                                    // FIXME(eddyb) what can be done here?
+                                    false
+                                }
+                            }
+                        }
+                        TypeKind::Vector(ty) => {
+                            // FIXME(eddyb) implement rewriting non-uint vectors.
+                            match ty.elem {
+                                scalar::Type::UInt(elem_width) => {
+                                    let mem_size = (elem_width.bits() / 8)
+                                        .checked_mul(ty.elem_count.get().into())
+                                        .unwrap();
+
+                                    happ.max_size == Some(mem_size)
+                                }
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !already_valid {
+                        return Err(mk_padding_err());
+                    }
+                }
+
+                Ok(ty)
+            }
+            DataHappKind::Dead | DataHappKind::Disjoint(_) => {
+                let no_fields = BTreeMap::new();
+                let fields = match &happ.kind {
+                    DataHappKind::Disjoint(fields) => &**fields,
+                    _ => &no_fields,
+                };
+
+                // HACK(eddyb) in order to be able to detect gaps both between
+                // fields, but also before/after the first/last field, extra
+                // iterator entries are used, which have `None` in the second
+                // component (instead of a `Some(field_happ)`), with the actual
+                // gaps being observed through the use of `tuple_windows`.
+                let mut field_offsets_and_types = [(Some(0), None)]
+                    .into_iter()
+                    .chain(
+                        fields.iter().map(|(&field_offset, field_happ)| {
+                            (Some(field_offset), Some(field_happ))
+                        }),
+                    )
+                    .chain([((happ.max_size).or(max_size_allowed_by_shape), None)])
+                    .tuple_windows()
+                    .flat_map(|((field_offset, field_happ), (next_offset, next_happ))| {
+                        let field_offset = field_offset.unwrap();
+                        let is_last = next_happ.is_none();
+
+                        // FIXME(eddyb) the use of `Option` (instead of `Result`)
+                        // in some of these cases is suboptimal and/or confusing.
+                        let field_type = field_happ.map(|field_happ| {
+                            self.pointee_type_for_data_happ(
+                                field_happ,
+                                effective_flags,
+                                max_size_allowed_by_shape
+                                    .map(|max| max.saturating_sub(field_offset)),
+                            )
+                        });
+                        let field_size = field_type
+                            .as_ref()
+                            .map_or(Ok(0), |ty| size_of(*ty.as_ref().map_err(|_e| ())?).ok_or(()))
+                            .ok();
+                        let field_range = field_size.and_then(|field_size| {
+                            Some(field_offset..field_offset.checked_add(field_size)?)
+                        });
+
+                        let extra_field = if disallow_padding {
+                            let maybe_gap = field_range
+                                .and_then(|field_range| {
+                                    Some((
+                                        field_range.end,
+                                        next_offset?.checked_sub(field_range.end)?,
+                                    ))
+                                })
+                                .ok_or_else(mk_padding_err)
+                                .map(|(gap_offset, gap_size)| {
+                                    Some((gap_offset, NonZeroU32::new(gap_size)?))
+                                })
+                                .transpose();
+                            maybe_gap.map(|gap| {
+                                let (gap_offset, gap_size) = gap?;
+
+                                // HACK(eddyb) pick `u32`, `u16` or `u8`,
+                                // preferring the largest one of them,
+                                // that `gap_size` is a multiple of.
+                                let filler_unit_size = 1 << gap_size.trailing_zeros().clamp(0, 2);
+                                let filler_unit = self.cx.intern(scalar::Type::UInt(
+                                    scalar::IntWidth::try_from_bits(filler_unit_size * 8).unwrap(),
+                                ));
+                                let filler_count = gap_size.get() / filler_unit_size;
+                                let filler = if filler_count == 1 {
+                                    filler_unit
+                                } else {
+                                    self.spv_op_type_array(
+                                        filler_unit,
+                                        Some(filler_count),
+                                        Some(NonZeroU32::new(filler_unit_size).unwrap()),
+                                    )?
+                                };
+                                Ok((gap_offset, filler))
+                            })
+                        } else if is_last {
+                            // HACK(eddyb) force the size of `OpTypeStruct`s that would be
+                            // otherwise undersized (as e.g. `mem.copy` src/dst).
+                            next_offset
+                                .filter(|&size| size > field_range.unwrap_or(0..0).end)
+                                .map(|size| Ok((size, self.spv_op_type_struct([], [])?)))
+                        } else {
+                            None
+                        };
+
+                        [field_type.map(|ty| ty.map(|ty| (field_offset, ty))), extra_field]
+                            .into_iter()
+                            .flatten()
+                    });
+
+                // HACK(eddyb) avoid creating redundant `OpTypeStruct`s.
+                match [field_offsets_and_types.next(), field_offsets_and_types.next()] {
+                    [Some(Ok((0, field_type))), None] => Ok(field_type),
+                    first_fields => self.spv_op_type_struct(
+                        first_fields.into_iter().flatten().chain(field_offsets_and_types),
+                        [],
+                    ),
+                }
             }
             DataHappKind::Repeated { element, stride } => {
                 let element_type =
                     self.pointee_type_for_data_happ(element, effective_flags, None)?;
+
+                // FIXME(eddyb) can this occur legitimately, does it need handling?
+                if disallow_padding && size_of(element_type) != Some(stride.get()) {
+                    return Err(mk_padding_err());
+                }
+
+                let fixed_size = happ.max_size.or(max_size_allowed_by_shape);
+
+                // HACK(eddyb) if the index can only be `0`, there's no reason
+                // to keep an arbitrarily large stride.
+                let stride = if let Some(size) = fixed_size.and_then(NonZeroU32::new)
+                    && size < *stride
+                {
+                    size
+                } else {
+                    *stride
+                };
 
                 let fixed_len = happ
                     .max_size
@@ -568,7 +818,7 @@ impl<'a> LiftToSpvPtrs<'a> {
                     })
                     .transpose()?;
 
-                self.spv_op_type_array(element_type, fixed_len, Some(*stride))
+                self.spv_op_type_array(element_type, fixed_len, Some(stride))
             }
         }
     }
@@ -785,15 +1035,22 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             }
 
             &DataInstKind::Mem(MemOp::FuncLocalVar(mem_layout)) => {
-                let output_mem_accesses = self.lifter.require_mem_accesses_attr(
-                    bld.func_at(data_inst_def.outputs[0]).decl().attrs,
-                )?;
-
                 // HACK(eddyb) reusing the same functionality meant for globals.
-                let pointee_type = self.lifter.pointee_type_for_shape_and_accesses(
-                    shapes::GlobalVarShape::UntypedData(mem_layout),
-                    output_mem_accesses,
-                )?;
+                let shape = shapes::GlobalVarShape::UntypedData(mem_layout);
+
+                let output_attrs = bld.func_at(data_inst_def.outputs[0]).decl().attrs;
+
+                let mem_accesses;
+                let mem_accesses = match self.lifter.require_mem_accesses_attr(output_attrs) {
+                    Ok(mem_accesses) => mem_accesses,
+                    Err(e) => {
+                        mem_accesses = self.lifter.fallback_accesses_from_shape(shape).ok_or(e)?;
+                        &mem_accesses
+                    }
+                };
+
+                let pointee_type =
+                    self.lifter.pointee_type_for_shape_and_accesses(shape, mem_accesses)?;
 
                 let mut data_inst_def = data_inst_def.clone();
                 data_inst_def.kind = DataInstKind::SpvInst(

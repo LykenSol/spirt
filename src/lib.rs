@@ -337,7 +337,13 @@ impl AttrSetDef {
             Attr::Diagnostics(OrdAssertEq(vec![]))
         };
         match &mut attr {
-            Attr::Diagnostics(OrdAssertEq(diags)) => f(diags),
+            Attr::Diagnostics(OrdAssertEq(diags)) => {
+                f(diags);
+
+                if diags.is_empty() {
+                    return;
+                }
+            }
             _ => unreachable!(),
         }
         self.attrs.insert(attr);
