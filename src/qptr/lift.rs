@@ -12,13 +12,16 @@ use crate::transform::{InnerInPlaceTransform, InnerTransform, Transformed, Trans
 use crate::{
     AddrSpace, Attr, AttrSet, AttrSetDef, Const, ConstDef, ConstKind, Context, DataInst,
     DataInstDef, DataInstKind, DeclDef, Diag, DiagLevel, EntityDefs, EntityOrientedDenseMap, Func,
-    FuncDecl, FxIndexMap, GlobalVar, GlobalVarDecl, GlobalVarInit, Module, Node, NodeKind, Region,
-    Type, TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl, VarKind, scalar, spv, vector,
+    FuncDecl, FxIndexMap, GlobalVar, GlobalVarDecl, GlobalVarInit, Module, Node, NodeDef, NodeKind,
+    Region, Type, TypeDef, TypeKind, TypeOrConst, Value, Var, VarDecl, VarKind, scalar, spv,
+    vector,
 };
-use itertools::Either;
+use itertools::{Either, Itertools as _};
 use smallvec::SmallVec;
+use std::cell::RefCell;
 use std::mem;
-use std::num::NonZeroU32;
+use std::num::{NonZeroI32, NonZeroU32};
+use std::ops::RangeInclusive;
 use std::rc::Rc;
 
 // HACK(eddyb) sharing layout code with other modules.
@@ -670,13 +673,17 @@ struct LiftToSpvPtrInstsInFunc<'a> {
     /// (using `var_use_counts` to determine whether they're truly unused).
     deferred_ptr_noops: FxIndexMap<Var, DeferredPtrNoop>,
 
-    var_use_counts: EntityOrientedDenseMap<Var, NonZeroU32>,
+    // HACK(eddyb) `RefCell` to avoid `&mut` complications around `Builder` usage.
+    var_use_counts: RefCell<EntityOrientedDenseMap<Var, NonZeroU32>>,
 
     // HACK(eddyb) this is used to avoid noise on top of `mem`/`qptr` diagnostics.
     func_has_mem_or_qptr_bug_diags: bool,
 }
 
 struct DeferredPtrNoop {
+    // TODO(eddyb) replace mechanism!
+    actually_noop: bool,
+
     output_pointer: Value,
 
     output_pointer_addr_space: AddrSpace,
@@ -722,25 +729,24 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
     fn try_lift_data_inst_def(
         &mut self,
-        mut func_at_data_inst: FuncAtMut<'_, DataInst>,
+        func_at_data_inst: FuncAtMut<'_, DataInst>,
     ) -> Result<Transformed<DataInstDef>, LiftError> {
         let wk = self.lifter.wk;
         let cx = &self.lifter.cx;
 
-        let func_at_data_inst_frozen = func_at_data_inst.reborrow().freeze();
-        let data_inst = func_at_data_inst_frozen.position;
-        let data_inst_def = func_at_data_inst_frozen.def();
-        let func = func_at_data_inst_frozen.at(());
-        let type_of_val = |v: Value| func.at(v).type_of(cx);
+        let data_inst = func_at_data_inst.position;
 
-        // FIXME(eddyb) this should be a method on some sort of "cursor" type.
-        let insert_aux_data_inst =
-            |this: &mut Self, func: FuncAtMut<'_, ()>, mut aux_data_inst_def: DataInstDef| {
+        // FIXME(eddyb) are there better names for this?
+        let mut bld = Builder {
+            cx,
+            wk,
+            func: func_at_data_inst.at(()),
+            insert_aux_node: |func: FuncAtMut<'_, ()>, mut aux_node_def: DataInstDef| {
                 // HACK(eddyb) account for `deferred_ptr_noops` interactions.
-                this.resolve_deferred_ptr_noop_uses(&mut aux_data_inst_def.inputs);
-                this.add_value_uses(&aux_data_inst_def.inputs);
+                self.resolve_deferred_ptr_noop_uses(&mut aux_node_def.inputs);
+                self.add_value_uses(&aux_node_def.inputs);
 
-                let aux_data_inst = func.nodes.define(cx, aux_data_inst_def.into());
+                let aux_data_inst = func.nodes.define(cx, aux_node_def.into());
 
                 // HACK(eddyb) can't really use helpers like `FuncAtMut::def`,
                 // due to the need to borrow `regions` and `nodes`
@@ -748,14 +754,17 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 // types for "where a list is in a parent entity" could be used
                 // to make this more ergonomic, although the potential need for
                 // an actual list entity of its own, should be considered.
-                func.regions[this.parent_region.unwrap()].children.insert_before(
+                func.regions[self.parent_region.unwrap()].children.insert_before(
                     aux_data_inst,
                     data_inst,
                     func.nodes,
                 );
 
                 aux_data_inst
-            };
+            },
+        };
+
+        let data_inst_def = bld.func_at(data_inst).def();
 
         let replacement_data_inst_def = match &data_inst_def.kind {
             NodeKind::Select(_) | NodeKind::Loop { .. } | NodeKind::ExitInvocation(_) => {
@@ -766,7 +775,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
             &DataInstKind::FuncCall(_callee) => {
                 for &v in &data_inst_def.inputs {
-                    if self.lifter.as_spv_ptr_type(type_of_val(v)).is_some() {
+                    if self.lifter.as_spv_ptr_type(bld.type_of(v)).is_some() {
                         return Err(LiftError(Diag::bug([
                             "unimplemented calls with pointer args".into(),
                         ])));
@@ -776,9 +785,9 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             }
 
             &DataInstKind::Mem(MemOp::FuncLocalVar(mem_layout)) => {
-                let output_mem_accesses = self
-                    .lifter
-                    .require_mem_accesses_attr(func.at(data_inst_def.outputs[0]).decl().attrs)?;
+                let output_mem_accesses = self.lifter.require_mem_accesses_attr(
+                    bld.func_at(data_inst_def.outputs[0]).decl().attrs,
+                )?;
 
                 // HACK(eddyb) reusing the same functionality meant for globals.
                 let pointee_type = self.lifter.pointee_type_for_shape_and_accesses(
@@ -794,7 +803,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     },
                     spv::InstLowering::default(),
                 );
-                let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                let output_decl = bld.func.reborrow().at(data_inst_def.outputs[0]).decl();
                 output_decl.attrs = self.lifter.strip_mem_accesses_attr(output_decl.attrs);
                 output_decl.ty =
                     self.lifter.spv_ptr_type(AddrSpace::SpvStorageClass(wk.Function), pointee_type);
@@ -802,7 +811,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             }
             DataInstKind::QPtr(QPtrOp::HandleArrayIndex) => {
                 let (addr_space, layout) =
-                    self.type_of_val_as_spv_ptr_with_layout(func.at(data_inst_def.inputs[0]))?;
+                    self.type_of_val_as_spv_ptr_with_layout(bld.func_at(data_inst_def.inputs[0]))?;
                 let handle = match layout {
                     // FIXME(eddyb) standardize variant order in enum/match.
                     TypeLayout::HandleArray(handle, _) => handle,
@@ -823,7 +832,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 let mut data_inst_def = data_inst_def.clone();
                 data_inst_def.kind =
                     DataInstKind::SpvInst(wk.OpAccessChain.into(), spv::InstLowering::default());
-                let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                let output_decl = bld.func.reborrow().at(data_inst_def.outputs[0]).decl();
                 output_decl.attrs = self.lifter.strip_mem_accesses_attr(output_decl.attrs);
                 output_decl.ty = self.lifter.spv_ptr_type(addr_space, handle_type);
                 data_inst_def
@@ -831,16 +840,25 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             DataInstKind::QPtr(QPtrOp::BufferData) => {
                 let buf_ptr = data_inst_def.inputs[0];
                 let (addr_space, buf_layout) =
-                    self.type_of_val_as_spv_ptr_with_layout(func.at(buf_ptr))?;
+                    self.type_of_val_as_spv_ptr_with_layout(bld.func_at(buf_ptr))?;
 
                 let buf_data_layout = match buf_layout {
                     TypeLayout::Handle(shapes::Handle::Buffer(_, buf)) => TypeLayout::Concrete(buf),
                     _ => return Err(LiftError(Diag::bug(["non-Buffer pointee".into()]))),
                 };
 
+                // FIXME(eddyb) avoid the repeated call to `type_of`,
+                // maybe don't even replace the `QPtrOp::BufferData` instruction?
+                let data_inst_def = data_inst_def.clone();
+
+                let new_output_ty = bld.type_of(buf_ptr);
+                let output_decl = bld.func.reborrow().at(data_inst_def.outputs[0]).decl();
+                output_decl.ty = new_output_ty;
+
                 self.deferred_ptr_noops.insert(
                     data_inst_def.outputs[0],
                     DeferredPtrNoop {
+                        actually_noop: true,
                         output_pointer: buf_ptr,
                         output_pointer_addr_space: addr_space,
                         output_pointee_layout: buf_data_layout,
@@ -848,19 +866,12 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     },
                 );
 
-                // FIXME(eddyb) avoid the repeated call to `type_of_val`,
-                // maybe don't even replace the `QPtrOp::BufferData` instruction?
-                let data_inst_def = data_inst_def.clone();
-
-                let new_output_ty = type_of_val(buf_ptr);
-                let output_decl = func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
-                output_decl.ty = new_output_ty;
-
                 data_inst_def
             }
             &DataInstKind::QPtr(QPtrOp::BufferDynLen { fixed_base_size, dyn_unit_stride }) => {
                 let buf_ptr = data_inst_def.inputs[0];
-                let (_, buf_layout) = self.type_of_val_as_spv_ptr_with_layout(func.at(buf_ptr))?;
+                let (_, buf_layout) =
+                    self.type_of_val_as_spv_ptr_with_layout(bld.func_at(buf_ptr))?;
 
                 let buf_data_layout = match buf_layout {
                     TypeLayout::Handle(shapes::Handle::Buffer(_, buf)) => buf,
@@ -924,38 +935,66 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
                 let output_mem_accesses = self
                     .lifter
-                    .find_mem_accesses_attr(func.at(data_inst_def.outputs[0]).decl().attrs)
+                    .find_mem_accesses_attr(bld.func_at(data_inst_def.outputs[0]).decl().attrs)
                     .unwrap_or(&MemAccesses::Data(DataHapp::DEAD));
 
-                let mut func = func_at_data_inst.reborrow().at(());
+                let mut partial_offset = MaybeDynOffset::Const(0);
                 let (output_pointer, (output_pointer_addr_space, output_pointee_layout)) = self
                     .adjust_pointer_for_offset_and_accesses(
                         data_inst_def.inputs[0],
                         maybe_dyn_offset,
                         output_mem_accesses,
-                        None,
-                        func.reborrow(),
-                        insert_aux_data_inst,
+                        Some(&mut partial_offset),
+                        &mut bld,
                     )?;
-                // FIXME(eddyb) not being able to reuse the original `DataInst`
-                // is a bit ridiculous, but correctly doing that would complicate
-                // `adjust_pointer_for_offset_and_accesses` in general.
-                self.deferred_ptr_noops.insert(
-                    data_inst_def.outputs[0],
-                    DeferredPtrNoop {
-                        output_pointer,
-                        output_pointer_addr_space,
-                        output_pointee_layout,
-                        parent_region: self.parent_region.unwrap(),
-                    },
-                );
+
                 // FIXME(eddyb) avoid the repeated call to `type_of_val`,
                 // maybe don't even replace the original instruction?
-                data_inst_def.kind = QPtrOp::Offset(0).into();
-                data_inst_def.inputs = [output_pointer].into_iter().collect();
-                let new_output_ty = func.reborrow().freeze().at(output_pointer).type_of(cx);
-                let output_decl = func.at(data_inst_def.outputs[0]).decl();
-                output_decl.ty = new_output_ty;
+                (data_inst_def.kind, data_inst_def.inputs) = match partial_offset {
+                    MaybeDynOffset::Const(offset) => {
+                        (QPtrOp::Offset(offset).into(), [output_pointer].into_iter().collect())
+                    }
+                    MaybeDynOffset::Dyn { index, stride, array_max_size } => {
+                        (
+                            QPtrOp::DynOffset {
+                                stride,
+                                index_bounds: array_max_size
+                                    .and_then(|array_size| {
+                                        // FIXME(eddyb) replace this when the `std` method stabilizes.
+                                        let checked_exact_div =
+                                            |a: u32, b: u32| a.is_multiple_of(b).then(|| a / b);
+                                        checked_exact_div(array_size, stride.get())?.try_into().ok()
+                                    })
+                                    .map(|array_len| 0..array_len),
+                            }
+                            .into(),
+                            [output_pointer, index].into_iter().collect(),
+                        )
+                    }
+                };
+
+                if partial_offset == MaybeDynOffset::Const(0) || true {
+                    if partial_offset == MaybeDynOffset::Const(0) {
+                        let new_output_ty = bld.type_of(output_pointer);
+                        let output_decl = bld.func.reborrow().at(data_inst_def.outputs[0]).decl();
+                        output_decl.ty = new_output_ty;
+                    }
+
+                    // FIXME(eddyb) not being able to reuse the original `DataInst`
+                    // is a bit ridiculous, but correctly doing that would complicate
+                    // `adjust_pointer_for_offset_and_accesses` in general.
+                    self.deferred_ptr_noops.insert(
+                        data_inst_def.outputs[0],
+                        DeferredPtrNoop {
+                            actually_noop: partial_offset == MaybeDynOffset::Const(0),
+                            output_pointer,
+                            output_pointer_addr_space,
+                            output_pointee_layout,
+                            parent_region: self.parent_region.unwrap(),
+                        },
+                    );
+                }
+
                 data_inst_def
             }
             DataInstKind::Mem(op @ (MemOp::Load { offset } | MemOp::Store { offset })) => {
@@ -970,9 +1009,41 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     }
                     _ => unreachable!(),
                 };
-                let access_type = stored_value
-                    .map_or_else(|| func.at(data_inst_def.outputs[0]).decl().ty, type_of_val);
+                let access_type = stored_value.map_or_else(
+                    || bld.func_at(data_inst_def.outputs[0]).decl().ty,
+                    |v| bld.type_of(v),
+                );
                 let offset = *offset;
+
+                // This access may need to be split into two or more accesses,
+                // if it's not statically guaranteed to fit entirely within
+                // one single scalar (found in the pointee type, at the offset).
+                //
+                // HACK(eddyb) the tracking for "2+ sub-accesses" consists of:
+                // - `maybe_access_scalar`, indicating the next sub-access position
+                //   within the overall loaded/stored (`access_type`-typed) value
+                // - `loaded_partial_uint` (only for load `op`s), accumulating
+                //   an unsigned integer value (of the same width as `access_type`)
+                //   from previous sub-loads (i.e. before `maybe_access_scalar`)
+                //   (store `op`s are simpler, as they can instead repeatedly slice
+                //    the original `stored_value`, for every sub-store, as needed)
+                let mut maybe_access_scalar = access_type.as_scalar(cx).and_then(|ty| {
+                    Some(ScalarBitSlice {
+                        ty,
+                        width: scalar::IntWidth::try_from_bits(match ty {
+                            // HACK(eddyb) this treats booleans as integers,
+                            // sized by the `LayoutConfig`, at the cost of
+                            // introducing conversion complications later.
+                            scalar::Type::Bool => {
+                                self.lifter.layout_cache.config.abstract_bool_size_align.0 * 8
+                            }
+                            _ => ty.bit_width(),
+                        })?,
+                        bit_offset: Value::Const(cx.intern(scalar::Const::from_u32(0))),
+                        bit_offset_bounds: 0..=0,
+                    })
+                });
+                let mut partially_loaded_uint = None;
 
                 // FIXME(eddyb) this is awkward (or at least its needs DRY-ing)
                 // because only an approximation is needed, most checks are
@@ -992,7 +1063,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     TypeLayout::Concrete(concrete) => {
                         let ty = concrete.original_type;
                         // HACK(eddyb) shrink scalar accesses to mere bytes.
-                        let (approx_ty, approx_size) = if ty.as_scalar(cx).is_some() {
+                        let (approx_ty, approx_size) = if maybe_access_scalar.is_some() {
                             (cx.intern(scalar::Type::UInt(scalar::IntWidth::I8)), Some(1))
                         } else {
                             (
@@ -1009,23 +1080,85 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     }
                 };
 
-                let mut func = func_at_data_inst.reborrow().at(());
-                let mut partial_offset = MaybeDynOffset::Const(0);
-                let (adjusted_ptr, (_, adjusted_pointee_layout)) = self
-                    .adjust_pointer_for_offset_and_accesses(
-                        data_inst_def.inputs[0],
-                        MaybeDynOffset::Const(offset.map_or(0, |o| o.get())),
-                        &approx_mem_accesses,
-                        Some(&mut partial_offset),
-                        func.reborrow(),
-                        insert_aux_data_inst,
-                    )?;
+                loop {
+                    let offset = {
+                        // FIXME(eddyb) implement big-endian accesses.
+                        assert!(!self.lifter.layout_cache.config.is_big_endian);
 
-                let partial_bit_offset = match partial_offset {
-                    // FIXME(eddyb) can negative offsets make sense here?
-                    MaybeDynOffset::Const(offset) => Value::Const(
-                        cx.intern(scalar::Const::from_u32(
-                            offset
+                        let initial_offset = MaybeDynOffset::Const(offset.map_or(0, |o| o.get()));
+                        let extra_offset = maybe_access_scalar.as_mut().map(|access_scalar| {
+                            if let Value::Const(bit_offset) = access_scalar.bit_offset
+                                && let Some(bit_offset) =
+                                    bit_offset.as_scalar(cx).and_then(|ct| ct.int_as_u32())
+                            {
+                                assert!(
+                                    bit_offset.is_multiple_of(8)
+                                        && bit_offset < access_scalar.width.bits()
+                                );
+                                return MaybeDynOffset::Const((bit_offset / 8).try_into().unwrap());
+                            }
+
+                            // HACK(eddyb) avoid potentially out-of-bounds "0 bit"
+                            // accesses from `bit_offset` being (dynamically)
+                            // equal to the bit width of the whole access,
+                            // by wrapping the (otherwise useless) last sub-access
+                            // back around the overlap with the first sub-access.
+                            let bit_offset_ty = bld.type_of(access_scalar.bit_offset);
+                            let bit_offset_scalar_ty = bit_offset_ty.as_scalar(cx).unwrap();
+                            let wrapped_bit_offset = bld.scalar_op(
+                                scalar::IntBinOp::And,
+                                [
+                                    access_scalar.bit_offset,
+                                    Value::Const(cx.intern(scalar::Const::from_bits(
+                                        bit_offset_scalar_ty,
+                                        (access_scalar.width.bits() - 1).into(),
+                                    ))),
+                                ],
+                                bit_offset_ty,
+                            );
+                            access_scalar.bit_offset = wrapped_bit_offset;
+                            MaybeDynOffset::Dyn {
+                                index: bld.scalar_op(
+                                    scalar::IntBinOp::DivU,
+                                    [
+                                        wrapped_bit_offset,
+                                        Value::Const(cx.intern(scalar::Const::from_bits(
+                                            bit_offset_scalar_ty,
+                                            8,
+                                        ))),
+                                    ],
+                                    bit_offset_ty,
+                                ),
+                                stride: NonZeroU32::new(1).unwrap(),
+                                array_max_size: Some(access_scalar.bit_offset_bounds.end() / 8),
+                            }
+                        });
+                        bld.offset_add(
+                            initial_offset,
+                            extra_offset.unwrap_or(MaybeDynOffset::Const(0)),
+                        )?
+                    };
+
+                    let mut partial_offset = MaybeDynOffset::Const(0);
+                    let (adjusted_ptr, (_, adjusted_pointee_layout)) = self
+                        .adjust_pointer_for_offset_and_accesses(
+                            data_inst_def.inputs[0],
+                            offset,
+                            &approx_mem_accesses,
+                            Some(&mut partial_offset),
+                            &mut bld,
+                        )?;
+
+                    // FIXME(eddyb) consider zeroing out `partial_offset` when
+                    // `maybe_access_scalar` has a non-zero `bit_offset` itself,
+                    // as even a dynamic `partial_offset` will end up being
+                    // zero due to `offset` having been already rounded up to
+                    // just after the memory scalar of the previous sub-access.
+
+                    let (partial_bit_offset, partial_bit_offset_bounds) = match partial_offset {
+                        // FIXME(eddyb) can negative offsets make sense here?
+                        MaybeDynOffset::Const(offset) => {
+                            let bit_offset = offset
                                 .checked_mul(8)
                                 .and_then(|bit_offset| bit_offset.try_into().ok())
                                 .ok_or_else(|| {
@@ -1033,556 +1166,373 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                                         "unsupported negative offset `{offset}`"
                                     )
                                     .into()]))
-                                })?,
-                        )),
-                    ),
-                    MaybeDynOffset::Dyn { index, stride, .. } => {
-                        let index_ty = func.reborrow().freeze().at(index).type_of(cx);
-                        let stride_in_bits = cx.intern(
-                            index_ty
-                                .as_scalar(cx)
-                                .and_then(|index_ty| {
-                                    scalar::Const::int_try_from_i128(
-                                        index_ty,
-                                        i128::from(stride.get()).checked_mul(8).unwrap(),
-                                    )
-                                })
-                                .ok_or_else(|| {
-                                    LiftError(Diag::bug([
+                                })?;
+                            (
+                                Value::Const(cx.intern(scalar::Const::from_u32(bit_offset))),
+                                bit_offset..=bit_offset,
+                            )
+                        }
+                        MaybeDynOffset::Dyn { index, stride, array_max_size } => {
+                            let index_ty = bld.type_of(index);
+                            let stride_in_bits =
+                                cx.intern(
+                                    index_ty
+                                        .as_scalar(cx)
+                                        .and_then(|index_ty| {
+                                            scalar::Const::int_try_from_i128(
+                                                index_ty,
+                                                i128::from(stride.get()).checked_mul(8).unwrap(),
+                                            )
+                                        })
+                                        .ok_or_else(|| {
+                                            LiftError(Diag::bug([
                                         format!("`{stride} * 8` not representable in index type `")
                                             .into(),
                                         index_ty.into(),
                                         "`".into(),
                                     ]))
-                                })?,
-                        );
+                                        })?,
+                                );
 
-                        let bit_offset_inst = insert_aux_data_inst(
-                            self,
-                            func.reborrow(),
-                            DataInstDef {
-                                attrs: Default::default(),
-                                kind: DataInstKind::Scalar(scalar::IntBinOp::Mul.into()),
-                                inputs: [index, Value::Const(stride_in_bits)].into_iter().collect(),
-                                child_regions: [].into_iter().collect(),
-                                outputs: [].into_iter().collect(),
-                            },
-                        );
+                            let bit_offset = bld.scalar_op(
+                                scalar::IntBinOp::Mul,
+                                [index, Value::Const(stride_in_bits)],
+                                index_ty,
+                            );
 
-                        let bit_offset_output_var = func.vars.define(
-                            cx,
-                            VarDecl {
-                                attrs: Default::default(),
-                                ty: index_ty,
-                                def_parent: Either::Right(bit_offset_inst),
-                                def_idx: 0,
-                            },
-                        );
-                        func.nodes[bit_offset_inst].outputs.push(bit_offset_output_var);
-
-                        Value::Var(bit_offset_output_var)
-                    }
-                };
-
-                // FIXME(eddyb) implement at least same-size bitcasting
-                // (more generally, accesses should be {de,re}composed).
-                let pointee_type = match adjusted_pointee_layout {
-                    TypeLayout::Handle(shapes::Handle::Opaque(ty)) => ty,
-                    TypeLayout::Concrete(concrete) => concrete.original_type,
-                    _ => unreachable!(),
-                };
-
-                // HACK(eddyb) avoids using too many tuples.
-                #[derive(Copy, Clone)]
-                struct BitWrangle {
-                    pointee_scalar_type: scalar::Type,
-                    pointee_uint_width: scalar::IntWidth,
-
-                    access_scalar_type: scalar::Type,
-                    access_scalar_width: scalar::IntWidth,
-
-                    access_bit_offset_in_pointee: Value,
-                }
-                let valid_bitwrangling_access =
-                    (pointee_type != access_type).then_some(()).and_then(|()| {
-                        let pointee_scalar_type = pointee_type.as_scalar(cx)?;
-                        let access_scalar_type = access_type.as_scalar(cx)?;
-
-                        // HACK(eddyb) the simplest case to support requires
-                        // unsigned integers (to allow zext w/o a bitcast).
-                        let pointee_uint_width = match pointee_scalar_type {
-                            scalar::Type::UInt(w) => w,
-                            _ => return None,
-                        };
-
-                        let access_scalar_width =
-                            scalar::IntWidth::try_from_bits(match access_scalar_type {
-                                // HACK(eddyb) this treats booleans as integers,
-                                // sized by the `LayoutConfig`, at the cost of
-                                // introducing conversion complications later.
-                                scalar::Type::Bool => {
-                                    self.lifter.layout_cache.config.abstract_bool_size_align.1 * 8
-                                }
-                                _ => access_scalar_type.bit_width(),
-                            })
-                            .filter(|&w| w <= pointee_uint_width)?;
-
-                        let le_bit_offset = partial_bit_offset;
-                        let access_bit_offset_in_pointee =
-                            if self.lifter.layout_cache.config.is_big_endian {
-                                // FIXME(eddyb) support big-endian w/ dynamic offset
-                                let le_bit_offset = match le_bit_offset {
-                                    Value::Const(ct) => ct.as_scalar(cx)?.int_as_u32()?,
-                                    Value::Var(_) => return None,
-                                };
-                                Value::Const(cx.intern(scalar::Const::from_u32(
-                                    pointee_uint_width.bits()
-                                        - access_scalar_width.bits()
-                                        - le_bit_offset,
-                                )))
-                            } else {
-                                le_bit_offset
+                            let pointee_layout = match &adjusted_pointee_layout {
+                                TypeLayout::Concrete(concrete) => concrete.mem_layout,
+                                _ => unreachable!(),
                             };
+                            let pointee_size = pointee_layout
+                                .dyn_unit_stride
+                                .is_none()
+                                .then_some(pointee_layout.fixed_base.size);
 
-                        Some(BitWrangle {
-                            pointee_scalar_type,
-                            pointee_uint_width,
-                            access_scalar_type,
-                            access_scalar_width,
-                            access_bit_offset_in_pointee,
-                        })
-                    });
-
-                if pointee_type != access_type && valid_bitwrangling_access.is_none() {
-                    return Err(LiftError(Diag::bug([
-                        "expected access type `".into(),
-                        access_type.into(),
-                        "` not found in pointee type layout (found leaf: `".into(),
-                        pointee_type.into(),
-                        "`)".into(),
-                    ])));
-                }
-
-                let Some(bw) = valid_bitwrangling_access else {
-                    data_inst_def.kind = access_op.into();
-                    data_inst_def.inputs[0] = adjusted_ptr;
-
-                    return Ok(Transformed::Changed(data_inst_def));
-                };
-
-                let is_partial = bw.pointee_uint_width > bw.access_scalar_width;
-
-                let inst_for_access_type_to_uint = |v, uint_ty| {
-                    match bw.access_scalar_type {
-                        // FIXME(eddyb) consider using a SPIR-T `Select` node.
-                        scalar::Type::Bool => (
-                            DataInstKind::SpvInst(wk.OpSelect.into(), spv::InstLowering::default()),
-                            [v].into_iter()
-                                .chain([true, false].map(|b| {
-                                    Value::Const(
-                                        cx.intern(scalar::Const::from_bits(uint_ty, b as u128)),
-                                    )
-                                }))
-                                .collect(),
-                        ),
-                        // FIXME(eddyb) SPIR-T should have its own bitcast.
-                        // FIXME(eddyb) try avoiding noop `OpBitcast`s.
-                        _ => (
-                            DataInstKind::SpvInst(
-                                wk.OpBitcast.into(),
-                                spv::InstLowering::default(),
-                            ),
-                            [v].into_iter().collect(),
-                        ),
-                    }
-                };
-                let inst_for_int_to_access_type = |v, int_ty| {
-                    match bw.access_scalar_type {
-                        scalar::Type::Bool => (
-                            scalar::Op::IntBinary(scalar::IntBinOp::Ne).into(),
-                            [v, Value::Const(cx.intern(scalar::Const::from_bits(int_ty, 0)))]
+                            // HACK(eddyb) intersect partial offset's 3 constraints:
+                            // - must be less than `array_max_size`
+                            // - must be less than the pointee's own size
+                            //   (i.e. the access overlaps *at least* one pointee byte)
+                            // - must be a multiple of `stride`
+                            let max_partial_offset = [pointee_size, array_max_size]
                                 .into_iter()
-                                .collect(),
-                        ),
-                        // FIXME(eddyb) SPIR-T should have its own bitcast.
-                        // FIXME(eddyb) try avoiding noop `OpBitcast`s.
-                        _ => (
-                            DataInstKind::SpvInst(
-                                wk.OpBitcast.into(),
-                                spv::InstLowering::default(),
-                            ),
-                            [v].into_iter().collect(),
-                        ),
-                    }
-                };
+                                .flatten()
+                                .reduce(|a, b| a.min(b))
+                                .map(|size| size.saturating_sub(1) / stride * stride.get());
 
-                // NOTE(eddyb) all partial accesses require loading the whole
-                // pointee value, even when storing (as the store must combine
-                // both the old pointee value and the newly stored value).
-                let loaded_pointee = (stored_value.is_none() || is_partial).then(|| {
-                    let load_pointee_inst = insert_aux_data_inst(
-                        self,
-                        func.reborrow(),
-                        DataInstDef {
-                            attrs: Default::default(),
-                            kind: DataInstKind::Mem(MemOp::Load { offset: None }),
-                            inputs: [adjusted_ptr].into_iter().collect(),
-                            child_regions: [].into_iter().collect(),
-                            outputs: [].into_iter().collect(),
-                        },
-                    );
-                    let loaded_pointee = func.vars.define(
-                        cx,
-                        VarDecl {
-                            attrs: Default::default(),
-                            ty: pointee_type,
-                            def_parent: Either::Right(load_pointee_inst),
-                            def_idx: 0,
-                        },
-                    );
-                    func.nodes[load_pointee_inst].outputs.push(loaded_pointee);
-                    Value::Var(loaded_pointee)
-                });
-
-                let loaded_pointee = match (loaded_pointee, stored_value) {
-                    // HACK(eddyb) handled below (unify)?
-                    (Some(loaded_pointee), _) if is_partial => loaded_pointee,
-
-                    (Some(loaded_pointee), None) => {
-                        assert!(!is_partial);
-
-                        // FIXME(eddyb) SPIR-T should have its own bitcast.
-                        (data_inst_def.kind, data_inst_def.inputs) =
-                            inst_for_int_to_access_type(loaded_pointee, bw.pointee_scalar_type);
-                        return Ok(Transformed::Changed(data_inst_def));
-                    }
-                    (None, Some(stored_value)) => {
-                        assert!(!is_partial);
-
-                        let (cast_kind, cast_inputs) =
-                            inst_for_access_type_to_uint(stored_value, bw.pointee_scalar_type);
-                        let cast_stored_value_inst = insert_aux_data_inst(
-                            self,
-                            func.reborrow(),
-                            DataInstDef {
-                                attrs: Default::default(),
-                                kind: cast_kind,
-                                inputs: cast_inputs,
-                                child_regions: [].into_iter().collect(),
-                                outputs: [].into_iter().collect(),
-                            },
-                        );
-                        let cast_stored_value = func.vars.define(
-                            cx,
-                            VarDecl {
-                                attrs: Default::default(),
-                                ty: pointee_type,
-                                def_parent: Either::Right(cast_stored_value_inst),
-                                def_idx: 0,
-                            },
-                        );
-                        func.nodes[cast_stored_value_inst].outputs.push(cast_stored_value);
-
-                        data_inst_def.kind = access_op.into();
-                        data_inst_def.inputs[0] = adjusted_ptr;
-                        data_inst_def.inputs[1] = Value::Var(cast_stored_value);
-
-                        return Ok(Transformed::Changed(data_inst_def));
-                    }
-                    (None, None) | (Some(_), Some(_)) => unreachable!(),
-                };
-
-                // FIXME(eddyb) unify this with the logic above?
-                assert!(is_partial);
-                let new_kind_and_inputs = if let Some(stored_value) = stored_value {
-                    let shl_amount = bw.access_bit_offset_in_pointee;
-                    let const_shl_amount = match shl_amount {
-                        Value::Const(ct) => ct.as_scalar(cx).and_then(|ct| ct.int_as_u32()),
-                        Value::Var(_) => None,
-                    };
-
-                    // FIXME(eddyb) consider adding a method for this on `IntWidth`.
-                    let mask = |w: scalar::IntWidth| !0u128 >> (128 - w.bits());
-
-                    let partial_hole_mask = if let Some(shl_amount) = const_shl_amount {
-                        Value::Const(cx.intern(scalar::Const::from_bits(
-                            bw.pointee_scalar_type,
-                            mask(bw.pointee_uint_width)
-                                & !(mask(bw.access_scalar_width) << shl_amount),
-                        )))
-                    } else {
-                        let partial_mask_inst = insert_aux_data_inst(
-                            self,
-                            func.reborrow(),
-                            DataInstDef {
-                                attrs: Default::default(),
-                                kind: scalar::Op::IntBinary(scalar::IntBinOp::Shl).into(),
-                                inputs: [
-                                    Value::Const(cx.intern(scalar::Const::from_bits(
-                                        bw.pointee_scalar_type,
-                                        mask(bw.access_scalar_width),
-                                    ))),
-                                    shl_amount,
-                                ]
-                                .into_iter()
-                                .collect(),
-                                child_regions: [].into_iter().collect(),
-                                outputs: [].into_iter().collect(),
-                            },
-                        );
-                        let partial_mask = func.vars.define(
-                            cx,
-                            VarDecl {
-                                attrs: Default::default(),
-                                ty: pointee_type,
-                                def_parent: Either::Right(partial_mask_inst),
-                                def_idx: 0,
-                            },
-                        );
-                        func.nodes[partial_mask_inst].outputs.push(partial_mask);
-
-                        let partial_hole_mask_inst = insert_aux_data_inst(
-                            self,
-                            func.reborrow(),
-                            DataInstDef {
-                                attrs: Default::default(),
-                                kind: scalar::Op::IntUnary(scalar::IntUnOp::Not).into(),
-                                inputs: [Value::Var(partial_mask)].into_iter().collect(),
-                                child_regions: [].into_iter().collect(),
-                                outputs: [].into_iter().collect(),
-                            },
-                        );
-                        let partial_hole_mask = func.vars.define(
-                            cx,
-                            VarDecl {
-                                attrs: Default::default(),
-                                ty: pointee_type,
-                                def_parent: Either::Right(partial_hole_mask_inst),
-                                def_idx: 0,
-                            },
-                        );
-                        func.nodes[partial_hole_mask_inst].outputs.push(partial_hole_mask);
-
-                        Value::Var(partial_hole_mask)
-                    };
-
-                    let mask_loaded_pointee_inst = insert_aux_data_inst(
-                        self,
-                        func.reborrow(),
-                        DataInstDef {
-                            attrs: Default::default(),
-                            kind: scalar::Op::IntBinary(scalar::IntBinOp::And).into(),
-                            inputs: [loaded_pointee, partial_hole_mask].into_iter().collect(),
-                            child_regions: [].into_iter().collect(),
-                            outputs: [].into_iter().collect(),
-                        },
-                    );
-                    let masked_loaded_pointee = func.vars.define(
-                        cx,
-                        VarDecl {
-                            attrs: Default::default(),
-                            ty: pointee_type,
-                            def_parent: Either::Right(mask_loaded_pointee_inst),
-                            def_idx: 0,
-                        },
-                    );
-                    func.nodes[mask_loaded_pointee_inst].outputs.push(masked_loaded_pointee);
-
-                    let zext_input_scalar_ty = match bw.access_scalar_type {
-                        scalar::Type::SInt(_) => scalar::Type::SInt(bw.access_scalar_width),
-                        scalar::Type::Bool | scalar::Type::UInt(_) | scalar::Type::Float(_) => {
-                            scalar::Type::UInt(bw.access_scalar_width)
+                            (
+                                bit_offset,
+                                0..=max_partial_offset
+                                    .and_then(|o| o.checked_mul(8))
+                                    .unwrap_or(u32::MAX),
+                            )
                         }
                     };
-                    let zext_input_ty = cx.intern(zext_input_scalar_ty);
-                    let zext_input = if zext_input_ty == access_type {
-                        stored_value
-                    } else {
-                        let (kind, inputs) =
-                            inst_for_access_type_to_uint(stored_value, zext_input_scalar_ty);
-                        let cast_stored_value_inst = insert_aux_data_inst(
-                            self,
-                            func.reborrow(),
-                            DataInstDef {
-                                attrs: Default::default(),
-                                kind,
-                                inputs,
-                                child_regions: [].into_iter().collect(),
-                                outputs: [].into_iter().collect(),
-                            },
-                        );
-                        let cast_stored_value = func.vars.define(
-                            cx,
-                            VarDecl {
-                                attrs: Default::default(),
-                                ty: zext_input_ty,
-                                def_parent: Either::Right(cast_stored_value_inst),
-                                def_idx: 0,
-                            },
-                        );
-                        func.nodes[cast_stored_value_inst].outputs.push(cast_stored_value);
-                        Value::Var(cast_stored_value)
-                    };
-                    let zext_stored_value_inst = insert_aux_data_inst(
-                        self,
-                        func.reborrow(),
-                        DataInstDef {
-                            attrs: Default::default(),
-                            kind: scalar::Op::IntUnary(scalar::IntUnOp::TruncOrZeroExtend).into(),
-                            inputs: [zext_input].into_iter().collect(),
-                            child_regions: [].into_iter().collect(),
-                            outputs: [].into_iter().collect(),
-                        },
-                    );
-                    let zext_stored_value = func.vars.define(
-                        cx,
-                        VarDecl {
-                            attrs: Default::default(),
-                            ty: pointee_type,
-                            def_parent: Either::Right(zext_stored_value_inst),
-                            def_idx: 0,
-                        },
-                    );
-                    func.nodes[zext_stored_value_inst].outputs.push(zext_stored_value);
 
-                    let shifted_left_stored_value = if let Value::Const(shl_amount) = shl_amount
-                        && shl_amount.as_scalar(cx).and_then(|ct| ct.int_as_u32()) == Some(0)
-                    {
-                        zext_stored_value
+                    let mem_type = match adjusted_pointee_layout {
+                        TypeLayout::Handle(shapes::Handle::Opaque(ty)) => ty,
+                        TypeLayout::Concrete(concrete) => concrete.original_type,
+                        _ => unreachable!(),
+                    };
+
+                    let simple_direct_access = mem_type == access_type
+                        && maybe_access_scalar
+                            .as_ref()
+                            .is_none_or(|access_scalar| access_scalar.bit_offset_bounds == (0..=0))
+                        && partial_bit_offset_bounds == (0..=0);
+
+                    if simple_direct_access {
+                        data_inst_def.kind = access_op.into();
+                        data_inst_def.inputs[0] = adjusted_ptr;
+
+                        return Ok(Transformed::Changed(data_inst_def));
+                    }
+
+                    let (mem_uint, access_scalar) = (!simple_direct_access)
+                        .then_some(())
+                        .and_then(|()| {
+                            let mem_scalar_type = mem_type.as_scalar(cx)?;
+
+                            // HACK(eddyb) the simplest case to support requires
+                            // unsigned integers (to allow zext w/o a bitcast).
+                            let mem_uint_width = match mem_scalar_type {
+                                scalar::Type::UInt(w) => w,
+                                _ => return None,
+                            };
+
+                            let access_scalar = maybe_access_scalar.as_mut()?;
+
+                            let (le_bit_offset, le_bit_offset_bounds) =
+                                (partial_bit_offset, partial_bit_offset_bounds.clone());
+                            let (mem_uint_bit_offset, mem_uint_bit_offset_bounds) =
+                                if self.lifter.layout_cache.config.is_big_endian {
+                                    // FIXME(eddyb) support big-endian w/ dynamic offset.
+                                    // FIXME(eddyb) the logic below doesn't even
+                                    // seem to support larger accesses.
+                                    let le_bit_offset = match le_bit_offset {
+                                        Value::Const(ct) => ct.as_scalar(cx)?.int_as_u32()?,
+                                        Value::Var(_) => return None,
+                                    };
+                                    let be_bit_offset = mem_uint_width
+                                        .bits()
+                                        .checked_sub(access_scalar.width.bits())?
+                                        .checked_sub(le_bit_offset)?;
+                                    (
+                                        Value::Const(
+                                            cx.intern(scalar::Const::from_u32(be_bit_offset)),
+                                        ),
+                                        be_bit_offset..=be_bit_offset,
+                                    )
+                                } else {
+                                    (le_bit_offset, le_bit_offset_bounds)
+                                };
+
+                            Some((
+                                ScalarBitSlice {
+                                    ty: mem_scalar_type,
+                                    width: mem_uint_width,
+                                    bit_offset: mem_uint_bit_offset,
+                                    bit_offset_bounds: mem_uint_bit_offset_bounds,
+                                },
+                                access_scalar,
+                            ))
+                        })
+                        .ok_or_else(|| {
+                            LiftError(Diag::bug([
+                                "expected access type `".into(),
+                                access_type.into(),
+                                "` not found in pointee type layout (found leaf: `".into(),
+                                mem_type.into(),
+                                "`)".into(),
+                            ]))
+                        })?;
+
+                    // FIXME(eddyb) fix the naming/terminology here.
+                    let access_scalar_for_next_subaccess = {
+                        // FIXME(eddyb) implement big-endian accesses.
+                        assert!(!self.lifter.layout_cache.config.is_big_endian);
+
+                        // FIXME(eddyb) consider zeroing out `mem_uint.bit_offset`
+                        // when `access_scalar.bit_offset` itself isn't zero.
+                        let mem_bit_offset_bounds = if access_scalar.bit_offset_bounds != (0..=0) {
+                            0..=0
+                        } else {
+                            mem_uint.bit_offset_bounds.clone()
+                        };
+                        let next_bit_offset_bounds = {
+                            let prev_bounds = &access_scalar.bit_offset_bounds;
+                            let [start, end] = [
+                                (prev_bounds.start(), mem_bit_offset_bounds.end()),
+                                (prev_bounds.end(), mem_bit_offset_bounds.start()),
+                            ]
+                            .map(|(prev_bound, &bit_offset_bound)| {
+                                let extra =
+                                    mem_uint.width.bits().checked_sub(bit_offset_bound).unwrap();
+                                prev_bound
+                                    .checked_add(extra)
+                                    .unwrap()
+                                    .min(access_scalar.width.bits())
+                            });
+                            start..=end
+                        };
+
+                        if *next_bit_offset_bounds.start() == access_scalar.width.bits() {
+                            None
+                        } else {
+                            // FIXME(eddyb) use const-folding to avoid this special-case.
+                            let subaccess_width = if let Value::Const(mem_bit_offset) =
+                                mem_uint.bit_offset
+                                && let Some(mem_bit_offset) =
+                                    mem_bit_offset.as_scalar(cx).and_then(|ct| ct.int_as_u32())
+                            {
+                                Value::Const(cx.intern(scalar::Const::from_u32(
+                                    mem_uint.width.bits().checked_sub(mem_bit_offset).unwrap(),
+                                )))
+                            } else {
+                                let mem_bit_offset_ty = bld.type_of(mem_uint.bit_offset);
+                                let mem_bit_offset_scalar_ty =
+                                    mem_bit_offset_ty.as_scalar(cx).unwrap();
+                                bld.scalar_op(
+                                    scalar::IntBinOp::Sub,
+                                    [
+                                        Value::Const(cx.intern(scalar::Const::from_bits(
+                                            mem_bit_offset_scalar_ty,
+                                            mem_uint.width.bits().into(),
+                                        ))),
+                                        mem_uint.bit_offset,
+                                    ],
+                                    mem_bit_offset_ty,
+                                )
+                            };
+                            // FIXME(eddyb) use const-folding to avoid this special-case.
+                            let next_bit_offset =
+                                if let (Value::Const(bit_offset), Value::Const(subaccess_width)) =
+                                    (access_scalar.bit_offset, subaccess_width)
+                                    && let Some(bit_offset) =
+                                        bit_offset.as_scalar(cx).and_then(|ct| ct.int_as_u32())
+                                    && let Some(subaccess_width) =
+                                        subaccess_width.as_scalar(cx).and_then(|ct| ct.int_as_u32())
+                                {
+                                    Value::Const(cx.intern(scalar::Const::from_u32(
+                                        bit_offset.checked_add(subaccess_width).unwrap(),
+                                    )))
+                                } else {
+                                    let bit_offset_ty = bld.type_of(access_scalar.bit_offset);
+                                    bld.scalar_op(
+                                        scalar::IntBinOp::Add,
+                                        [access_scalar.bit_offset, subaccess_width],
+                                        bit_offset_ty,
+                                    )
+                                };
+                            Some(ScalarBitSlice {
+                                bit_offset: next_bit_offset,
+                                bit_offset_bounds: next_bit_offset_bounds,
+                                ..access_scalar.clone()
+                            })
+                        }
+                    };
+
+                    let new_kind_and_inputs = if let Some(stored_value) = stored_value {
+                        let merged_value = bld.bit_sliced_update(
+                            |rax| rax.op(MemOp::Load { offset: None }, [adjusted_ptr], mem_type),
+                            mem_uint.clone(),
+                            stored_value,
+                            access_scalar.clone(),
+                        );
+                        let (store_op, store_inputs) =
+                            (MemOp::Store { offset: None }, [adjusted_ptr, merged_value]);
+
+                        // FIXME(eddyb) dedup with the load side?
+                        if let Some(access_scalar_for_next_subaccess) =
+                            access_scalar_for_next_subaccess
+                        {
+                            bld.op_without_output(store_op, store_inputs);
+                            *access_scalar = access_scalar_for_next_subaccess;
+                            continue;
+                        }
+
+                        (store_op.into(), store_inputs.into_iter().collect())
                     } else {
-                        let shl_stored_value_inst = insert_aux_data_inst(
-                            self,
-                            func.reborrow(),
-                            DataInstDef {
-                                attrs: Default::default(),
-                                kind: scalar::Op::IntBinary(scalar::IntBinOp::Shl).into(),
-                                inputs: [Value::Var(zext_stored_value), shl_amount]
+                        let raw_load =
+                            bld.op(MemOp::Load { offset: None }, [adjusted_ptr], mem_type);
+
+                        let sliced_load = bld.scalar_op(
+                            scalar::IntBinOp::ShrU,
+                            [raw_load, mem_uint.bit_offset],
+                            mem_type,
+                        );
+
+                        let needs_multiple_loads = partially_loaded_uint.is_some()
+                            || access_scalar_for_next_subaccess.is_some();
+
+                        let complete_loaded_uint = if needs_multiple_loads {
+                            let access_uint_ty = cx.intern(scalar::Type::UInt(access_scalar.width));
+                            let sliced_load_as_uint = bld.scalar_op(
+                                scalar::IntUnOp::TruncOrZeroExtend,
+                                [sliced_load],
+                                access_uint_ty,
+                            );
+                            // FIXME(eddyb) consider using `bit_sliced_update`?
+                            let sliced_load_at_access_offset = bld.scalar_op(
+                                scalar::IntBinOp::Shl,
+                                [sliced_load_as_uint, access_scalar.bit_offset],
+                                access_uint_ty,
+                            );
+                            // FIXME(eddyb) use auto-simplification to avoid this special-case.
+                            // HACK(eddyb) using `Iterator::reduce` to keep this short.
+                            let merged_loaded_uint =
+                                [partially_loaded_uint, Some(sliced_load_at_access_offset)]
+                                    .into_iter()
+                                    .flatten()
+                                    .reduce(|a, b| {
+                                        bld.scalar_op(scalar::IntBinOp::Or, [a, b], access_uint_ty)
+                                    })
+                                    .unwrap();
+
+                            // FIXME(eddyb) dedup with the store side?
+                            if let Some(access_scalar_for_next_subaccess) =
+                                access_scalar_for_next_subaccess
+                            {
+                                partially_loaded_uint = Some(merged_loaded_uint);
+                                *access_scalar = access_scalar_for_next_subaccess;
+                                continue;
+                            }
+
+                            merged_loaded_uint
+                        } else {
+                            sliced_load
+                        };
+
+                        let complete_loaded_uint_ty = bld.type_of(complete_loaded_uint);
+                        let complete_loaded_uint_scalar_ty =
+                            complete_loaded_uint_ty.as_scalar(cx).unwrap();
+                        match access_scalar.ty {
+                            scalar::Type::Bool => {
+                                let bool_mask = Value::Const(cx.intern(scalar::Const::from_bits(
+                                    complete_loaded_uint_scalar_ty,
+                                    !0u128 >> (128 - access_scalar.width.bits()),
+                                )));
+                                let masked_loaded_uint = bld.scalar_op(
+                                    scalar::IntBinOp::And,
+                                    [complete_loaded_uint, bool_mask],
+                                    complete_loaded_uint_ty,
+                                );
+
+                                (
+                                    scalar::Op::IntBinary(scalar::IntBinOp::Ne).into(),
+                                    [
+                                        masked_loaded_uint,
+                                        Value::Const(cx.intern(scalar::Const::from_bits(
+                                            complete_loaded_uint_scalar_ty,
+                                            0,
+                                        ))),
+                                    ]
                                     .into_iter()
                                     .collect(),
-                                child_regions: [].into_iter().collect(),
-                                outputs: [].into_iter().collect(),
-                            },
-                        );
-                        let shifted_left_stored_value = func.vars.define(
-                            cx,
-                            VarDecl {
-                                attrs: Default::default(),
-                                ty: pointee_type,
-                                def_parent: Either::Right(shl_stored_value_inst),
-                                def_idx: 0,
-                            },
-                        );
-                        func.nodes[shl_stored_value_inst].outputs.push(shifted_left_stored_value);
-                        shifted_left_stored_value
+                                )
+                            }
+                            scalar::Type::SInt(_)
+                                if access_scalar.width.bits()
+                                    != complete_loaded_uint_scalar_ty.bit_width() =>
+                            {
+                                (
+                                    scalar::Op::IntUnary(scalar::IntUnOp::TruncOrSignExtend).into(),
+                                    [complete_loaded_uint].into_iter().collect(),
+                                )
+                            }
+                            scalar::Type::UInt(_)
+                                if access_scalar.width.bits()
+                                    != complete_loaded_uint_scalar_ty.bit_width() =>
+                            {
+                                (
+                                    scalar::Op::IntUnary(scalar::IntUnOp::TruncOrZeroExtend).into(),
+                                    [complete_loaded_uint].into_iter().collect(),
+                                )
+                            }
+                            // FIXME(eddyb) don't resort to a bitcast for non-floats,
+                            // when the last `Or` of `complete_loaded_uint` could
+                            // instead take over the original load instruction.
+                            _ => {
+                                let trunc_output = bld.scalar_op(
+                                    scalar::IntUnOp::TruncOrZeroExtend,
+                                    [complete_loaded_uint],
+                                    cx.intern(scalar::Type::UInt(access_scalar.width)),
+                                );
+
+                                // FIXME(eddyb) SPIR-T should have its own bitcast.
+                                (
+                                    DataInstKind::SpvInst(
+                                        wk.OpBitcast.into(),
+                                        spv::InstLowering::default(),
+                                    ),
+                                    [trunc_output].into_iter().collect(),
+                                )
+                            }
+                        }
                     };
-
-                    let merge_values_inst = insert_aux_data_inst(
-                        self,
-                        func.reborrow(),
-                        DataInstDef {
-                            attrs: Default::default(),
-                            kind: scalar::Op::IntBinary(scalar::IntBinOp::Or).into(),
-                            inputs: [
-                                Value::Var(masked_loaded_pointee),
-                                Value::Var(shifted_left_stored_value),
-                            ]
-                            .into_iter()
-                            .collect(),
-                            child_regions: [].into_iter().collect(),
-                            outputs: [].into_iter().collect(),
-                        },
-                    );
-                    let merged_value = func.vars.define(
-                        cx,
-                        VarDecl {
-                            attrs: Default::default(),
-                            ty: pointee_type,
-                            def_parent: Either::Right(merge_values_inst),
-                            def_idx: 0,
-                        },
-                    );
-                    func.nodes[merge_values_inst].outputs.push(merged_value);
-
-                    (
-                        access_op.into(),
-                        [adjusted_ptr, Value::Var(merged_value)].into_iter().collect(),
-                    )
-                } else {
-                    let shr_amount = bw.access_bit_offset_in_pointee;
-                    let shifted_right_pointee = if let Value::Const(shr_amount) = shr_amount
-                        && shr_amount.as_scalar(cx).and_then(|ct| ct.int_as_u32()) == Some(0)
-                    {
-                        loaded_pointee
-                    } else {
-                        let shr_pointee_inst = insert_aux_data_inst(
-                            self,
-                            func.reborrow(),
-                            DataInstDef {
-                                attrs: Default::default(),
-                                kind: scalar::Op::IntBinary(scalar::IntBinOp::ShrU).into(),
-                                inputs: [loaded_pointee, shr_amount].into_iter().collect(),
-                                child_regions: [].into_iter().collect(),
-                                outputs: [].into_iter().collect(),
-                            },
-                        );
-                        let shifted_pointee = func.vars.define(
-                            cx,
-                            VarDecl {
-                                attrs: Default::default(),
-                                ty: pointee_type,
-                                def_parent: Either::Right(shr_pointee_inst),
-                                def_idx: 0,
-                            },
-                        );
-                        func.nodes[shr_pointee_inst].outputs.push(shifted_pointee);
-                        Value::Var(shifted_pointee)
-                    };
-
-                    // FIXME(eddyb) some of this seems extra roundabout.
-                    let (trunc_scalar_ty, trunc_op) = match bw.access_scalar_type {
-                        scalar::Type::SInt(_) => (
-                            scalar::Type::SInt(bw.access_scalar_width),
-                            scalar::Op::IntUnary(scalar::IntUnOp::TruncOrSignExtend),
-                        ),
-                        scalar::Type::Bool | scalar::Type::UInt(_) | scalar::Type::Float(_) => (
-                            scalar::Type::UInt(bw.access_scalar_width),
-                            scalar::Op::IntUnary(scalar::IntUnOp::TruncOrZeroExtend),
-                        ),
-                    };
-                    let (trunc_kind, trunc_inputs) =
-                        (trunc_op.into(), [shifted_right_pointee].into_iter().collect());
-                    let trunc_ty = cx.intern(trunc_scalar_ty);
-
-                    if trunc_ty == access_type {
-                        (trunc_kind, trunc_inputs)
-                    } else {
-                        let trunc_inst = insert_aux_data_inst(
-                            self,
-                            func.reborrow(),
-                            DataInstDef {
-                                attrs: Default::default(),
-                                kind: trunc_kind,
-                                inputs: trunc_inputs,
-                                child_regions: [].into_iter().collect(),
-                                outputs: [].into_iter().collect(),
-                            },
-                        );
-                        let trunc_output = func.vars.define(
-                            cx,
-                            VarDecl {
-                                attrs: Default::default(),
-                                ty: trunc_ty,
-                                def_parent: Either::Right(trunc_inst),
-                                def_idx: 0,
-                            },
-                        );
-                        func.nodes[trunc_inst].outputs.push(trunc_output);
-
-                        inst_for_int_to_access_type(Value::Var(trunc_output), trunc_scalar_ty)
-                    }
-                };
-                (data_inst_def.kind, data_inst_def.inputs) = new_kind_and_inputs;
-                data_inst_def
+                    (data_inst_def.kind, data_inst_def.inputs) = new_kind_and_inputs;
+                    break data_inst_def;
+                }
             }
             &DataInstKind::Mem(MemOp::Copy { size }) => {
                 let mut data_inst_def = data_inst_def.clone();
@@ -1593,6 +1543,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 // risks potentially losing the `flags`.
                 let kind = DataHappKind::Disjoint(Default::default());
 
+                let mut dst_partial_offset = MaybeDynOffset::Const(0);
                 let (dst_adjusted_ptr, (_, dst_adjusted_pointee_layout)) = self
                     .adjust_pointer_for_offset_and_accesses(
                         data_inst_def.inputs[0],
@@ -1602,11 +1553,11 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                             flags: DataHappFlags::COPY_DST,
                             kind: kind.clone(),
                         }),
-                        None,
-                        func_at_data_inst.reborrow().at(()),
-                        insert_aux_data_inst,
+                        Some(&mut dst_partial_offset),
+                        &mut bld,
                     )?;
 
+                let mut src_partial_offset = MaybeDynOffset::Const(0);
                 let (src_adjusted_ptr, (_, src_adjusted_pointee_layout)) = self
                     .adjust_pointer_for_offset_and_accesses(
                         data_inst_def.inputs[1],
@@ -1616,40 +1567,123 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                             flags: DataHappFlags::COPY_SRC,
                             kind: kind.clone(),
                         }),
-                        None,
-                        func_at_data_inst.reborrow().at(()),
-                        insert_aux_data_inst,
+                        Some(&mut src_partial_offset),
+                        &mut bld,
                     )?;
 
-                data_inst_def.inputs[0] = dst_adjusted_ptr;
-                data_inst_def.inputs[1] = src_adjusted_ptr;
+                // FIXME(eddyb) this feels inefficient but there's not really
+                // any way to maximize `adjust_pointer_for_offset_and_accesses`
+                // reuse of intermediaries (also, can dedup later, in theory).
+                let [(dst_ptr, dst_offset), (src_ptr, src_offset)] = [
+                    (data_inst_def.inputs[0], dst_adjusted_ptr, dst_partial_offset),
+                    (data_inst_def.inputs[1], src_adjusted_ptr, src_partial_offset),
+                ]
+                .map(|(original_ptr, adjusted_ptr, partial_offset)| {
+                    let supported_offset = match partial_offset {
+                        MaybeDynOffset::Const(offset) => Some(offset),
+                        MaybeDynOffset::Dyn { .. } => None,
+                    };
+                    // HACK(eddyb) guarantee that all necessary additions succed.
+                    let supported_offset = supported_offset.filter(|offset| {
+                        i32::try_from(size.get())
+                            .ok()
+                            .and_then(|size| offset.checked_add(size))
+                            .is_some()
+                    });
+                    supported_offset.map_or((original_ptr, 0), |offset| (adjusted_ptr, offset))
+                });
 
-                let spv_opcode = match (dst_adjusted_pointee_layout, src_adjusted_pointee_layout) {
+                match (dst_adjusted_pointee_layout, src_adjusted_pointee_layout) {
                     (TypeLayout::Concrete(dst_concrete), TypeLayout::Concrete(src_concrete))
                         if dst_concrete.original_type == src_concrete.original_type
                             && dst_concrete.mem_layout.fixed_base.size == size.get()
-                            && dst_concrete.mem_layout.dyn_unit_stride.is_none() =>
+                            && dst_concrete.mem_layout.dyn_unit_stride.is_none()
+                            && (dst_ptr, dst_offset) == (dst_adjusted_ptr, 0)
+                            && (src_ptr, src_offset) == (src_adjusted_ptr, 0) =>
                     {
-                        wk.OpCopyMemory
-                    }
-
-                    // TODO(eddyb) implement by expanding pointee leaves in `0..size`.
-                    _ => {
+                        (data_inst_def.kind, data_inst_def.inputs) = (
+                            DataInstKind::SpvInst(
+                                wk.OpCopyMemory.into(),
+                                spv::InstLowering::default(),
+                            ),
+                            [dst_adjusted_ptr, src_adjusted_ptr].into_iter().collect(),
+                        );
                         data_inst_def
-                            .inputs
-                            .push(Value::Const(cx.intern(scalar::Const::from_u32(size.get()))));
-                        wk.OpCopyMemorySized
                     }
-                };
 
-                data_inst_def.kind =
-                    DataInstKind::SpvInst(spv_opcode.into(), spv::InstLowering::default());
-                data_inst_def
+                    // FIXME(eddyb) consider a loop (e.g. above a certain size),
+                    // but there's a chance the pointee isn't (entirely) an array,
+                    // so `mem::analyze` would have to be also adjusted.
+                    _ => {
+                        // HACK(eddyb) this is only needed because of `bld`
+                        // borrowing `self` immutably, and it's easier to use
+                        // `bld` to create the instructions in the first place.
+                        let mut new_nodes = crate::EntityListIter { first: None, last: None };
+                        let mut offset = 0;
+                        while let Some(remaining_bytes @ 1..) = size.get().checked_sub(offset) {
+                            // HACK(eddyb) prefer `u32` over `u16` over `u8`.
+                            let copy_unit_size = 1 << remaining_bytes.trailing_zeros().clamp(0, 2);
+                            let copy_unit = cx.intern(scalar::Type::UInt(
+                                scalar::IntWidth::try_from_bits(copy_unit_size * 8).unwrap(),
+                            ));
+
+                            let (load_node, loaded_value) = bld.maybe_define_node(
+                                MemOp::Load {
+                                    offset: NonZeroI32::new(
+                                        src_offset
+                                            .checked_add(i32::try_from(offset).unwrap())
+                                            .unwrap(),
+                                    ),
+                                },
+                                [src_ptr],
+                                Some(copy_unit),
+                            );
+                            let (store_node, _) = bld.maybe_define_node(
+                                MemOp::Store {
+                                    offset: NonZeroI32::new(
+                                        dst_offset
+                                            .checked_add(i32::try_from(offset).unwrap())
+                                            .unwrap(),
+                                    ),
+                                },
+                                [dst_ptr, loaded_value.unwrap()],
+                                None,
+                            );
+
+                            new_nodes.first.get_or_insert(load_node.unwrap());
+                            new_nodes.last = Some(store_node.unwrap());
+
+                            offset += copy_unit_size;
+                        }
+
+                        // HACK(eddyb) this is responsible for transforming the
+                        // above `load`+`store` pairs into the appropriate
+                        // (sub)accesses that are supported by the pointee.
+                        let mut iter = bld.func.at(new_nodes);
+                        while let Some(mut func_at_node) = iter.next() {
+                            // HACK(eddyb) originally defining the nodes will
+                            // have invoked `add_value_uses`, so that has to
+                            // be undone before `in_place_transform_node_def`
+                            // re-adds them (to avoid them being double-counted).
+                            self.remove_value_uses(&func_at_node.reborrow().def().inputs);
+
+                            self.in_place_transform_node_def(func_at_node);
+                        }
+
+                        // FIXME(eddyb) it might be possible to avoid this kind
+                        // of "tombstone", but it would complicate the above.
+                        (data_inst_def.kind, data_inst_def.inputs) = (
+                            DataInstKind::SpvInst(wk.OpNop.into(), spv::InstLowering::default()),
+                            [].into_iter().collect(),
+                        );
+                        data_inst_def
+                    }
+                }
             }
 
             &DataInstKind::ThunkBind(_) => {
                 for &v in &data_inst_def.inputs {
-                    if self.lifter.as_spv_ptr_type(type_of_val(v)).is_some() {
+                    if self.lifter.as_spv_ptr_type(bld.type_of(v)).is_some() {
                         return Err(LiftError(Diag::bug([
                             "unsupported `thunk.bind` with pointer inputs".into(),
                         ])));
@@ -1670,7 +1704,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     };
 
                     let data_inst_def = changed_data_inst_def
-                        .get_or_insert_with(|| func_at_data_inst.reborrow().def().clone());
+                        .get_or_insert_with(|| bld.func_at(data_inst).def().clone());
 
                     match *attr {
                         QPtrAttr::ToSpvPtrInput { input_idx, pointee: expected_pointee_type } => {
@@ -1713,8 +1747,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                                     MaybeDynOffset::Const(0),
                                     &expected_mem_accesses,
                                     None,
-                                    func_at_data_inst.reborrow().at(()),
-                                    insert_aux_data_inst,
+                                    &mut bld,
                                 )?;
                             match (adjusted_pointee_layout, expected_pointee_layout) {
                                 (
@@ -1739,7 +1772,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
                             assert_eq!(data_inst_def.outputs.len(), 1);
                             let output_decl =
-                                func_at_data_inst.reborrow().at(data_inst_def.outputs[0]).decl();
+                                bld.func.reborrow().at(data_inst_def.outputs[0]).decl();
                             output_decl.ty = self.lifter.spv_ptr_type(addr_space.0, pointee.0);
                         }
                     }
@@ -1765,29 +1798,104 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     // FIXME(eddyb) consider undoing all of this work, and relying on a more
     // flexible pointer representation, instead.
     fn adjust_pointer_for_offset_and_accesses(
-        &mut self,
-        ptr: Value,
+        &self,
+        mut ptr: Value,
         mut offset: MaybeDynOffset,
         target_accesses: &MemAccesses,
 
         // HACK(eddyb) find a better API, maybe wrap inputs/outputs of this
         // whole "adjustment" process into `struct`s etc.
+        //
+        // TODO(eddyb) also return the start of the pointer, somehow, to make
+        // it easier to find the pointer *after* the pointee, without ending
+        // up with redunandant offset math (or just do the redundant math).
         allow_partial_offsets_and_write_them_back_into: Option<&mut MaybeDynOffset>,
 
-        // FIXME(eddyb) bundle these into some kind of "cursor" type.
-        mut func: FuncAtMut<'_, ()>,
-        insert_aux_data_inst: impl Fn(&mut Self, FuncAtMut<'_, ()>, DataInstDef) -> DataInst,
+        bld: &mut Builder<'_, impl FnMut(FuncAtMut<'_, ()>, NodeDef) -> Node>,
     ) -> Result<(Value, (AddrSpace, TypeLayout)), LiftError> {
         let wk = self.lifter.wk;
         let cx = &self.lifter.cx;
 
-        let (addr_space, mut pointee_layout) =
-            self.type_of_val_as_spv_ptr_with_layout(func.reborrow().freeze().at(ptr))?;
+        // FIXME(eddyb) this effectively duplicates parts of `qptr::legalize`,
+        // but the choice for typed memory are provided by `mem::analyze`, which
+        // must run on the output of `qptr::legalize`, so the best thing to do
+        // would be to share some of the offset recombination logic.
+        loop {
+            let (base_ptr, base_maybe_dyn_offset) = match ptr {
+                Value::Const(ct) => {
+                    let ConstKind::PtrToGlobalVar { global_var, offset: Some(offset) } =
+                        cx[ct].kind
+                    else {
+                        break;
+                    };
+                    (
+                        Value::Const(cx.intern(ConstDef {
+                            attrs: Default::default(),
+                            ty: self.global_vars[global_var].type_of_ptr_to,
+                            kind: ConstKind::PtrToGlobalVar { global_var, offset: None },
+                        })),
+                        MaybeDynOffset::Const(i32::try_from(offset.get()).ok().ok_or_else(
+                            || {
+                                LiftError(Diag::bug([format!(
+                                    "{offset} not representable as a positive s32"
+                                )
+                                .into()]))
+                            },
+                        )?),
+                    )
+                }
+                Value::Var(var) => {
+                    let Either::Right(node) = bld.func.vars[var].def_parent else {
+                        break;
+                    };
+                    let node_def = &bld.func.nodes[node];
+                    let NodeKind::QPtr(offset_op @ (QPtrOp::Offset(_) | QPtrOp::DynOffset { .. })) =
+                        &node_def.kind
+                    else {
+                        break;
+                    };
+                    (
+                        node_def.inputs[0],
+                        match offset_op {
+                            &QPtrOp::Offset(offset) => MaybeDynOffset::Const(offset),
+                            QPtrOp::DynOffset { stride, index_bounds } => MaybeDynOffset::Dyn {
+                                index: node_def.inputs[1],
+                                stride: *stride,
+                                array_max_size: index_bounds.clone().map(|index_bounds| {
+                                    u32::try_from(index_bounds.end)
+                                        .ok()
+                                        .unwrap_or(0)
+                                        .checked_mul(stride.get())
+                                        .unwrap_or(0)
+                                }),
+                            },
+                            _ => unreachable!(),
+                        },
+                    )
+                }
+            };
 
-        let mut access_chain_inputs: SmallVec<_> = [ptr].into_iter().collect();
+            offset = bld.offset_add(offset, base_maybe_dyn_offset)?;
+
+            ptr = base_ptr;
+        }
+
+        let (addr_space, mut pointee_layout) =
+            self.type_of_val_as_spv_ptr_with_layout(bld.func_at(ptr))?;
+
+        let mut access_chain_inputs: SmallVec<[_; 8]> = [ptr].into_iter().collect();
+
+        // HACK(eddyb) this is only used to work around a ridiculous edge case,
+        // where `qptr.dyn_offset`, when used with a `qptr.buffer_data`, and if
+        // fully deferred, would replace the `qptr.buffer_data` output with its
+        // input (i.e. the whole buffer itself), breaking downstream uses.
+        let original_ptr_before_misguided_resolve = access_chain_inputs[0];
 
         // HACK(eddyb) account for `deferred_ptr_noops` interactions.
         self.resolve_deferred_ptr_noop_uses(&mut access_chain_inputs);
+
+        // HACK(eddyb) see the earlier comment on matching variable.
+        let original_ptr_after_misguided_resolve = access_chain_inputs[0];
 
         // HACK(eddyb) disallowing naming the original `ptr` again.
         #[allow(unused)]
@@ -1796,39 +1904,25 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         let access_chain_data_inst_kind =
             DataInstKind::SpvInst(wk.OpAccessChain.into(), spv::InstLowering::default());
 
-        let mk_access_chain = |this: &mut Self,
-                               mut func: FuncAtMut<'_, ()>,
-                               access_chain_inputs: SmallVec<_>,
-                               final_pointee_type| {
-            if access_chain_inputs.len() > 1 {
-                let node = insert_aux_data_inst(
-                    this,
-                    func.reborrow(),
-                    DataInstDef {
-                        attrs: Default::default(),
-                        kind: access_chain_data_inst_kind.clone(),
-                        inputs: access_chain_inputs,
-                        child_regions: [].into_iter().collect(),
-                        outputs: [].into_iter().collect(),
-                    },
-                );
+        let mk_access_chain =
+            |bld: &mut Builder<'_, _>, access_chain_inputs: SmallVec<_>, final_pointee_type| {
+                if access_chain_inputs.len() > 1 {
+                    bld.op(
+                        access_chain_data_inst_kind.clone(),
+                        access_chain_inputs,
+                        self.lifter.spv_ptr_type(addr_space, final_pointee_type),
+                    )
+                } else {
+                    let ptr = access_chain_inputs[0];
 
-                let output_var = func.vars.define(
-                    cx,
-                    VarDecl {
-                        attrs: Default::default(),
-                        ty: this.lifter.spv_ptr_type(addr_space, final_pointee_type),
-                        def_parent: Either::Right(node),
-                        def_idx: 0,
-                    },
-                );
-                func.nodes[node].outputs.push(output_var);
-
-                Value::Var(output_var)
-            } else {
-                access_chain_inputs[0]
-            }
-        };
+                    // HACK(eddyb) see comments on these variables.
+                    if ptr == original_ptr_after_misguided_resolve {
+                        original_ptr_before_misguided_resolve
+                    } else {
+                        ptr
+                    }
+                }
+            };
 
         if let TypeLayout::HandleArray(handle, _) = pointee_layout {
             access_chain_inputs.push(Value::Const(cx.intern(scalar::Const::from_u32(0))));
@@ -1871,7 +1965,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 }
 
                 return Ok((
-                    mk_access_chain(self, func, access_chain_inputs, pointee_handle_type),
+                    mk_access_chain(bld, access_chain_inputs, pointee_handle_type),
                     (addr_space, TypeLayout::Handle(shapes::Handle::Opaque(pointee_handle_type))),
                 ));
             }
@@ -1882,6 +1976,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         };
 
         // HACK(eddyb) helper for `if !target_fits_in_pointee` (see below).
+        // TODO(eddyb) try disabling this by returning `None`, it might not be
+        // needed anymore for anything.
         let decompose_array_indexing = |this: &Self, func_at_ptr: FuncAt<'_, Value>| {
             let func = func_at_ptr.at(());
             let inst = match func_at_ptr.position {
@@ -1916,6 +2012,25 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         };
 
         loop {
+            // FIXME(eddyb) should `MemTypeLayout` have have an `.extent()` method?
+            let pointee_extent = Extent {
+                start: 0,
+                end: (pointee_layout.mem_layout.dyn_unit_stride.is_none())
+                    .then_some(pointee_layout.mem_layout.fixed_base.size),
+            };
+
+            // HACK(eddyb) if a dynamic index could only be `0`, without going
+            // outside of the bounds of the pointee, ignore the actual dynamic
+            // value and replace it with just the constant offset of `0` bytes.
+            // FIXME(eddyb) this could also generate an `assume index == 0`,
+            // if SPIR-T had such a concept.
+            // FIXME(eddyb) this assumes an "inbounds"-style offsetting operation.
+            if let MaybeDynOffset::Dyn { stride, .. } = offset
+                && pointee_extent.end.is_some_and(|size| stride.get() > size)
+            {
+                offset = MaybeDynOffset::Const(0);
+            }
+
             // FIXME(eddyb) should `DataHapp` have have an `.extent()` method?
             let target_extent = match offset {
                 MaybeDynOffset::Const(offset) => {
@@ -1932,13 +2047,6 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 }
             };
 
-            // FIXME(eddyb) should `MemTypeLayout` have have an `.extent()` method?
-            let pointee_extent = Extent {
-                start: 0,
-                end: (pointee_layout.mem_layout.dyn_unit_stride.is_none())
-                    .then_some(pointee_layout.mem_layout.fixed_base.size),
-            };
-
             let target_fits_in_pointee = pointee_extent.includes(&target_extent);
 
             // HACK(eddyb) escaping the logical pointer bounds is illegal,
@@ -1952,12 +2060,9 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 // HACK(eddyb) approximating a `try {...}` block.
                 let mut maybe_recompose_dyn_indexing = || {
                     let (array_ptr, array_index, array_stride, array_elem) =
-                        decompose_array_indexing(
-                            self,
-                            func.reborrow().freeze().at(access_chain_inputs[0]),
-                        )?;
+                        decompose_array_indexing(self, bld.func_at(access_chain_inputs[0]))?;
 
-                    let array_index_ty = func.reborrow().freeze().at(array_index).type_of(cx);
+                    let array_index_ty = bld.type_of(array_index);
                     let array_index_scalar_ty = array_index_ty.as_scalar(cx)?;
                     let (index_addend, remainder_offset) = match offset {
                         MaybeDynOffset::Const(offset) => {
@@ -1977,8 +2082,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                             }
 
                             // FIMXE(eddyb) cast mismatched types.
-                            let index_scalar_ty =
-                                func.reborrow().freeze().at(index).type_of(cx).as_scalar(cx)?;
+                            let index_scalar_ty = bld.type_of(index).as_scalar(cx)?;
                             if index_scalar_ty != array_index_scalar_ty {
                                 return None;
                             }
@@ -1987,31 +2091,13 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         }
                     };
 
-                    let combined_index_inst = insert_aux_data_inst(
-                        self,
-                        func.reborrow(),
-                        DataInstDef {
-                            attrs: Default::default(),
-                            kind: DataInstKind::Scalar(scalar::IntBinOp::Add.into()),
-                            inputs: [array_index, index_addend].into_iter().collect(),
-                            child_regions: [].into_iter().collect(),
-                            outputs: [].into_iter().collect(),
-                        },
+                    let combined_index = bld.scalar_op(
+                        scalar::IntBinOp::Add,
+                        [array_index, index_addend],
+                        array_index_ty,
                     );
 
-                    let combined_index_output_var = func.vars.define(
-                        cx,
-                        VarDecl {
-                            attrs: Default::default(),
-                            ty: array_index_ty,
-                            def_parent: Either::Right(combined_index_inst),
-                            def_idx: 0,
-                        },
-                    );
-                    func.nodes[combined_index_inst].outputs.push(combined_index_output_var);
-
-                    access_chain_inputs =
-                        [array_ptr, Value::Var(combined_index_output_var)].into_iter().collect();
+                    access_chain_inputs = [array_ptr, combined_index].into_iter().collect();
                     offset = MaybeDynOffset::Const(remainder_offset.try_into().unwrap());
                     pointee_layout = array_elem;
 
@@ -2064,84 +2150,84 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 Components::Elements { stride: array_stride, elem, .. },
                 MaybeDynOffset::Dyn { index, stride: index_stride, .. },
             ) = (&pointee_layout.components, offset)
+                && target_happ.max_size.is_some_and(|target_size| target_size <= index_stride.get())
             {
                 // FIXME(eddyb) replace this when the `std` method stabilizes.
                 let checked_exact_div = |a: u32, b: u32| a.is_multiple_of(b).then(|| a / b);
 
-                let (index, leftover_offset) = if *array_stride == index_stride {
-                    (index, MaybeDynOffset::Const(0))
-                } else if let Some(index_multiplier) =
-                    checked_exact_div(index_stride.get(), array_stride.get())
+                let index_ty = bld.type_of(index);
+                let index_typed_const = |x: u32| {
+                    let ct = index_ty
+                        .as_scalar(cx)
+                        .and_then(|index_ty| scalar::Const::int_try_from_i128(index_ty, x.into()))
+                        .ok_or_else(|| {
+                            LiftError(Diag::bug([
+                                format!("{x} not representable in index type `").into(),
+                                index_ty.into(),
+                                "`".into(),
+                            ]))
+                        })?;
+                    Ok(Value::Const(cx.intern(ct)))
+                };
+
+                // HACK(eddyb) in the worst-case scenario, where neither of the
+                // two strides (`array_stride` and `index_stride`) is a multiple
+                // of the other, the `index` must be first be multiplied, such
+                // that it's in terms of a smaller `common_stride`, that is also
+                // a divisor of `array_stride`, allowing later divison+remainder.
+                // FIXME(eddyb) dedup some of this with `offset_add`.
+                let (index, index_stride) = if !array_stride
+                    .get()
+                    .is_multiple_of(index_stride.get())
                 {
-                    // FIXME(eddyb) implement index multiplication here, and
-                    // take advantage of it in `mem::analyze`.
-                    return Err(LiftError(Diag::bug([format!(
-                        "unimplemented stride factor (index multiplier) of {index_multiplier}"
-                    )
-                    .into()])));
-                } else if let Some(index_divisor) =
-                    checked_exact_div(array_stride.get(), index_stride.get())
-                {
-                    let index_ty = func.reborrow().freeze().at(index).type_of(cx);
-                    let index_divisor_value = {
-                        let index_divisor = index_ty
-                            .as_scalar(cx)
-                            .and_then(|index_ty| {
-                                scalar::Const::int_try_from_i128(index_ty, index_divisor.into())
-                            })
-                            .ok_or_else(|| {
-                                LiftError(Diag::bug([
-                                    format!("{index_divisor} not representable in index type `")
-                                        .into(),
-                                    index_ty.into(),
-                                    "`".into(),
-                                ]))
-                            })?;
-                        Value::Const(cx.intern(index_divisor))
+                    let common_stride = if index_stride.get().is_multiple_of(array_stride.get()) {
+                        *array_stride
+                    } else {
+                        // HACK(eddyb) instead of computing GCD, just use
+                        // the largest power of 2 they have in common.
+                        NonZeroU32::new(
+                            1 << array_stride.trailing_zeros().min(index_stride.trailing_zeros()),
+                        )
+                        .unwrap()
                     };
-
-                    let [divided_index, index_remainder] =
-                        [scalar::IntBinOp::DivU, scalar::IntBinOp::RemS].map(|op| {
-                            let inst = insert_aux_data_inst(
-                                self,
-                                func.reborrow(),
-                                DataInstDef {
-                                    attrs: Default::default(),
-                                    kind: DataInstKind::Scalar(op.into()),
-                                    inputs: [index, index_divisor_value].into_iter().collect(),
-                                    child_regions: [].into_iter().collect(),
-                                    outputs: [].into_iter().collect(),
-                                },
-                            );
-
-                            let output_var = func.vars.define(
-                                cx,
-                                VarDecl {
-                                    attrs: Default::default(),
-                                    ty: index_ty,
-                                    def_parent: Either::Right(inst),
-                                    def_idx: 0,
-                                },
-                            );
-                            func.nodes[inst].outputs.push(output_var);
-
-                            Value::Var(output_var)
-                        });
-
+                    let index_multiplier =
+                        checked_exact_div(index_stride.get(), common_stride.get()).unwrap();
                     (
-                        divided_index,
+                        bld.scalar_op(
+                            scalar::IntBinOp::Mul,
+                            [index, index_typed_const(index_multiplier)?],
+                            index_ty,
+                        ),
+                        common_stride,
+                    )
+                } else {
+                    (index, index_stride)
+                };
+
+                let index_divisor =
+                    checked_exact_div(array_stride.get(), index_stride.get()).unwrap();
+
+                // FIXME(eddyb) use auto-simplification to avoid this special-case.
+                let (index, leftover_offset) = if index_divisor == 1 {
+                    (index, MaybeDynOffset::Const(0))
+                } else {
+                    let index_divisor_value = index_typed_const(index_divisor)?;
+                    (
+                        bld.scalar_op(
+                            scalar::IntBinOp::DivU,
+                            [index, index_divisor_value],
+                            index_ty,
+                        ),
                         MaybeDynOffset::Dyn {
-                            index: index_remainder,
+                            index: bld.scalar_op(
+                                scalar::IntBinOp::RemS,
+                                [index, index_divisor_value],
+                                index_ty,
+                            ),
                             stride: index_stride,
                             array_max_size: Some(array_stride.get()),
                         },
                     )
-                } else {
-                    return Err(LiftError(Diag::bug([format!(
-                        "unsupported indexing with stride {index_stride} \
-                         in an array with stride {array_stride}"
-                    )
-                    .into()])));
                 };
 
                 // HACK(eddyb) separate the `OpAccessChain`s into one for
@@ -2150,12 +2236,10 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 // to `adjust_pointer_for_offset_and_accesses`.
                 // FIXME(eddyb) consider tracking representations of `qptr`s
                 // that deviate from "`Value` of SPIR-V logical pointer type".
-                let array_ptr = mk_access_chain(
-                    self,
-                    func.reborrow(),
-                    access_chain_inputs,
-                    pointee_layout.original_type,
-                );
+                // TODO(eddyb) try replacing this with `access_chain_inputs.push(index)`,
+                // it might not be needed anymore for anything.
+                let array_ptr =
+                    mk_access_chain(bld, access_chain_inputs, pointee_layout.original_type);
                 access_chain_inputs = [array_ptr, index].into_iter().collect();
 
                 offset = leftover_offset;
@@ -2172,7 +2256,12 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     // there's a good chance the pointer is already compatible
                     // with `target_happ` (and the only reason to keep going
                     // would be to find smaller types that remain compatible).
-                    if is_compatible || offset == MaybeDynOffset::Const(0) {
+                    //
+                    // TODO(eddyb) is the partial offset escape hatch correct??
+                    if is_compatible
+                        || offset == MaybeDynOffset::Const(0)
+                        || allow_partial_offsets_and_write_them_back_into.is_some()
+                    {
                         break;
                     }
 
@@ -2185,7 +2274,12 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 }
                 (Some(_), Some(_)) => {
                     return Err(LiftError(Diag::bug([
-                        "ambiguity due to ZSTs in pointee type layout".into(),
+                        format!(
+                            "ambiguity for offsets {target_extent} (due to ZSTs?), \
+                             in the layout of "
+                        )
+                        .into(),
+                        pointee_layout.original_type.into(),
                     ])));
                 }
                 (Some(idx), None) => idx,
@@ -2232,7 +2326,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         }
 
         Ok((
-            mk_access_chain(self, func, access_chain_inputs, pointee_layout.original_type),
+            mk_access_chain(bld, access_chain_inputs, pointee_layout.original_type),
             (addr_space, TypeLayout::Concrete(pointee_layout)),
         ))
     }
@@ -2248,10 +2342,10 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             // make tracking use counts harder.
             while let Value::Var(var) = *v {
                 match self.deferred_ptr_noops.get(&var) {
-                    Some(ptr_noop) => {
+                    Some(ptr_noop) if ptr_noop.actually_noop => {
                         *v = ptr_noop.output_pointer;
                     }
-                    None => break,
+                    _ => break,
                 }
             }
         }
@@ -2259,20 +2353,24 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
     // FIXME(eddyb) these are only this whacky because an `u32` is being
     // encoded as `Option<NonZeroU32>` for (dense) map entry reasons.
-    fn add_value_uses(&mut self, values: &[Value]) {
+    // HACK(eddyb) `&self` instead of `&mut self` to avoid complications around
+    // `Builder` usage.
+    fn add_value_uses(&self, values: &[Value]) {
         for &v in values {
             if let Value::Var(v) = v {
-                let count = self.var_use_counts.entry(v);
+                let mut var_use_counts = self.var_use_counts.borrow_mut();
+                let count = var_use_counts.entry(v);
                 *count = Some(
                     NonZeroU32::new(count.map_or(0, |c| c.get()).checked_add(1).unwrap()).unwrap(),
                 );
             }
         }
     }
-    fn remove_value_uses(&mut self, values: &[Value]) {
+    fn remove_value_uses(&self, values: &[Value]) {
         for &v in values {
             if let Value::Var(v) = v {
-                let count = self.var_use_counts.entry(v);
+                let mut var_use_counts = self.var_use_counts.borrow_mut();
+                let count = var_use_counts.entry(v);
                 *count = NonZeroU32::new(count.unwrap().get() - 1);
             }
         }
@@ -2289,7 +2387,8 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
             let mut attrs = ct_def.attrs;
             let mut ty = ct_def.ty;
 
-            // TODO(eddyb) implement.
+            // FIXME(eddyb) remove the cost of adding `Diag`s that will just be
+            // ignored by `adjust_pointer_for_offset_and_accesses`.
             if let Some(offset) = offset {
                 attrs.push_diag(
                     &self.lifter.cx,
@@ -2351,7 +2450,8 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
                 let data_inst_def = func_at_node.def();
                 self.remove_value_uses(&data_inst_def.inputs);
                 *data_inst_def = new_def;
-                self.resolve_deferred_ptr_noop_uses(&mut data_inst_def.inputs);
+                // HACK(eddyb) doing this here can cause extra unwanted rewrites.
+                // self.resolve_deferred_ptr_noop_uses(&mut data_inst_def.inputs);
                 self.add_value_uses(&data_inst_def.inputs);
             }
             Err(LiftError(e)) => {
@@ -2408,7 +2508,7 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
             // NOTE(eddyb) reverse order is important, as each removal can reduce
             // use counts of an earlier definition, allowing further removal.
             for (output_var, ptr_noop) in deferred_ptr_noops.into_iter().rev() {
-                let is_used = self.var_use_counts.get(output_var).is_some();
+                let is_used = self.var_use_counts.borrow().get(output_var).is_some();
                 if !is_used {
                     let inst = func_def_body.at(output_var).decl().def_parent.right().unwrap();
 
@@ -2426,5 +2526,343 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
                 }
             }
         }
+    }
+}
+
+// FIXME(eddyb) reconsider the name and placement of this.
+struct Builder<'a, IAN: FnMut(FuncAtMut<'_, ()>, NodeDef) -> Node> {
+    cx: &'a Context,
+    wk: &'static spv::spec::WellKnown,
+
+    func: FuncAtMut<'a, ()>,
+    insert_aux_node: IAN,
+}
+
+#[derive(Clone)]
+struct ScalarBitSlice {
+    ty: scalar::Type,
+    // FIXME(eddyb) is keeping this separate even needed?
+    // NOTE(eddyb) this is the width of `ty` *not* the slice!
+    width: scalar::IntWidth,
+
+    bit_offset: Value,
+    bit_offset_bounds: RangeInclusive<u32>,
+}
+
+impl<IAN: FnMut(FuncAtMut<'_, ()>, NodeDef) -> Node> Builder<'_, IAN> {
+    // HACK(eddyb) `self.func.reborrow().freeze().at(position)` w/o `&mut self`.
+    fn func_at<P: Copy>(&self, position: P) -> FuncAt<'_, P> {
+        let FuncAtMut { regions, nodes, vars, position: () } = &self.func;
+        FuncAt { regions, nodes, vars, position }
+    }
+
+    fn type_of(&self, v: Value) -> Type {
+        self.func_at(v).type_of(self.cx)
+    }
+
+    fn op(
+        &mut self,
+        kind: impl Into<NodeKind>,
+        inputs: impl IntoIterator<Item = Value>,
+        output_type: Type,
+    ) -> Value {
+        self.maybe_define_node(kind, inputs, Some(output_type)).1.unwrap()
+    }
+
+    fn op_without_output(
+        &mut self,
+        kind: impl Into<NodeKind>,
+        inputs: impl IntoIterator<Item = Value>,
+    ) {
+        self.maybe_define_node(kind, inputs, None);
+    }
+
+    fn maybe_define_node(
+        &mut self,
+        kind: impl Into<NodeKind>,
+        inputs: impl IntoIterator<Item = Value>,
+        output_type: Option<Type>,
+    ) -> (Option<Node>, Option<Value>) {
+        let node_def = NodeDef {
+            // FIXME(eddyb) strongly consider copying debuginfo from the initial
+            // instigating node (that resulted in the `Builder` being created).
+            attrs: Default::default(),
+            kind: kind.into(),
+            inputs: inputs.into_iter().collect(),
+            child_regions: [].into_iter().collect(),
+            outputs: [].into_iter().collect(),
+        };
+
+        // HACK(eddyb) constant-folding here should be "free" (in the sense of
+        // never defining any `Node`s or `Var`s when it succeeds) and it allows
+        // simplifying the calling side.
+        if let NodeKind::Scalar(scalar::Op::IntBinary(
+            scalar::IntBinOp::Shl | scalar::IntBinOp::ShrS | scalar::IntBinOp::ShrU,
+        )) = node_def.kind
+            && let Value::Const(shift_amount) = node_def.inputs[1]
+            && shift_amount.as_scalar(self.cx).and_then(|ct| ct.int_as_u32()) == Some(0)
+        {
+            return (None, Some(node_def.inputs[0]));
+        }
+        // FIXME(eddyb) this situation is technically illegal according to SPIR-V.
+        if let NodeKind::Scalar(scalar::Op::IntUnary(
+            scalar::IntUnOp::TruncOrSignExtend | scalar::IntUnOp::TruncOrZeroExtend,
+        )) = node_def.kind
+            && Some(self.type_of(node_def.inputs[0])) == output_type
+        {
+            return (None, Some(node_def.inputs[0]));
+        }
+
+        let node = (self.insert_aux_node)(self.func.reborrow(), node_def);
+
+        let output_var = output_type.map(|output_type| {
+            let output_var = self.func.vars.define(
+                self.cx,
+                VarDecl {
+                    attrs: Default::default(),
+                    ty: output_type,
+                    def_parent: Either::Right(node),
+                    def_idx: 0,
+                },
+            );
+            self.func.nodes[node].outputs.push(output_var);
+
+            Value::Var(output_var)
+        });
+        (Some(node), output_var)
+    }
+
+    // FIXME(eddyb) this needs a more compact name.
+    fn scalar_op(
+        &mut self,
+        op: impl Into<scalar::Op>,
+        inputs: impl IntoIterator<Item = Value>,
+        output_type: Type,
+    ) -> Value {
+        self.op(op.into(), inputs, output_type)
+    }
+
+    fn bit_sliced_update(
+        &mut self,
+        fetch_old_dst: impl FnOnce(&mut Self) -> Value,
+        dst_slice: ScalarBitSlice,
+        src: Value,
+        src_slice: ScalarBitSlice,
+    ) -> Value {
+        let cx = self.cx;
+        let wk = self.wk;
+
+        // FIXME(eddyb) figure out if this restriction can/should be lifted,
+        // and/or if it should be enforced at the type level.
+        assert!(matches!(dst_slice.ty, scalar::Type::UInt(_)));
+
+        let dst_type = self.cx.intern(dst_slice.ty);
+
+        // FIXME(eddyb) consider adding a method for this on `IntWidth`.
+        let mask = |w: scalar::IntWidth| !0u128 >> (128 - w.bits());
+
+        // FIXME(eddyb) use const-folding to avoid this special-case.
+        let dst_minus_src_mask = if let Value::Const(bit_offset) = dst_slice.bit_offset
+            && let Some(bit_offset) = bit_offset.as_scalar(cx).and_then(|ct| ct.int_as_u32())
+        {
+            Value::Const(cx.intern(scalar::Const::from_bits(
+                dst_slice.ty,
+                mask(dst_slice.width) & !(mask(src_slice.width) << bit_offset),
+            )))
+        } else {
+            let src_mask_in_dst = self.scalar_op(
+                scalar::IntBinOp::Shl,
+                [
+                    Value::Const(cx.intern(scalar::Const::from_bits(
+                        dst_slice.ty,
+                        mask(dst_slice.width) & mask(src_slice.width),
+                    ))),
+                    dst_slice.bit_offset,
+                ],
+                dst_type,
+            );
+            self.scalar_op(scalar::IntUnOp::Not, [src_mask_in_dst], dst_type)
+        };
+
+        let masked_old_dst = if let Value::Const(dst_minus_src_mask) = dst_minus_src_mask
+            && dst_minus_src_mask.as_scalar(cx).and_then(|ct| ct.int_as_u32()) == Some(0)
+        {
+            Value::Const(cx.intern(scalar::Const::from_bits(dst_slice.ty, 0)))
+        } else {
+            let old_dst = fetch_old_dst(self);
+            self.scalar_op(scalar::IntBinOp::And, [old_dst, dst_minus_src_mask], dst_type)
+        };
+
+        let src_as_int = match src_slice.ty {
+            // FIXME(eddyb) consider using a SPIR-T `Select` node.
+            scalar::Type::Bool => self.op(
+                DataInstKind::SpvInst(wk.OpSelect.into(), spv::InstLowering::default()),
+                [src].into_iter().chain([true, false].map(|b| {
+                    Value::Const(cx.intern(scalar::Const::from_bits(dst_slice.ty, b as u128)))
+                })),
+                dst_type,
+            ),
+            // FIXME(eddyb) try to remove some of the signedness edge cases.
+            scalar::Type::UInt(_) => src,
+            scalar::Type::SInt(_) if src_slice.width != dst_slice.width => src,
+            // FIXME(eddyb) SPIR-T should have its own bitcast.
+            _ => self.op(
+                DataInstKind::SpvInst(wk.OpBitcast.into(), spv::InstLowering::default()),
+                [src],
+                cx.intern(scalar::Type::UInt(src_slice.width)),
+            ),
+        };
+
+        let sliced_src_as_int = self.scalar_op(
+            scalar::IntBinOp::ShrU,
+            [src_as_int, src_slice.bit_offset],
+            // FIXME(eddyb) maybe allow deducing types automatically instead?
+            self.type_of(src_as_int),
+        );
+
+        let sliced_src_as_dst_uint =
+            self.scalar_op(scalar::IntUnOp::TruncOrZeroExtend, [sliced_src_as_int], dst_type);
+
+        let sliced_src_at_dst_offset = self.scalar_op(
+            scalar::IntBinOp::Shl,
+            [sliced_src_as_dst_uint, dst_slice.bit_offset],
+            dst_type,
+        );
+
+        // FIXME(eddyb) use auto-simplification to avoid this special-case.
+        if let Value::Const(masked_old_dst) = masked_old_dst
+            && masked_old_dst.as_scalar(cx).and_then(|ct| ct.int_as_u32()) == Some(0)
+        {
+            sliced_src_at_dst_offset
+        } else {
+            self.scalar_op(
+                scalar::IntBinOp::Or,
+                [masked_old_dst, sliced_src_at_dst_offset],
+                dst_type,
+            )
+        }
+    }
+
+    fn offset_add(
+        &mut self,
+        a: MaybeDynOffset,
+        b: MaybeDynOffset,
+    ) -> Result<MaybeDynOffset, LiftError> {
+        // FIXME(eddyb) implement merging of arbitrary offsets.
+        Ok(match (a, b) {
+            (MaybeDynOffset::Const(0), offset) | (offset, MaybeDynOffset::Const(0)) => offset,
+            (MaybeDynOffset::Const(a), MaybeDynOffset::Const(b)) => {
+                MaybeDynOffset::Const(a.checked_add(b).ok_or_else(|| {
+                    LiftError(Diag::bug([format!("{a} + {b} overflowed").into()]))
+                })?)
+            }
+
+            _ => {
+                // HACK(eddyb) approximating a `try {...}` block.
+                let mut maybe_combine_offsets = || {
+                    // HACK(eddyb) this is mostly copied from `qptr::legalize`.
+                    #[derive(Copy, Clone)]
+                    enum IndexValue {
+                        Dyn(Value),
+                        One,
+                    }
+
+                    let [a, b] = [a, b].map(|offset| {
+                        Some(match offset {
+                            MaybeDynOffset::Const(offset) => {
+                                // FIXME(eddyb) allow negative offsets here.
+                                let offset = u32::try_from(offset).ok()?;
+                                (IndexValue::One, NonZeroU32::new(offset).unwrap(), Some(offset))
+                            }
+                            MaybeDynOffset::Dyn { index, stride, array_max_size } => {
+                                (IndexValue::Dyn(index), stride, array_max_size)
+                            }
+                        })
+                    });
+                    let (a_index, a_stride, a_array_max_size) = a?;
+                    let (b_index, b_stride, b_array_max_size) = b?;
+
+                    let common_stride = {
+                        let (min_stride, max_stride) =
+                            (a_stride.min(b_stride), a_stride.max(b_stride));
+                        if max_stride.get().is_multiple_of(min_stride.get()) {
+                            min_stride
+                        } else {
+                            // HACK(eddyb) instead of computing GCD, just use
+                            // the largest power of 2 they have in common.
+                            NonZeroU32::new(
+                                1 << a_stride.trailing_zeros().min(b_stride.trailing_zeros()),
+                            )
+                            .unwrap()
+                        }
+                    };
+
+                    let index_ty = [a_index, b_index]
+                        .into_iter()
+                        .filter_map(|index| match index {
+                            IndexValue::Dyn(index) => Some(self.type_of(index)),
+                            IndexValue::One => None,
+                        })
+                        .dedup()
+                        .exactly_one()
+                        .ok()?;
+                    let index_scalar_ty = index_ty.as_scalar(self.cx)?;
+
+                    // HACK(eddyb) this overlaps with parts of `qptr::legalize`.
+                    let [scaled_a_index, scaled_b_index] =
+                        [(a_index, a_stride), (b_index, b_stride)].map(|(index, stride)| {
+                            let scale = stride.get() / common_stride;
+                            let scale_value = Value::Const(self.cx.intern(
+                                scalar::Const::int_try_from_i128(index_scalar_ty, scale.into())?,
+                            ));
+
+                            Some(match index {
+                                IndexValue::Dyn(index) => {
+                                    // FIXME(eddyb) use auto-simplification to avoid this special-case.
+                                    if scale == 1 {
+                                        index
+                                    } else {
+                                        self.scalar_op(
+                                            scalar::IntBinOp::Mul,
+                                            [index, scale_value],
+                                            index_ty,
+                                        )
+                                    }
+                                }
+                                IndexValue::One => scale_value,
+                            })
+                        });
+
+                    Some(MaybeDynOffset::Dyn {
+                        index: self.scalar_op(
+                            scalar::IntBinOp::Add,
+                            [scaled_a_index?, scaled_b_index?],
+                            index_ty,
+                        ),
+                        stride: common_stride,
+                        array_max_size: a_array_max_size
+                            .and_then(|size| size.checked_add(b_array_max_size?)),
+                    })
+                };
+                maybe_combine_offsets().ok_or_else(|| {
+                    let fmt_offset = |offset| match offset {
+                        MaybeDynOffset::Const(offset) => vec![format!("const (`{offset}`)").into()],
+                        MaybeDynOffset::Dyn { index, stride, .. } => {
+                            vec![
+                                "dyn (`(N: ".into(),
+                                self.type_of(index).into(),
+                                format!(")×{stride}`)").into(),
+                            ]
+                        }
+                    };
+                    LiftError(Diag::bug(
+                        (["failed to merge offsets: ".into()].into_iter())
+                            .chain(fmt_offset(a))
+                            .chain([" + ".into()])
+                            .chain(fmt_offset(b)),
+                    ))
+                })?
+            }
+        })
     }
 }
