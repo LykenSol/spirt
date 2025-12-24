@@ -764,12 +764,23 @@ impl<'a> CallStackEmulator<'a> {
             // it's intra-emu-group).
             let mut func = func_def_body.at_mut(());
             let ret_cont = {
+                let popped_state_var = func.vars.define(
+                    &self.global_stack.cx,
+                    VarDecl {
+                        attrs: Default::default(),
+                        ty: state_ty,
+                        // HACK(eddyb) using an existing region to declare an "orphan" `Var`.
+                        def_parent: Either::Left(new_body),
+                        def_idx: !0,
+                    },
+                );
+
                 let mut popper = self.global_stack.popper(func.reborrow());
-                let popped_state = Value::Var(popper.pop(func.reborrow(), state_ty));
+                popper.pop_into(func.reborrow(), popped_state_var);
                 let pops_nodes = popper.finish(func.reborrow());
                 func.regions[orig_body].children.append(pops_nodes, func.nodes);
                 EmuContClosure {
-                    origin: Err(popped_state),
+                    origin: Err(Value::Var(popped_state_var)),
                     input_count: orig_ret_types.len(),
                     captures: FxIndexSet::default(),
                 }
@@ -792,6 +803,7 @@ impl<'a> CallStackEmulator<'a> {
                                 func.reborrow(),
                                 &ret_cont,
                                 outputs,
+                                None,
                             );
                             cont_body.children.prepend(children, func.nodes);
                             cont_body
@@ -853,8 +865,14 @@ impl<'a> CallStackEmulator<'a> {
                         }
                         None => EmuStateIdx::UNKNOWN_STATE.to_value(cx),
                     };
-                func.regions
-                    .define(cx, EmuContBody { children, next_state_after }.into_region_def())
+                func.regions.define(
+                    cx,
+                    RegionDef {
+                        inputs: [].into_iter().collect(),
+                        children,
+                        outputs: [next_state_after].into_iter().collect(),
+                    },
+                )
             };
 
             let state_switch_node = {
@@ -1067,42 +1085,58 @@ impl<'a> CallStackEmulator<'a> {
 
         let call_args = mem::take(&mut func.reborrow().at(call_site.func_call_node).def().inputs);
 
-        // FIXME(eddyb) is `call_emu_cont` unnecessary?
-        assert!(call_emu_cont.captures.is_empty());
+        let mut call_start_cont_body = self.global_stack.invoke_cont_closure(
+            func.reborrow(),
+            call_emu_cont,
+            &call_args,
+            Some(&EmuContClosure {
+                origin: Err(call_site_ret_cont_state.to_value(cx)),
+                input_count: 0,
+                captures: FxIndexSet::default(),
+            }),
+        );
 
-        // TODO(eddyb) consider using `invoke_cont_closure` here.
-        let (args_pushes_nodes, initial_state) = {
-            let mut pusher = self.global_stack.pusher(func.reborrow());
-            pusher.push(func.reborrow(), call_site_ret_cont_state.to_value(cx));
-            for v in call_args.into_iter().rev() {
-                pusher.push(func.reborrow(), v);
-            }
-            pusher.finish_for_state(func.reborrow(), call_emu_cont.entry_state_value(cx))
-        };
-        {
-            // HACK(eddyb) support splicing lists to make this O(1).
-            let mut args_pushes_nodes = args_pushes_nodes;
-            while let Some(node) = args_pushes_nodes.remove_first(func.nodes) {
-                func.regions[call_site.parent_region].children.insert_before(
-                    node,
-                    call_site.func_call_node,
-                    func.nodes,
-                );
-            }
+        // HACK(eddyb) support splicing lists to make this O(1).
+        while let Some(node) = call_start_cont_body.children.remove_first(func.nodes) {
+            func.regions[call_site.parent_region].children.insert_before(
+                node,
+                call_site.func_call_node,
+                func.nodes,
+            );
         }
 
         let call_node_output_indices = 0..func.nodes[call_site.func_call_node].outputs.len();
-        let (ret_vals_pops_nodes, ret_vals) = {
-            let mut popper = self.global_stack.popper(func.reborrow());
-            let ret_vals: SmallVec<_> = call_node_output_indices
-                .clone()
-                .map(|call_output_idx| {
-                    let call_output = func.nodes[call_site.func_call_node].outputs[call_output_idx];
-                    let ty = func.vars[call_output].ty;
-                    Value::Var(popper.pop(func.reborrow(), ty))
-                })
-                .collect();
-            (popper.finish(func.reborrow()), ret_vals)
+        let ret_cont_def = {
+            let dummy_state_in = EmuStateIdx::UNKNOWN_STATE.to_value(cx);
+
+            let ret_cont_origin = Either::Right((
+                call_site.func_call_node,
+                NodeEmuStates { merge: call_site_ret_cont_state },
+            ));
+            let (ret_cont_closure, ret_cont_def) = self.global_stack.collect_cont_closure(
+                func.reborrow(),
+                ret_cont_origin,
+                EmuContBody { children: EntityList::empty(), next_state_after: dummy_state_in },
+            );
+
+            {
+                let EmuContClosure { origin, input_count, captures } = ret_cont_closure;
+                assert!(origin == Ok(ret_cont_origin));
+                assert_eq!(input_count, call_node_output_indices.len());
+                assert!(captures.is_empty());
+            }
+
+            {
+                let EmuContDef {
+                    inputs_and_captures,
+                    body: EmuContBody { children: _, next_state_after: dummy_state_out },
+                } = &ret_cont_def;
+
+                assert_eq!(inputs_and_captures.len(), call_node_output_indices.len());
+                assert!(*dummy_state_out == dummy_state_in);
+            }
+
+            ret_cont_def
         };
 
         let state_machine_loop_body = func.regions.define(cx, RegionDef::default());
@@ -1190,7 +1224,7 @@ impl<'a> CallStackEmulator<'a> {
         // will end up (i.e. the state machine loop keeps going), with only the
         // successful return, and error states, being matched for explicitly.
         let non_default_next_state_switch_cases = [
-            (call_site_ret_cont_state, Ok((ret_vals_pops_nodes, ret_vals))),
+            (call_site_ret_cont_state, Ok(ret_cont_def)),
             (EmuStateIdx::STACK_OVERFLOW, Err("stack overflow")),
             (EmuStateIdx::UNKNOWN_STATE, Err("unknown state")),
         ];
@@ -1203,8 +1237,14 @@ impl<'a> CallStackEmulator<'a> {
             .map(|maybe_non_default_case| {
                 let case_region = func.regions.define(cx, RegionDef::default());
                 let break_with_outputs = match maybe_non_default_case {
-                    Some((_, Ok((ret_vals_pops_nodes, ret_vals)))) => {
-                        func.regions[case_region].children.append(ret_vals_pops_nodes, func.nodes);
+                    Some((_, Ok(ret_cont_def))) => {
+                        let ret_vals = ret_cont_def
+                            .inputs_and_captures
+                            .iter()
+                            .map(|&v| Value::Var(v))
+                            .collect();
+                        ret_cont_def
+                            .define_into(func.reborrow().at(case_region), &self.global_stack);
                         Some(ret_vals)
                     }
                     Some((_, Err(msg))) => {
@@ -1288,7 +1328,7 @@ impl<'a> CallStackEmulator<'a> {
             state_machine_loop_node_def.child_regions =
                 [state_machine_loop_body].into_iter().collect();
 
-            state_machine_loop_node_def.inputs.push(initial_state);
+            state_machine_loop_node_def.inputs.push(call_start_cont_body.next_state_after);
 
             // HACK(eddyb) `.outputs` starts out as all of the original call's
             // output `Var`s, which are already in the right place to take the
@@ -1366,7 +1406,7 @@ struct FuncEmuStates {
 /// and may include additional helper state(s) where necessary.
 //
 // FIXME(eddyb) better names/organization?
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 struct RegionEmuStates {
     /// Only used for function bodies (i.e. as the target of a call) and
     /// loop bodies (i.e. as the target of a backedge).
@@ -1377,7 +1417,7 @@ struct RegionEmuStates {
 /// or due to its children), and includes additional helper state(s).
 //
 // FIXME(eddyb) better names/organization?
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 struct NodeEmuStates {
     /// The "continuation" (or "exit"), into the parent `Region`, of this
     /// node, receiving the outputs of this node (e.g. `FuncCall` return values,
@@ -1697,16 +1737,18 @@ impl<'a> EmuGlobalStack<'a> {
 
     // FIXME(eddyb) is this the right API?
     // TODO(eddyb) document as building `λ(...inputs). cont_body`.
+    #[must_use]
     fn collect_cont_closure(
         &self,
         func: FuncAtMut<'_, ()>,
         origin: Either<(Region, RegionEmuStates), (Node, NodeEmuStates)>,
         cont_body: EmuContBody,
-    ) -> (EmuContClosure, EmuContBody) {
+    ) -> (EmuContClosure, EmuContDef) {
         self.collect_cont_closure_with_collector_access(func, origin, cont_body, |_, _| {})
     }
 
     // TODO(eddyb) document like `collect_cont_closure` while allowing self-invocation.
+    #[must_use]
     fn collect_cont_closure_with_collector_access(
         &self,
         mut func: FuncAtMut<'_, ()>,
@@ -1714,11 +1756,10 @@ impl<'a> EmuGlobalStack<'a> {
         mut cont_body: EmuContBody,
         // FIXME(eddyb) this is only used by loops for self-invocation, find some
         // better way (builder pattern?) to access this API.
-        access_collector: impl FnOnce(FuncAtMut<'_, ()>, &mut EmuContClosureCollector<'_, '_>),
-    ) -> (EmuContClosure, EmuContBody) {
+        access_collector: impl FnOnce(FuncAtMut<'_, ()>, &mut EmuContClosureCollector<'_>),
+    ) -> (EmuContClosure, EmuContDef) {
         let mut collector = EmuContClosureCollector {
-            global_stack: self,
-            popper: None,
+            cx: &self.cx,
 
             closure: EmuContClosure {
                 origin: Ok(origin),
@@ -1730,13 +1771,13 @@ impl<'a> EmuGlobalStack<'a> {
                 captures: FxIndexSet::default(),
             },
 
-            pops_of_inputs_and_captures: vec![],
+            inputs_and_captures: vec![],
             defined_vars: EntityOrientedDenseMap::new(),
         };
 
         // HACK(eddyb) guarantee the first `cont.input_count` pops.
         for i in 0..collector.closure.input_count {
-            assert_eq!(collector.pops_of_inputs_and_captures.len(), i);
+            assert_eq!(collector.inputs_and_captures.len(), i);
             let v = Value::Var(origin.either(
                 |(region, _)| func.regions[region].inputs[i],
                 |(node, _)| func.nodes[node].outputs[i],
@@ -1744,11 +1785,11 @@ impl<'a> EmuGlobalStack<'a> {
             match collector.transform_value_use_in_func(func.reborrow().at(v)) {
                 Transformed::Unchanged => unreachable!(),
                 Transformed::Changed(new) => {
-                    assert!(new == Value::Var(collector.pops_of_inputs_and_captures[i]));
+                    assert!(new == Value::Var(collector.inputs_and_captures[i]));
                 }
             }
         }
-        assert_eq!(collector.pops_of_inputs_and_captures.len(), collector.closure.input_count);
+        assert_eq!(collector.inputs_and_captures.len(), collector.closure.input_count);
         assert!(collector.closure.captures.is_empty());
 
         func.reborrow()
@@ -1763,12 +1804,10 @@ impl<'a> EmuGlobalStack<'a> {
         access_collector(func.reborrow(), &mut collector);
         assert_eq!(collector.closure.captures.len(), frozen_capture_count);
 
-        if let Some(popper) = collector.popper.take() {
-            let pops_nodes = popper.finish(func.reborrow());
-            cont_body.children.prepend(pops_nodes, func.nodes);
-        }
-
-        (collector.closure, cont_body)
+        (
+            collector.closure,
+            EmuContDef { inputs_and_captures: collector.inputs_and_captures, body: cont_body },
+        )
     }
 
     // FIXME(eddyb) is this the right API?
@@ -1778,11 +1817,25 @@ impl<'a> EmuGlobalStack<'a> {
         mut func: FuncAtMut<'_, ()>,
         cont: &EmuContClosure,
         inputs: &[Value],
+        // FIXME(eddyb) get rid of this by encoding everything with e.g. thunks.
+        ret_cont_input: Option<&EmuContClosure>,
     ) -> EmuContBody {
         assert_eq!(inputs.len(), cont.input_count);
 
-        let values_in_pop_order =
-            inputs.iter().copied().chain(cont.captures.iter().map(|&v| Value::Var(v)));
+        let ret_cont_state = ret_cont_input.map(|ret_cont| ret_cont.entry_state_value(&self.cx));
+        let captures = match ret_cont_input {
+            Some(ret_cont) => {
+                assert!(cont.captures.is_empty());
+                &ret_cont.captures
+            }
+            None => &cont.captures,
+        };
+
+        let values_in_pop_order = inputs
+            .iter()
+            .copied()
+            .chain(ret_cont_state)
+            .chain(captures.iter().map(|&v| Value::Var(v)));
         let values_in_push_order = values_in_pop_order.rev();
 
         let mut pusher = self.pusher(func.reborrow());
@@ -1883,8 +1936,10 @@ impl EmuStackPusherPopper<'_, '_, /*CAN_PUSH=*/ true> {
 }
 
 impl EmuStackPusherPopper<'_, '_, /*CAN_PUSH=*/ false> {
-    fn pop(&mut self, func: FuncAtMut<'_, ()>, ty: Type) -> Var {
+    fn pop_into(&mut self, func: FuncAtMut<'_, ()>, output_var: Var) {
         let cx = &self.global_stack.cx;
+
+        let ty = func.vars[output_var].ty;
 
         let mut attrs = AttrSet::default();
         let size_in_stack_units = self
@@ -1908,18 +1963,18 @@ impl EmuStackPusherPopper<'_, '_, /*CAN_PUSH=*/ false> {
                 }),
                 inputs: [Value::Var(self.stack_ptr)].into_iter().collect(),
                 child_regions: [].into_iter().collect(),
-                outputs: [].into_iter().collect(),
+                outputs: [output_var].into_iter().collect(),
             }
             .into(),
         );
 
-        // FIXME(eddyb) automate this (insertion cursor?).
-        let output_var = func.vars.define(
-            cx,
-            VarDecl { attrs: Default::default(), ty, def_parent: Either::Right(inst), def_idx: 0 },
-        );
-        func.nodes[inst].outputs.push(output_var);
+        {
+            let output_var_decl = &mut func.vars[output_var];
+            output_var_decl.def_parent = Either::Right(inst);
+            output_var_decl.def_idx = 0;
+        }
 
+        // FIXME(eddyb) automate this (insertion cursor?).
         self.push_pop_insts.insert_last(inst, func.nodes);
 
         self.accessed_stack_unit_offsets.start =
@@ -1930,8 +1985,6 @@ impl EmuStackPusherPopper<'_, '_, /*CAN_PUSH=*/ false> {
             .unwrap();
         self.accessed_stack_unit_offsets.end =
             self.accessed_stack_unit_offsets.end.max(self.offset_in_stack_units);
-
-        output_var
     }
 
     // HACK(eddyb) popping doesn't need to worry about stack overflows.
@@ -2176,9 +2229,8 @@ impl<const CAN_PUSH: bool> EmuStackPusherPopper<'_, '_, CAN_PUSH> {
     }
 }
 
-struct EmuContClosureCollector<'a, 'b> {
-    global_stack: &'b EmuGlobalStack<'a>,
-    popper: Option<EmuStackPusherPopper<'a, 'b, false>>,
+struct EmuContClosureCollector<'a> {
+    cx: &'a Context,
 
     /// The continuation whose `captures` are being collected.
     closure: EmuContClosure,
@@ -2191,7 +2243,9 @@ struct EmuContClosureCollector<'a, 'b> {
     /// Note that pushing has to be done in reverse (moving the stack top downwards),
     /// though this is mainly relevant when inputs are pushed separately, which
     /// is why inputs are popped first (`0..cont.input_count`), and pushed last.
-    pops_of_inputs_and_captures: Vec<Var>,
+    //
+    // TODO(eddyb) update the docs, now that the pops are not done on the fly.
+    inputs_and_captures: Vec<Var>,
 
     // HACK(eddyb) efficient tracking to allow determining if a `Value` is part
     // of the continuation itself, or a capture (see `popped_values`).
@@ -2238,6 +2292,8 @@ impl EmuContClosure {
 /// - no inputs
 /// - child `Node`s (including all necessary stack manipulation)
 /// - one output: `next_state_after` (see also its documentation)
+//
+// TODO(eddyb) update docs (after `EmuContDef` addition)
 struct EmuContBody {
     children: EntityList<Node>,
 
@@ -2265,13 +2321,45 @@ impl EmuContBody {
     }
 }
 
-impl Transformer for EmuContClosureCollector<'_, '_> {
+// HACK(eddyb) this is the "def-side" of an emulated continuation, which can be
+// invoked via `EmuContClosure` (making that the "use-side").
+// TODO(eddyb) document (might be gone after thunkification?)
+struct EmuContDef {
+    inputs_and_captures: Vec<Var>,
+    body: EmuContBody,
+}
+
+impl EmuContDef {
+    fn define_into(
+        self,
+        mut func_at_region: FuncAtMut<'_, Region>,
+        global_stack: &EmuGlobalStack<'_>,
+    ) {
+        let EmuContDef { inputs_and_captures, mut body } = self;
+
+        if !inputs_and_captures.is_empty() {
+            let mut func = func_at_region.reborrow().at(());
+
+            let mut popper = global_stack.popper(func.reborrow());
+            for v in inputs_and_captures {
+                popper.pop_into(func.reborrow(), v);
+            }
+
+            let pops_nodes = popper.finish(func.reborrow());
+            body.children.prepend(pops_nodes, func.nodes);
+        }
+
+        *func_at_region.def() = body.into_region_def();
+    }
+}
+
+impl Transformer for EmuContClosureCollector<'_> {
     fn transform_value_use_in_func(
         &mut self,
         func_at_val: FuncAtMut<'_, Value>,
     ) -> Transformed<Value> {
         let v = func_at_val.position;
-        let mut func = func_at_val.at(());
+        let func = func_at_val.at(());
 
         let Value::Var(v) = v else {
             return Transformed::Unchanged;
@@ -2294,26 +2382,34 @@ impl Transformer for EmuContClosureCollector<'_, '_> {
             _ => None,
         };
 
-        let pop_idx = match cont_input_idx {
+        let input_or_capture_idx = match cont_input_idx {
             Some(input_idx) => input_idx.try_into().unwrap(),
             None => self.closure.input_count + self.closure.captures.insert_full(v).0,
         };
 
-        if let Some(&v) = self.pops_of_inputs_and_captures.get(pop_idx) {
+        if let Some(&v) = self.inputs_and_captures.get(input_or_capture_idx) {
             // Already seen (i.e. effectively cached).
             return Transformed::Changed(Value::Var(v));
         }
 
-        // Generate the pop (and scaffolding, if not yet present).
-        assert_eq!(pop_idx, self.pops_of_inputs_and_captures.len());
+        // Reserve a new `Var` that can eventually be used as a pop destination.
+        assert_eq!(input_or_capture_idx, self.inputs_and_captures.len());
 
         let ty = func.vars[v].ty;
-        let popped_value = self
-            .popper
-            .get_or_insert_with(|| self.global_stack.popper(func.reborrow()))
-            .pop(func.reborrow(), ty);
-        self.pops_of_inputs_and_captures.push(popped_value);
-        Transformed::Changed(Value::Var(popped_value))
+
+        let new_var = func.vars.define(
+            self.cx,
+            VarDecl {
+                attrs: Default::default(),
+                ty,
+                // HACK(eddyb) using an existing parent to declare an "orphan" `Var`.
+                def_parent: func.vars[v].def_parent,
+                def_idx: !0,
+            },
+        );
+        self.inputs_and_captures.push(new_var);
+
+        Transformed::Changed(Value::Var(new_var))
     }
 
     fn in_place_transform_region_def(&mut self, mut func_at_region: FuncAtMut<'_, Region>) {
@@ -2328,7 +2424,7 @@ impl Transformer for EmuContClosureCollector<'_, '_> {
         let node_def = func_at_node.def();
         if let NodeKind::Mem(MemOp::FuncLocalVar(_)) = node_def.kind {
             node_def.attrs.push_diag(
-                &self.global_stack.cx,
+                self.cx,
                 Diag::bug(["unexpected local not at the start of the function".into()]),
             );
         }
@@ -2359,17 +2455,17 @@ impl EmuFuncFracker<'_> {
         let mut children = mem::take(&mut cont_body.children);
         while let Some(node) = children.remove_last(func.nodes) {
             if let Some(&node_states) = self.states.for_node.get(node) {
-                let (merge_cont, merge_cont_body) = self.global_stack.collect_cont_closure(
+                let (merge_cont, merge_cont_def) = self.global_stack.collect_cont_closure(
                     func.reborrow(),
                     Either::Right((node, node_states)),
                     cont_body,
                 );
                 assert_eq!(merge_cont.entry_state_idx().ok().unwrap(), node_states.merge);
 
-                self.state_switch_cases.insert(
-                    node_states.merge,
-                    func.regions.define(cx, merge_cont_body.into_region_def()),
-                );
+                let merge_cont_region = func.regions.define(cx, RegionDef::default());
+                merge_cont_def
+                    .define_into(func.reborrow().at(merge_cont_region), self.global_stack);
+                self.state_switch_cases.insert(node_states.merge, merge_cont_region);
 
                 cont_body = self.frack_node(func.reborrow().at(node), merge_cont);
             } else {
@@ -2433,24 +2529,25 @@ impl EmuFuncFracker<'_> {
 
         let cont_body = self.frack_cont_body_nodes_as_needed(func.reborrow(), cont_body);
 
-        let (maybe_entry_cont, cont_body) = if let Some(entry_state) = region_states.entry_state {
-            let (entry_cont, entry_cont_body) = self.global_stack.collect_cont_closure(
+        if let Some(entry_state) = region_states.entry_state {
+            let (entry_cont, entry_cont_def) = self.global_stack.collect_cont_closure(
                 func.reborrow(),
                 Either::Left((region, region_states)),
                 cont_body,
             );
             assert_eq!(entry_cont.entry_state_idx().ok().unwrap(), entry_state);
 
+            entry_cont_def.define_into(func.at(region), self.global_stack);
             self.state_switch_cases.insert(entry_state, region);
 
-            (Some(entry_cont), entry_cont_body)
+            Some(entry_cont)
         } else {
             assert_eq!(func.regions[region].inputs.len(), 0);
-            (None, cont_body)
-        };
-        func.regions[region] = cont_body.into_region_def();
 
-        maybe_entry_cont
+            func.regions[region] = cont_body.into_region_def();
+
+            None
+        }
     }
 
     fn frack_node(
@@ -2483,6 +2580,7 @@ impl EmuFuncFracker<'_> {
                                 func.reborrow(),
                                 &merge,
                                 case_outputs,
+                                None,
                             );
                             cont_body.children.prepend(children, func.nodes);
                             cont_body
@@ -2539,7 +2637,7 @@ impl EmuFuncFracker<'_> {
                 let [backedge_region, merge_region] = [
                     RegionDef::default(),
                     self.global_stack
-                        .invoke_cont_closure(func.reborrow(), &merge, &body_outputs)
+                        .invoke_cont_closure(func.reborrow(), &merge, &body_outputs, None)
                         .into_region_def(),
                 ]
                 .map(|def| func.regions.define(cx, def));
@@ -2573,7 +2671,7 @@ impl EmuFuncFracker<'_> {
 
                     EmuContBody { children, next_state_after: Value::Var(cb_output_var) }
                 };
-                let (body_entry_cont, whole_body_cont_body) =
+                let (body_entry_cont, mut whole_body_cont_def) =
                     self.global_stack.collect_cont_closure_with_collector_access(
                         func.reborrow(),
                         Either::Left((body, body_states)),
@@ -2585,6 +2683,7 @@ impl EmuFuncFracker<'_> {
                                     func.reborrow(),
                                     &collector.closure,
                                     &body_outputs,
+                                    None,
                                 )
                                 .into_region_def();
                             collector.in_place_transform_region_def(func.at(backedge_region));
@@ -2596,9 +2695,9 @@ impl EmuFuncFracker<'_> {
                 // the self-invocation performed above is *already* aware of
                 // any captures needed *anywhere* inside the `body`, before
                 // fracking its child nodes may split it into separate regions.
-                func.regions[body] = self
-                    .frack_cont_body_nodes_as_needed(func.reborrow(), whole_body_cont_body)
-                    .into_region_def();
+                whole_body_cont_def.body =
+                    self.frack_cont_body_nodes_as_needed(func.reborrow(), whole_body_cont_def.body);
+                whole_body_cont_def.define_into(func.reborrow().at(body), self.global_stack);
 
                 // HACK(eddyb) this used to be part of `frack_region_as_needed`.
                 {
@@ -2606,18 +2705,15 @@ impl EmuFuncFracker<'_> {
                     self.state_switch_cases.insert(body_entry_state, body);
                 }
                 let loop_initial_inputs = mem::take(&mut func.nodes[node].inputs);
-                self.global_stack.invoke_cont_closure(func, &body_entry_cont, &loop_initial_inputs)
+                self.global_stack.invoke_cont_closure(
+                    func,
+                    &body_entry_cont,
+                    &loop_initial_inputs,
+                    None,
+                )
             }
 
-            // TODO(eddyb) use `invoke_cont_closure` here.
             &DataInstKind::FuncCall(callee) => {
-                let callee_entry_cont = &self.func_call_emu_cont[&callee];
-
-                let inputs = mem::take(&mut node_def.inputs);
-                assert_eq!(inputs.len(), callee_entry_cont.input_count);
-                assert!(callee_entry_cont.captures.is_empty());
-
-                // FIXME(eddyb) the `.rev()` usage here is not self-explanatory.
                 // TODO(eddyb) for this to be compatible with "frame (base) pointers",
                 // the `merge` (return) continuation should be pushed separately
                 // from the actual function inputs, and/or maybe there should
@@ -2630,21 +2726,13 @@ impl EmuFuncFracker<'_> {
                 // `qptr::legalize` has to handle (the data one, that is), and
                 // the stack being restored is done by that return continuation
                 // happening to capture the next up frame pointer or w/e etc.
-                let values_in_push_order = (merge.captures.iter().map(|&v| Value::Var(v)).rev())
-                    .chain([merge.entry_state_value(cx)])
-                    .chain(inputs.iter().copied().rev());
-
-                let mut pusher = self.global_stack.pusher(func.reborrow());
-                for v in values_in_push_order {
-                    pusher.push(func.reborrow(), v);
-                }
-                let (pushes_nodes, next_state_after) = pusher
-                    .finish_for_state(func.reborrow(), callee_entry_cont.entry_state_value(cx));
-
-                let mut children = EntityList::empty();
-                children.append(pushes_nodes, func.nodes);
-
-                EmuContBody { children, next_state_after }
+                let inputs = mem::take(&mut node_def.inputs);
+                self.global_stack.invoke_cont_closure(
+                    func,
+                    &self.func_call_emu_cont[&callee],
+                    &inputs,
+                    Some(&merge),
+                )
             }
 
             // FIXME(eddyb) deduplicate with `FuncCall` above.
@@ -2652,22 +2740,18 @@ impl EmuFuncFracker<'_> {
                 if spv_inst.opcode == wk.OpFunctionPointerCallINTEL =>
             {
                 let inputs = mem::take(&mut node_def.inputs);
+                let (&callee, inputs) = inputs.split_first().unwrap();
 
-                let values_in_push_order = (merge.captures.iter().map(|&v| Value::Var(v)).rev())
-                    .chain([merge.entry_state_value(cx)])
-                    .chain(inputs[1..].iter().copied().rev());
-
-                let mut pusher = self.global_stack.pusher(func.reborrow());
-                for v in values_in_push_order {
-                    pusher.push(func.reborrow(), v);
-                }
-                let (pushes_nodes, next_state_after) =
-                    pusher.finish_for_state(func.reborrow(), inputs[0]);
-
-                let mut children = EntityList::empty();
-                children.append(pushes_nodes, func.nodes);
-
-                EmuContBody { children, next_state_after }
+                self.global_stack.invoke_cont_closure(
+                    func,
+                    &EmuContClosure {
+                        origin: Err(callee),
+                        input_count: inputs.len(),
+                        captures: FxIndexSet::default(),
+                    },
+                    inputs,
+                    Some(&merge),
+                )
             }
 
             DataInstKind::Scalar(_)
