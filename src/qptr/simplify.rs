@@ -1017,7 +1017,9 @@ impl PropagateLocalContents<'_> {
                 }
             }
 
-            NodeKind::ExitInvocation(crate::cf::ExitInvocationKind::SpvInst(_))
+            NodeKind::ExitInvocation(
+                crate::cf::ExitInvocationKind::SpvInst(_) | crate::cf::ExitInvocationKind::Abort,
+            )
             | NodeKind::Scalar(_)
             | NodeKind::Vector(_)
             | NodeKind::FuncCall(_)

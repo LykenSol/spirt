@@ -1867,7 +1867,9 @@ impl<'a> LegalizePtrs<'a> {
                 }
             }
 
-            NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
+            NodeKind::ExitInvocation(
+                cf::ExitInvocationKind::SpvInst(_) | cf::ExitInvocationKind::Abort,
+            )
             | NodeKind::Scalar(_)
             | NodeKind::Vector(_)
             | NodeKind::Mem(MemOp::FuncLocalVar(_) | MemOp::Copy { .. })
@@ -2646,7 +2648,9 @@ impl ScanBasesInFunc<'_> {
                 }
             }
 
-            NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
+            NodeKind::ExitInvocation(
+                cf::ExitInvocationKind::SpvInst(_) | cf::ExitInvocationKind::Abort,
+            )
             | NodeKind::Scalar(_)
             | NodeKind::Vector(_)
             | NodeKind::Mem(
@@ -3192,7 +3196,9 @@ impl ScanBasesInFunc<'_> {
                 QPtrDefLaw::DecodeEscaped
             }
 
-            NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
+            NodeKind::ExitInvocation(
+                cf::ExitInvocationKind::SpvInst(_) | cf::ExitInvocationKind::Abort,
+            )
             | NodeKind::ThunkBind(_)
             | NodeKind::SpvInst(..)
             | NodeKind::SpvExtInst { .. } => QPtrDefLaw::Unsupported,
