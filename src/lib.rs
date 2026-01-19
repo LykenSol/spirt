@@ -828,6 +828,19 @@ pub use context::Func;
 pub struct FuncDecl {
     pub attrs: AttrSet,
 
+    /// The "return value index" for "explicitly propagated `abort`s" out of this
+    /// function (see also [`cf::ExitInvocationKind::Abort`]).
+    ///
+    /// When this is `Some(i)`, then `ret_types[i]` must have boolean type, and
+    /// all calls to this function must immediately branch on the `i`th output
+    /// of the call, to `abort` themselves if the `i`th returned value is `true`
+    /// (either by also having its own `bool` return value with a corresponding
+    /// `explicitly_propagated_abort_output_idx`, or by being an entry-point).
+    //
+    // FIXME(eddyb) actually validate that this is used correctly.
+    // FIXME(eddyb) should this actually be an attribute instead?
+    pub explicitly_propagated_abort_ret_idx: Option<u32>,
+
     pub ret_types: SmallVec<[Type; 2]>,
 
     pub params: SmallVec<[FuncParam; 2]>,

@@ -1650,6 +1650,7 @@ impl<'a> Interpreter<'a> {
                 NodeKind::Select(SelectionKind::BoolCond) => "if",
                 NodeKind::Select(SelectionKind::Switch { .. }) => "switch",
                 NodeKind::Loop { .. } => "loop",
+                NodeKind::ExitInvocation(spirt::cf::ExitInvocationKind::Abort) => "abort",
 
                 DataInstKind::Scalar(op) => op.name(),
                 DataInstKind::Vector(op) => match op {

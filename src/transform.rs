@@ -580,7 +580,7 @@ impl InnerInPlaceTransform for GlobalVarInit {
 
 impl InnerInPlaceTransform for FuncDecl {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
-        let Self { attrs, ret_types, params, def } = self;
+        let Self { attrs, explicitly_propagated_abort_ret_idx: _, ret_types, params, def } = self;
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
         for ty in ret_types {
@@ -684,7 +684,9 @@ impl InnerInPlaceTransform for FuncAtMut<'_, Node> {
                 SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
             )
             | NodeKind::Loop { repeat_condition: _ }
-            | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
+            | NodeKind::ExitInvocation(
+                cf::ExitInvocationKind::SpvInst(_) | cf::ExitInvocationKind::Abort,
+            )
             | DataInstKind::Scalar(_)
             | DataInstKind::Vector(_)
             | DataInstKind::Mem(

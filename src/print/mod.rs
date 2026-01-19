@@ -3603,10 +3603,20 @@ impl Print for GlobalVarInit {
 impl Print for FuncDecl {
     type Output = AttrsAndDef;
     fn print(&self, printer: &Printer<'_>) -> AttrsAndDef {
-        let Self { attrs, ret_types, params, def } = self;
+        let Self { attrs, explicitly_propagated_abort_ret_idx, ret_types, params, def } = self;
 
         let sig_ret = if !ret_types.is_empty() {
-            let mut ret_types = ret_types.iter().map(|ty| ty.print(printer));
+            let mut ret_types = ret_types.iter().enumerate().map(|(i, ty)| {
+                // FIXME(eddyb) replacing `explicitly_propagated_abort_ret_idx`
+                // with an attribute might make a lot more sense.
+                pretty::Fragment::new(
+                    explicitly_propagated_abort_ret_idx
+                        .filter(|&ret_idx| u32::try_from(i).unwrap() == ret_idx)
+                        .map(|_| printer.comment_style().apply("/* propagate abort */ ").into())
+                        .into_iter()
+                        .chain([ty.print(printer)]),
+                )
+            });
             let ret_type = if ret_types.len() == 1 {
                 ret_types.next().unwrap()
             } else {
@@ -3967,6 +3977,10 @@ impl Print for FuncAt<'_, Node> {
                 imms,
                 inputs.iter().map(|v| v.print(printer)),
             ),
+            NodeKind::ExitInvocation(cf::ExitInvocationKind::Abort) => {
+                assert!(inputs.is_empty());
+                kw("abort")
+            }
 
             DataInstKind::Scalar(_)
             | DataInstKind::Vector(_)

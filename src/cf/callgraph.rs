@@ -5,10 +5,10 @@ use crate::mem::MemOp;
 use crate::transform::{Transformed, Transformer};
 use crate::visit::{InnerVisit as _, Visitor};
 use crate::{
-    AttrSet, Const, ConstDef, ConstKind, Context, DataInstKind, DeclDef, Diag,
+    AttrSet, Const, ConstDef, ConstKind, Context, DataInstKind, DeclDef, Diag, EntityList,
     EntityOrientedDenseMap, ExportKey, Exportee, Func, FuncDefBody, FxIndexMap, FxIndexSet,
-    GlobalVar, Import, Module, Node, NodeDef, NodeKind, Region, RegionDef, Type, Value, Var, cf,
-    spv,
+    GlobalVar, Import, Module, Node, NodeDef, NodeKind, Region, RegionDef, Type, Value, Var,
+    VarDecl, cf, scalar, spv,
 };
 use itertools::Either;
 use rustc_hash::FxHashSet;
@@ -23,6 +23,9 @@ pub struct CallGraph {
     pub caller_to_callees: FxIndexMap<Func, Callees>,
 
     pub indirect_callees: FxIndexSet<Func>,
+
+    // HACK(eddyb) used only for explicitly propagated aborts.
+    pub funcs_that_abort: FxIndexSet<Func>,
 }
 
 #[derive(Default)]
@@ -51,6 +54,7 @@ impl CallGraph {
                 spv_entry_points: FxIndexSet::default(),
                 caller_to_callees: FxIndexMap::default(),
                 indirect_callees: FxIndexSet::default(),
+                funcs_that_abort: FxIndexSet::default(),
             },
             caller: Err("Module"),
 
@@ -157,7 +161,13 @@ impl CallGraph {
 
         // FIXME(eddyb) implement or use diagnostics instead of assert?
         for &func in self.caller_to_callees.keys() {
-            let DeclDef::Present(func_def_body) = &module.funcs[func].def else {
+            let func_decl = &module.funcs[func];
+            assert!(
+                func_decl.explicitly_propagated_abort_ret_idx.is_none(),
+                "inlining does not support explicitly propagated aborts"
+            );
+
+            let DeclDef::Present(func_def_body) = &func_decl.def else {
                 unreachable!();
             };
             assert!(
@@ -197,6 +207,8 @@ impl CallGraph {
                 unreachable!()
             };
 
+            let callee_aborts = self.funcs_that_abort.contains(&callee);
+
             callers.retain(|&mut caller| {
                 // FIXME(eddyb) enforce that no recursion exists to begin with,
                 // but the bottom-up (i.e. postorder) approach should heavily
@@ -209,6 +221,8 @@ impl CallGraph {
                     &mut self.caller_to_callees.get_mut(&caller).unwrap().direct;
                 let call_sites = all_direct_callees.get_mut(&callee).unwrap();
 
+                let mut any_inlined = false;
+
                 let DeclDef::Present(caller_def) = &mut module.funcs[caller].def else {
                     unreachable!()
                 };
@@ -216,9 +230,14 @@ impl CallGraph {
                     let inline = should_inline(caller_def.at(call_site), &callee_def);
                     if inline {
                         inline_call(&cx, caller_def, call_site, &callee_def);
+                        any_inlined = true;
                     }
                     !inline
                 });
+
+                if any_inlined && callee_aborts {
+                    self.funcs_that_abort.insert(caller);
+                }
 
                 !call_sites.is_empty()
             });
@@ -251,6 +270,159 @@ impl CallGraph {
 
             true
         });
+    }
+
+    // FIXME(eddyb) should this be here? (it just happens to be so simple)
+    pub fn explicitly_propagate_aborts(&self, module: &mut Module) {
+        // TODO(eddyb) replace this with injecting diagnostics, and on call sites,
+        // not on the callees (which can just be because of function pointers).
+        assert!(
+            self.indirect_callees.is_empty(),
+            "explicitly_propagate_aborts does not support indirect calls"
+        );
+
+        // FIXME(eddyb) implement or use diagnostics instead of assert?
+        for &func in self.caller_to_callees.keys() {
+            let DeclDef::Present(func_def_body) = &module.funcs[func].def else {
+                unreachable!();
+            };
+            assert!(
+                func_def_body.unstructured_cfg.is_none(),
+                "explicitly_propagate_aborts does not support unstructured control-flow"
+            );
+        }
+
+        // FIXME(eddyb) should `CallGraph` itself contain this reverse mapping?
+        let callee_to_callers = {
+            let mut callee_to_callers = FxIndexMap::<_, FxIndexMap<_, _>>::default();
+            for (&caller, callees) in &self.caller_to_callees {
+                for (&callee, call_sites) in &callees.direct {
+                    callee_to_callers.entry(callee).or_default().insert(caller, call_sites);
+                }
+            }
+            callee_to_callers
+        };
+
+        let cx = module.cx();
+        let bool_ty = cx.intern(scalar::Type::Bool);
+
+        let mut any_unsupported_calls = false;
+        for &func in &self.spv_entry_points {
+            let Some(callers) = callee_to_callers.get(&func) else {
+                continue;
+            };
+            for (&caller, &call_sites) in callers {
+                let DeclDef::Present(caller_func_def_body) = &mut module.funcs[caller].def else {
+                    unreachable!();
+                };
+                for call_site in call_sites {
+                    caller_func_def_body.nodes[call_site.func_call_node].attrs.push_diag(
+                        &cx,
+                        Diag::bug(["call to SPIR-V entry-point is unsupported".into()]),
+                    );
+                    any_unsupported_calls = true;
+                }
+            }
+        }
+        if any_unsupported_calls {
+            return;
+        }
+
+        let mut queue: VecDeque<_> = self.funcs_that_abort.iter().copied().collect();
+        while let Some(func) = queue.pop_front() {
+            let func_decl = &mut module.funcs[func];
+            if func_decl.explicitly_propagated_abort_ret_idx.is_some() {
+                continue;
+            }
+
+            // `abort`s in entry-points become unstructured early returns,
+            // which is only sound iff entry-points cannot be directly called.
+            // HACK(eddyb) calls to entry-points are already disallowed above.
+            if self.spv_entry_points.contains(&func) {
+                continue;
+            }
+
+            func_decl.explicitly_propagated_abort_ret_idx =
+                Some(func_decl.ret_types.len().try_into().unwrap());
+            func_decl.ret_types.push(bool_ty);
+            if let DeclDef::Present(func_def_body) = &mut func_decl.def {
+                func_def_body
+                    .at_mut_body()
+                    .def()
+                    .outputs
+                    .push(Value::Const(cx.intern(scalar::Const::FALSE)));
+            }
+
+            let Some(callers) = callee_to_callers.get(&func) else {
+                continue;
+            };
+            for (&caller, &call_sites) in callers {
+                queue.push_back(caller);
+
+                let DeclDef::Present(caller_func_def_body) = &mut module.funcs[caller].def else {
+                    unreachable!();
+                };
+                for call_site in call_sites {
+                    let call_outputs =
+                        &mut caller_func_def_body.nodes[call_site.func_call_node].outputs;
+                    let abort_cond_var = caller_func_def_body.vars.define(
+                        &cx,
+                        VarDecl {
+                            attrs: AttrSet::default(),
+                            ty: cx.intern(scalar::Type::Bool),
+                            def_parent: Either::Right(call_site.func_call_node),
+                            def_idx: call_outputs.len().try_into().unwrap(),
+                        },
+                    );
+                    call_outputs.push(abort_cond_var);
+
+                    let abort_node = caller_func_def_body.nodes.define(
+                        &cx,
+                        NodeDef {
+                            attrs: AttrSet::default(),
+                            kind: NodeKind::ExitInvocation(cf::ExitInvocationKind::Abort),
+                            inputs: [].into_iter().collect(),
+                            child_regions: [].into_iter().collect(),
+                            outputs: [].into_iter().collect(),
+                        }
+                        .into(),
+                    );
+                    let [then_abort_region, else_noop_region] =
+                        [Some(abort_node), None].map(|child_node| {
+                            let mut children = EntityList::empty();
+                            if let Some(node) = child_node {
+                                children.insert_last(node, &mut caller_func_def_body.nodes);
+                            }
+                            caller_func_def_body.regions.define(
+                                &cx,
+                                RegionDef {
+                                    inputs: [].into_iter().collect(),
+                                    children,
+                                    outputs: [].into_iter().collect(),
+                                },
+                            )
+                        });
+                    let conditional_abort_node = caller_func_def_body.nodes.define(
+                        &cx,
+                        NodeDef {
+                            attrs: AttrSet::default(),
+                            kind: NodeKind::Select(cf::SelectionKind::BoolCond),
+                            inputs: [Value::Var(abort_cond_var)].into_iter().collect(),
+                            child_regions: [then_abort_region, else_noop_region]
+                                .into_iter()
+                                .collect(),
+                            outputs: [].into_iter().collect(),
+                        }
+                        .into(),
+                    );
+                    caller_func_def_body.regions[call_site.parent_region].children.insert_after(
+                        conditional_abort_node,
+                        call_site.func_call_node,
+                        &mut caller_func_def_body.nodes,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -382,6 +554,12 @@ impl Visitor<'_> for CallGraphCollector<'_> {
                 func_call_node: func_at_node.position,
                 parent_region: self.parent_region.unwrap(),
             });
+        }
+
+        if let (Ok(parent_func), NodeKind::ExitInvocation(cf::ExitInvocationKind::Abort)) =
+            (self.caller, kind)
+        {
+            self.call_graph.funcs_that_abort.insert(parent_func);
         }
 
         func_at_node.inner_visit_with(self);

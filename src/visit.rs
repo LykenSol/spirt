@@ -512,7 +512,7 @@ impl InnerVisit for GlobalVarInit {
 
 impl InnerVisit for FuncDecl {
     fn inner_visit_with<'a>(&'a self, visitor: &mut impl Visitor<'a>) {
-        let Self { attrs, ret_types, params, def } = self;
+        let Self { attrs, explicitly_propagated_abort_ret_idx: _, ret_types, params, def } = self;
 
         visitor.visit_attr_set_use(*attrs);
         for &ty in ret_types {
@@ -587,7 +587,9 @@ impl<'a> FuncAt<'a, Node> {
                 SelectionKind::BoolCond | SelectionKind::Switch { case_consts: _ },
             )
             | NodeKind::Loop { repeat_condition: _ }
-            | NodeKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(_))
+            | NodeKind::ExitInvocation(
+                cf::ExitInvocationKind::SpvInst(_) | cf::ExitInvocationKind::Abort,
+            )
             | DataInstKind::Scalar(_)
             | DataInstKind::Vector(_)
             | DataInstKind::Mem(

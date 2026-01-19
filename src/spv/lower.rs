@@ -186,6 +186,7 @@ impl Module {
                 );
                 attrs
             },
+            explicitly_propagated_abort_ret_idx: None,
             ret_types: [].into_iter().collect(),
             params: [].into_iter().collect(),
             def: DeclDef::Imported(Import::LinkName(cx.intern(""))),
@@ -193,11 +194,17 @@ impl Module {
         // HACK(eddyb) no `PartialEq` on `FuncDecl`.
         let assert_is_dummy_decl_for_func_forward_ref = |decl: &FuncDecl| {
             let [expected, found] = [&dummy_decl_for_func_forward_ref, decl].map(
-                |FuncDecl { attrs, ret_types, params, def }| {
+                |FuncDecl {
+                     attrs,
+                     explicitly_propagated_abort_ret_idx,
+                     ret_types,
+                     params,
+                     def,
+                 }| {
                     let DeclDef::Imported(import) = def else {
                         unreachable!();
                     };
-                    (attrs, ret_types, params, import)
+                    (attrs, explicitly_propagated_abort_ret_idx, ret_types, params, import)
                 },
             );
             assert!(expected == found);
@@ -1056,7 +1063,13 @@ impl Module {
                     );
                 }
 
-                let decl = FuncDecl { attrs: mem::take(&mut attrs), ret_types, params, def };
+                let decl = FuncDecl {
+                    attrs: mem::take(&mut attrs),
+                    explicitly_propagated_abort_ret_idx: None,
+                    ret_types,
+                    params,
+                    def,
+                };
 
                 let func = {
                     use std::collections::hash_map::Entry;

@@ -136,6 +136,11 @@ struct FuncIds<'a> {
     // (it's easier this way, but it could also be tracked in `ModuleIds`)
     spv_func_type: Type,
 
+    /// Precomputed (and reaggregated) value that must be returned by an `abort`
+    /// out of the function, if `explicitly_propagated_abort_ret_idx` is in use
+    /// (the value at that index is set to `true`, while the rest are `undef`s).
+    explicitly_propagated_abort_ret_const: Option<Const>,
+
     func_id: spv::Id,
     param_ids: Range<spv::Id>,
 
@@ -304,6 +309,32 @@ impl<AI: AllocIds> Visitor<'_> for Lifter<'_, AI> {
         );
         self.visit_type_use(spv_func_type);
 
+        let explicitly_propagated_abort_ret_const =
+            func_decl.explicitly_propagated_abort_ret_idx.map(|abort_cond_ret_idx| {
+                let ct = self.reaggregate_const(
+                    spv_func_ret_type,
+                    &func_decl
+                        .ret_types
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &ty)| {
+                            if u32::try_from(i).unwrap() == abort_cond_ret_idx {
+                                assert!(ty.as_scalar(self.cx) == Some(scalar::Type::Bool));
+                                self.cx.intern(scalar::Const::TRUE)
+                            } else {
+                                self.cx.intern(ConstDef {
+                                    attrs: AttrSet::default(),
+                                    ty,
+                                    kind: ConstKind::Undef,
+                                })
+                            }
+                        })
+                        .collect::<SmallVec<[_; 2]>>(),
+                );
+                self.visit_const_use(ct);
+                ct
+            });
+
         // NOTE(eddyb) inserting first produces a different function ordering
         // overall in the final module, but the order doesn't matter, and we
         // need to avoid infinite recursion for recursive functions.
@@ -314,6 +345,7 @@ impl<AI: AllocIds> Visitor<'_> for Lifter<'_, AI> {
                 spv_func_type,
                 func_id: self.alloc_ids.one(),
                 param_ids: (self.alloc_ids)(func_decl.params.len()),
+                explicitly_propagated_abort_ret_const,
                 body: None,
             },
         );
@@ -2067,6 +2099,19 @@ impl LazyInst<'_, '_> {
                     }
                     TerminatorKind::ExitInvocation(cf::ExitInvocationKind::SpvInst(inst)) => {
                         inst.clone()
+                    }
+                    TerminatorKind::ExitInvocation(cf::ExitInvocationKind::Abort) => {
+                        assert_eq!(id_operands.len(), 0);
+                        id_operands.extend(
+                            parent_func_ids
+                                .explicitly_propagated_abort_ret_const
+                                .map(|ct| ids.globals[&Global::Const(ct)]),
+                        );
+                        if id_operands.is_empty() {
+                            wk.OpReturn.into()
+                        } else {
+                            wk.OpReturnValue.into()
+                        }
                     }
 
                     TerminatorKind::Branch => wk.OpBranch.into(),
