@@ -478,6 +478,7 @@ impl<'a> LegalizePtrs<'a> {
         // FIXME(eddyb) make these configurable.
         let fuse_all_private_globals = true;
         let reuse_fused_private_global_for_escaped_func_locals = true;
+        let fuse_all_escaped_func_locals = true;
 
         // HACK(eddyb) fuse as many `GlobalVar` as possible (in theory, only
         // one `GlobalVar` should be needed for `Private` and `Workgroup` each,
@@ -511,6 +512,12 @@ impl<'a> LegalizePtrs<'a> {
                 else {
                     continue;
                 };
+
+                // HACK(eddyb) do not fuse ZSTs.
+                // TODO(eddyb) consider using offset `0` for these.
+                if layout.size == 0 {
+                    continue;
+                }
 
                 // FIXME(eddyb) remove some of these restrictions.
                 if attrs != AttrSet::default()
@@ -643,7 +650,7 @@ impl<'a> LegalizePtrs<'a> {
 
                     // HACK(eddyb) zero out any padding, instead of leaving it
                     // `undef`, to increase `qptr::lift`'s chances of success.
-                    for offset in fused_init_old_size..aligned_size {
+                    for offset in fused_init_old_size..fused_init.size() {
                         fused_init.write_bytes(offset, &[0]).unwrap();
                     }
                 }
@@ -1062,8 +1069,7 @@ impl<'a> LegalizePtrs<'a> {
 
                         def: DeclDef::Present(GlobalVarDefBody { initializer: None }),
                     };
-                    // FIXME(eddyb) make this configurable.
-                    let (gv, offset_in_gv) = if true {
+                    let (gv, offset_in_gv) = if fuse_all_escaped_func_locals {
                         // FIXME(eddyb) this is the opposite of elegant.
                         let fused_gv = *fused_private_global_for_escaped_func_locals
                             .get_or_insert_with(|| {
@@ -1096,6 +1102,43 @@ impl<'a> LegalizePtrs<'a> {
                     module.global_vars[gv]
                         .attrs
                         .push_diags(&self.cx, local_def.attrs.diags(&self.cx).iter().cloned());
+
+                    // HACK(eddyb) trying to get unfused to work (via align 8).
+                    // TODO(eddyb) get rid of this, or base it off of access
+                    // patterns, the worst-case scenario, etc. etc.
+                    if !fuse_all_escaped_func_locals {
+                        use crate::mem::shapes::GlobalVarShape;
+
+                        let GlobalVarDecl {
+                            shape: Some(GlobalVarShape::UntypedData(layout)),
+                            def: DeclDef::Present(GlobalVarDefBody { initializer }),
+                            ..
+                        } = &mut module.global_vars[gv]
+                        else {
+                            unreachable!();
+                        };
+
+                        // TODO(eddyb) get rid of this, or base it off of access
+                        // patterns, the worst-case scenario, etc. etc.
+                        layout.align = layout.align.max(8);
+
+                        layout.size = layout.size.checked_next_multiple_of(layout.align).unwrap();
+
+                        match initializer {
+                            Some(GlobalVarInit::Data(init)) => {
+                                let init_old_size = init.size();
+                                init.grow(layout.size);
+
+                                // HACK(eddyb) zero out any padding, instead of leaving it
+                                // `undef`, to increase `qptr::lift`'s chances of success.
+                                for offset in init_old_size..init.size() {
+                                    init.write_bytes(offset, &[0]).unwrap();
+                                }
+                            }
+                            None => {}
+                            _ => unreachable!(),
+                        }
+                    }
 
                     // FIXME(eddyb) cache this when possible.
                     let ptr_to_gv = self.cx.intern(ConstDef {
@@ -1193,7 +1236,16 @@ impl<'a> LegalizePtrs<'a> {
                 fused_layout.size.checked_next_multiple_of(fused_layout.align).unwrap();
 
             match initializer {
-                Some(GlobalVarInit::Data(init)) => init.grow(fused_layout.size),
+                Some(GlobalVarInit::Data(init)) => {
+                    let init_old_size = init.size();
+                    init.grow(fused_layout.size);
+
+                    // HACK(eddyb) zero out any padding, instead of leaving it
+                    // `undef`, to increase `qptr::lift`'s chances of success.
+                    for offset in init_old_size..init.size() {
+                        init.write_bytes(offset, &[0]).unwrap();
+                    }
+                }
                 None => {}
                 _ => unreachable!(),
             }
@@ -3788,46 +3840,136 @@ impl<'a> LegalizePtrsInFunc<'a> {
                     NodeKind::Mem(MemOp::Load { offset } | MemOp::Store { offset })
                         if input_idx == 0 =>
                     {
-                        Some(offset.map_or(0, |o| o.get()))
+                        // TODO(eddyb) make this unnecessary by baking a *range*
+                        // into `mem.{load,store}`, *not just* the base offset.
+                        let access_size = {
+                            let access_type = match node_def_template.kind {
+                                NodeKind::Mem(MemOp::Load { .. }) => {
+                                    func.vars[node_def_template.outputs[0]].ty
+                                }
+                                NodeKind::Mem(MemOp::Store { .. }) => func
+                                    .reborrow()
+                                    .freeze()
+                                    .at(node_def_template.inputs[1])
+                                    .type_of(cx),
+                                _ => unreachable!(),
+                            };
+
+                            crate::mem::layout::LayoutCache::new(
+                                self.legalizer.cx.clone(),
+                                self.legalizer.config,
+                            )
+                            .fixed_mem_layout_of(access_type, "")
+                            .ok()
+                            .map(|layout| layout.size)
+                        };
+                        let start = offset.map_or(0, |o| o.get());
+                        Some(crate::mem::layout::Extent {
+                            start,
+                            end: access_size
+                                .and_then(|size| start.checked_add(size.try_into().ok()?)),
+                        })
                     }
-                    NodeKind::Mem(MemOp::Copy { .. }) => Some(0),
+                    NodeKind::Mem(MemOp::Copy { size }) => Some(crate::mem::layout::Extent {
+                        start: 0,
+                        end: size.get().try_into().ok(),
+                    }),
                     _ => None,
                 };
                 struct AlwaysUb;
-                let access_validity = always_accesses_input_ptr.map_or(Ok(()), |access_offset| {
-                    match choice_or_default {
+                let access_validity = always_accesses_input_ptr.map_or(Ok(()), |access_extent| {
+                    let max_access_offset = (access_extent.end.and_then(|end| end.checked_sub(1)))
+                        .unwrap_or(access_extent.start)
+                        .max(access_extent.start);
+                    // HACK(eddyb) a negative offset is out of bounds.
+                    let max_access_offset = u32::try_from(max_access_offset).map_err(|_e| {
+                        assert!(max_access_offset < 0);
+                        AlwaysUb
+                    })?;
+
+                    let (base, ptr_to_binding_or_buffer) = match choice_or_default {
                         Some((_, Base::Global(GlobalBase::Undef | GlobalBase::Null))) => {
                             return Err(AlwaysUb);
                         }
-                        Some((_, Base::Global(GlobalBase::GlobalVar { ptr_to_binding }))) => {
-                            let ConstKind::PtrToGlobalVar { global_var, offset: None } =
-                                cx[ptr_to_binding].kind
-                            else {
-                                unreachable!();
-                            };
-                            let gv_shape = self.module_global_vars[global_var].shape.unwrap();
 
-                            // HACK(eddyb) a negative offset is out of bounds.
-                            let access_offset = u32::try_from(access_offset).map_err(|_e| {
-                                assert!(access_offset < 0);
-                                AlwaysUb
-                            })?;
+                        Some((
+                            _,
+                            Base::Global(
+                                base @ (GlobalBase::GlobalVar { ptr_to_binding: ptr }
+                                | GlobalBase::BufferData { ptr_to_buffer: ptr }),
+                            ),
+                        )) => (base, ptr),
 
-                            use crate::mem::shapes::GlobalVarShape;
-                            match gv_shape {
-                                GlobalVarShape::Handles { .. } => return Err(AlwaysUb),
-                                GlobalVarShape::UntypedData(mem_layout) => {
-                                    // HACK(eddyb) eliding out of bounds accesses
-                                    // avoids misshapen `#[mem.accesses]` later.
-                                    if access_offset >= mem_layout.size {
-                                        return Err(AlwaysUb);
-                                    }
-                                }
-                                GlobalVarShape::TypedInterface(_) => {}
+                        _ => return Ok(()),
+                    };
+                    let ConstKind::PtrToGlobalVar { global_var, offset: None } =
+                        cx[ptr_to_binding_or_buffer].kind
+                    else {
+                        unreachable!()
+                    };
+
+                    let gv_shape = self.module_global_vars[global_var].shape.unwrap();
+
+                    use crate::mem::shapes::{GlobalVarShape, Handle};
+                    match (gv_shape, base) {
+                        (_, GlobalBase::Undef | GlobalBase::Null) => unreachable!(),
+
+                        // HACK(eddyb) avoid breaking opaque handle `mem.load`s.
+                        (
+                            GlobalVarShape::Handles { handle: Handle::Opaque(_), .. },
+                            GlobalBase::GlobalVar { .. },
+                        ) if access_extent.start == 0 => {}
+
+                        (GlobalVarShape::Handles { .. }, GlobalBase::GlobalVar { .. })
+                        | (
+                            GlobalVarShape::Handles { handle: Handle::Opaque(_), .. }
+                            | GlobalVarShape::UntypedData(_)
+                            | GlobalVarShape::TypedInterface(_),
+                            GlobalBase::BufferData { .. },
+                        ) => {
+                            return Err(AlwaysUb);
+                        }
+
+                        (GlobalVarShape::UntypedData(mem_layout), GlobalBase::GlobalVar { .. })
+                        | (
+                            GlobalVarShape::Handles {
+                                handle:
+                                    Handle::Buffer(
+                                        _,
+                                        crate::mem::shapes::MaybeDynMemLayout {
+                                            fixed_base: mem_layout,
+                                            dyn_unit_stride: None,
+                                        },
+                                    ),
+                                fixed_count: _,
+                            },
+                            GlobalBase::BufferData { .. },
+                        ) => {
+                            // HACK(eddyb) eliding out of bounds accesses
+                            // avoids misshapen `#[mem.accesses]` later.
+                            if max_access_offset >= mem_layout.size {
+                                return Err(AlwaysUb);
                             }
                         }
-                        _ => {}
+                        (GlobalVarShape::TypedInterface(_), GlobalBase::GlobalVar { .. })
+                        | (
+                            // FIXME(eddyb) this pattern is ridiculously verbose,
+                            // and also should be DRY'd with the encode checks.
+                            GlobalVarShape::Handles {
+                                handle:
+                                    Handle::Buffer(
+                                        _,
+                                        crate::mem::shapes::MaybeDynMemLayout {
+                                            fixed_base: _,
+                                            dyn_unit_stride: Some(_),
+                                        },
+                                    ),
+                                fixed_count: _,
+                            },
+                            GlobalBase::BufferData { .. },
+                        ) => {}
                     }
+
                     Ok(())
                 });
                 if let Err(AlwaysUb) = access_validity {

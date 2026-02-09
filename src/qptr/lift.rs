@@ -679,7 +679,18 @@ impl<'a> LiftToSpvPtrs<'a> {
                     }
                 }
 
-                Ok(ty)
+                // TODO(eddyb) `mem::analyze` should do better, but there's
+                // a chance accesses that are "too direct" don't have their
+                // type changed to `UInt`, while still needing bitwrangling.
+                if !is_strict
+                    && let Some(ty) = ty.as_scalar(&self.cx)
+                    && !matches!(ty, scalar::Type::UInt(_))
+                    && let Some(width) = scalar::IntWidth::try_from_bits(ty.bit_width())
+                {
+                    Ok(self.cx.intern(scalar::Type::UInt(width)))
+                } else {
+                    Ok(ty)
+                }
             }
             DataHappKind::Dead | DataHappKind::Disjoint(_) => {
                 let no_fields = BTreeMap::new();
@@ -784,15 +795,13 @@ impl<'a> LiftToSpvPtrs<'a> {
                 }
             }
             DataHappKind::Repeated { element, stride } => {
-                let element_type =
-                    self.pointee_type_for_data_happ(element, effective_flags, None)?;
+                let mut fixed_size = happ.max_size.or(max_size_allowed_by_shape);
 
-                // FIXME(eddyb) can this occur legitimately, does it need handling?
-                if disallow_padding && size_of(element_type) != Some(stride.get()) {
-                    return Err(mk_padding_err());
+                // HACK(eddyb) actually clamping by `max_size_allowed_by_shape`,
+                // not just using it as a default when `happ.max_size` is missing.
+                if let (Some(size), Some(max_size)) = (&mut fixed_size, max_size_allowed_by_shape) {
+                    *size = (*size).min(max_size);
                 }
-
-                let fixed_size = happ.max_size.or(max_size_allowed_by_shape);
 
                 // HACK(eddyb) if the index can only be `0`, there's no reason
                 // to keep an arbitrarily large stride.
@@ -804,9 +813,15 @@ impl<'a> LiftToSpvPtrs<'a> {
                     *stride
                 };
 
-                let fixed_len = happ
-                    .max_size
-                    .or(max_size_allowed_by_shape)
+                let element_type =
+                    self.pointee_type_for_data_happ(element, effective_flags, Some(stride.get()))?;
+
+                // FIXME(eddyb) can this occur legitimately, does it need handling?
+                if disallow_padding && size_of(element_type) != Some(stride.get()) {
+                    return Err(mk_padding_err());
+                }
+
+                let fixed_len = fixed_size
                     .map(|size| {
                         if !size.is_multiple_of(stride.get()) {
                             return Err(LiftError(Diag::bug([format!(
@@ -2276,14 +2291,24 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     .then_some(pointee_layout.mem_layout.fixed_base.size),
             };
 
+            // TODO(eddyb) update docs, if this works, for generalization!
             // HACK(eddyb) if a dynamic index could only be `0`, without going
             // outside of the bounds of the pointee, ignore the actual dynamic
             // value and replace it with just the constant offset of `0` bytes.
             // FIXME(eddyb) this could also generate an `assume index == 0`,
             // if SPIR-T had such a concept.
             // FIXME(eddyb) this assumes an "inbounds"-style offsetting operation.
-            if let MaybeDynOffset::Dyn { stride, .. } = offset
-                && pointee_extent.end.is_some_and(|size| stride.get() > size)
+            if let MaybeDynOffset::Dyn { stride, array_max_size, .. } = &mut offset
+                && let Some(pointee_size) = pointee_extent.end
+            {
+                let max_usable_pointee_size = pointee_size / stride.get() * stride.get();
+                *array_max_size = Some(
+                    array_max_size.unwrap_or(max_usable_pointee_size).min(max_usable_pointee_size),
+                );
+            }
+            // FIXME(eddyb) this doesn't allow one-past-the-end indices.
+            if let MaybeDynOffset::Dyn { stride, array_max_size: Some(size), .. } = offset
+                && stride.get() >= size
             {
                 offset = MaybeDynOffset::Const(0);
             }

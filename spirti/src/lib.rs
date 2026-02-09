@@ -343,6 +343,14 @@ pub fn run_from_file(in_file_path: PathBuf, out_file_path: Option<PathBuf>) {
         interpreter.bind_memory(BindSlot::PushConstant, push_constant_bytes);
     }
 
+    // HACK(eddyb) polyfill the lodestar demo allocator.
+    interpreter.bind_memory(BindSlot::StorageBuffer { descriptor_set: 0, binding: 0 }, {
+        let heap_size = 512 * 1024;
+        let mut init = vec![0; heap_size as usize];
+        init[0..4].copy_from_slice(&u32::to_le_bytes(heap_size));
+        init
+    });
+
     let start = std::time::Instant::now();
     interpreter.launch = Some(launch.clone());
     interpreter.eval_call(entry, [].into_iter().collect());

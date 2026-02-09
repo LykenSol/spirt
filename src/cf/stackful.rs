@@ -1592,7 +1592,8 @@ impl<'a> EmuGlobalStack<'a> {
             // to fuse it with the `Private` globals that also have initializers.
             Some(GlobalVarInit::Data(crate::mem::const_data::ConstData::new(
                 config.stack_size_bytes,
-            ))),
+            )))
+            .filter(|_| false),
         );
 
         let scalar_type_of_stack_top = scalar::Type::U32;
