@@ -1,0 +1,17 @@
+[package]
+name = "spirt-ptx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+spirt = { path = ".." }
+
+# FIXME(eddyb) deduplicate these by the workspace inheritance feature.
+arrayvec = "0.7.1"
+derive_more = "0.99.17"
+itertools = "0.10.3"
+lazy_static = "1.4.0"
+rustc-hash = "1.1.0"
+smallvec = { version = "1.7.0", features = ["serde", "union"] }
+
+cudarc = { version = "0.19.3", features = ["cuda-12000"] }
