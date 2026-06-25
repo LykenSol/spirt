@@ -764,21 +764,44 @@ impl<'a> CallStackEmulator<'a> {
             // it's intra-emu-group).
             let mut func = func_def_body.at_mut(());
             let ret_cont = {
-                let popped_state_var = func.vars.define(
-                    &self.global_stack.cx,
-                    VarDecl {
-                        attrs: Default::default(),
-                        ty: state_ty,
-                        // HACK(eddyb) using an existing region to declare an "orphan" `Var`.
-                        def_parent: Either::Left(new_body),
-                        def_idx: !0,
-                    },
-                );
+                let [popped_stack_offset_var, popped_state_var] =
+                    [self.global_stack.type_of_stack_top, state_ty].map(|ty| {
+                        func.vars.define(
+                            &self.global_stack.cx,
+                            VarDecl {
+                                attrs: Default::default(),
+                                ty,
+                                // HACK(eddyb) using an existing region to declare an "orphan" `Var`.
+                                def_parent: Either::Left(new_body),
+                                def_idx: !0,
+                            },
+                        )
+                    });
 
                 let mut popper = self.global_stack.popper(func.reborrow());
                 popper.pop_into(func.reborrow(), popped_state_var);
+                popper.pop_into(func.reborrow(), popped_stack_offset_var);
                 let pops_nodes = popper.finish(func.reborrow());
                 func.regions[orig_body].children.append(pops_nodes, func.nodes);
+
+                let stack_restore = func.nodes.define(
+                    cx,
+                    DataInstDef {
+                        attrs: AttrSet::default(),
+                        kind: DataInstKind::Mem(MemOp::Store { offset: None }),
+                        inputs: [
+                            Value::Const(self.global_stack.ptr_to_stack_top_global),
+                            Value::Var(popped_stack_offset_var),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        child_regions: [].into_iter().collect(),
+                        outputs: [].into_iter().collect(),
+                    }
+                    .into(),
+                );
+                func.regions[orig_body].children.insert_last(stack_restore, func.nodes);
+
                 EmuContClosure {
                     origin: Err(Value::Var(popped_state_var)),
                     input_count: orig_ret_types.len(),
@@ -1829,32 +1852,40 @@ impl<'a> EmuGlobalStack<'a> {
         assert_eq!(inputs.len(), cont.input_count);
 
         // TODO(eddyb) split the push/pop into write/read (w/ push/pop as also
-        // changing the stack offset) then push ret_cont_input while only *writing*
-        // the rest of the inputs (alongside with the *offset* before ret_cont_input,
-        // which can be used when returning, to properly restore the stack)
+        // changing the stack offset)... or is that still a good idea?
 
-        let ret_cont_state = ret_cont_input.map(|ret_cont| ret_cont.entry_state_value(&self.cx));
-        let captures = match ret_cont_input {
+        let (mut children, ret_cont_input) = match ret_cont_input {
             Some(ret_cont) => {
-                assert!(cont.captures.is_empty());
-                &ret_cont.captures
+                let values_in_pop_order = ret_cont.captures.iter().map(|&v| Value::Var(v));
+                let values_in_push_order = values_in_pop_order.rev();
+
+                let mut pusher = self.pusher(func.reborrow());
+                for v in values_in_push_order {
+                    pusher.push(func.reborrow(), v);
+                }
+                let (children, ret_cont_state, stack_offset) = pusher
+                    .finish_for_state_and_stack_offset(
+                        func.reborrow(),
+                        ret_cont.entry_state_value(&self.cx),
+                    );
+
+                (children, Some([ret_cont_state, stack_offset]))
             }
-            None => &cont.captures,
+            None => (EntityList::empty(), None),
         };
 
-        let values_in_pop_order = inputs
-            .iter()
-            .copied()
-            .chain(ret_cont_state)
-            .chain(captures.iter().map(|&v| Value::Var(v)));
+        let values_in_pop_order = (inputs.iter().copied())
+            .chain(ret_cont_input.into_iter().flatten())
+            .chain(cont.captures.iter().map(|&v| Value::Var(v)));
         let values_in_push_order = values_in_pop_order.rev();
 
         let mut pusher = self.pusher(func.reborrow());
         for v in values_in_push_order {
             pusher.push(func.reborrow(), v);
         }
-        let (children, next_state_after) =
-            pusher.finish_for_state(func, cont.entry_state_value(&self.cx));
+        let (children2, next_state_after, _) = pusher
+            .finish_for_state_and_stack_offset(func.reborrow(), cont.entry_state_value(&self.cx));
+        children.append(children2, func.nodes);
 
         EmuContBody { children, next_state_after }
     }
@@ -2017,7 +2048,7 @@ impl EmuStackPusherPopper<'_, '_, /*CAN_PUSH=*/ false> {
     // HACK(eddyb) popping doesn't need to worry about stack overflows.
     fn finish(self, func: FuncAtMut<'_, ()>) -> EntityList<Node> {
         let dummy_in = EmuStateIdx::UNKNOWN_STATE.to_value(&self.global_stack.cx);
-        let (nodes, dummy_out) = self.finish_for_state(func, dummy_in);
+        let (nodes, dummy_out, _) = self.finish_for_state_and_stack_offset(func, dummy_in);
         assert!(dummy_out == dummy_in);
         nodes
     }
@@ -2075,11 +2106,13 @@ impl<const CAN_PUSH: bool> EmuStackPusherPopper<'_, '_, CAN_PUSH> {
     // `Value` returned will (dynamically) be a choice between `next_state` or
     // `EmuStateIdx::STACK_OVERFLOW`, and the caller needs to rely on it.
     // FIXME(eddyb) should this return `EmuContBody`?
-    fn finish_for_state(
+    // HACK(eddyb) returning the final stack offset is a latter addition,
+    // and might be avoidable with the right conventions.
+    fn finish_for_state_and_stack_offset(
         self,
         mut func: FuncAtMut<'_, ()>,
         next_state: Value,
-    ) -> (EntityList<Node>, Value) {
+    ) -> (EntityList<Node>, Value, Value) {
         let cx = &self.global_stack.cx;
 
         let min_neg_offset = Some(self.accessed_stack_unit_offsets.start).filter(|&x| x < 0);
@@ -2177,7 +2210,7 @@ impl<const CAN_PUSH: bool> EmuStackPusherPopper<'_, '_, CAN_PUSH> {
         let mut all_nodes = pre_check_insts;
 
         let Some(checked_insts) = stack_overflow_checked_insts else {
-            return (all_nodes, next_state);
+            return (all_nodes, next_state, stack_top_plus_final_offset);
         };
 
         let would_overflow_stack_node = func.nodes.define(
@@ -2252,7 +2285,7 @@ impl<const CAN_PUSH: bool> EmuStackPusherPopper<'_, '_, CAN_PUSH> {
 
         all_nodes.insert_last(check_node, func.nodes);
 
-        (all_nodes, Value::Var(check_output_var))
+        (all_nodes, Value::Var(check_output_var), stack_top_plus_final_offset)
     }
 }
 
