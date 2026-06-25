@@ -878,7 +878,10 @@ impl<'a> CallStackEmulator<'a> {
             let state_switch_node = {
                 let (case_consts, mut cases): (_, SmallVec<_>) = state_switch_cases
                     .into_iter()
-                    .map(|(case_const, case)| (case_const.as_scalar(), case))
+                    .map(|(case_const, case)| {
+                        self.global_stack.finish_thunk_body(func.reborrow().at(case));
+                        (case_const.as_scalar(), case)
+                    })
                     .unzip();
                 cases.push(default_case);
                 func.nodes.define(
@@ -1238,13 +1241,15 @@ impl<'a> CallStackEmulator<'a> {
                 let case_region = func.regions.define(cx, RegionDef::default());
                 let break_with_outputs = match maybe_non_default_case {
                     Some((_, Ok(ret_cont_def))) => {
-                        let ret_vals = ret_cont_def
-                            .inputs_and_captures
+                        ret_cont_def.thunk_define_into(func.reborrow().at(case_region));
+
+                        let ret_vals = func.regions[case_region]
+                            .inputs
                             .iter()
                             .map(|&v| Value::Var(v))
                             .collect();
-                        ret_cont_def
-                            .define_into(func.reborrow().at(case_region), &self.global_stack);
+                        self.global_stack.finish_thunk_body(func.reborrow().at(case_region));
+
                         Some(ret_vals)
                     }
                     Some((_, Err(msg))) => {
@@ -1750,10 +1755,11 @@ impl<'a> EmuGlobalStack<'a> {
     // TODO(eddyb) document like `collect_cont_closure` while allowing self-invocation.
     #[must_use]
     fn collect_cont_closure_with_collector_access(
+        // FIXME(eddyb) remove `&self` - or rather, have a method on `EmuContClosure`.
         &self,
         mut func: FuncAtMut<'_, ()>,
         origin: Either<(Region, RegionEmuStates), (Node, NodeEmuStates)>,
-        mut cont_body: EmuContBody,
+        cont_body: EmuContBody,
         // FIXME(eddyb) this is only used by loops for self-invocation, find some
         // better way (builder pattern?) to access this API.
         access_collector: impl FnOnce(FuncAtMut<'_, ()>, &mut EmuContClosureCollector<'_>),
@@ -1768,11 +1774,11 @@ impl<'a> EmuGlobalStack<'a> {
                     |func, (region, _)| func.at(region).def().inputs.len(),
                     |func, (node, _)| func.at(node).def().outputs.len(),
                 ),
-                captures: FxIndexSet::default(),
+                captures: Default::default(),
             },
 
-            inputs_and_captures: vec![],
-            defined_vars: EntityOrientedDenseMap::new(),
+            inputs_and_captures: Default::default(),
+            defined_vars: Default::default(),
         };
 
         // HACK(eddyb) guarantee the first `cont.input_count` pops.
@@ -1822,6 +1828,11 @@ impl<'a> EmuGlobalStack<'a> {
     ) -> EmuContBody {
         assert_eq!(inputs.len(), cont.input_count);
 
+        // TODO(eddyb) split the push/pop into write/read (w/ push/pop as also
+        // changing the stack offset) then push ret_cont_input while only *writing*
+        // the rest of the inputs (alongside with the *offset* before ret_cont_input,
+        // which can be used when returning, to properly restore the stack)
+
         let ret_cont_state = ret_cont_input.map(|ret_cont| ret_cont.entry_state_value(&self.cx));
         let captures = match ret_cont_input {
             Some(ret_cont) => {
@@ -1846,6 +1857,22 @@ impl<'a> EmuGlobalStack<'a> {
             pusher.finish_for_state(func, cont.entry_state_value(&self.cx));
 
         EmuContBody { children, next_state_after }
+    }
+
+    fn finish_thunk_body(&self, mut func_at_thunk_body: FuncAtMut<'_, Region>) {
+        let body = func_at_thunk_body.position;
+        let mut func = func_at_thunk_body.reborrow().at(());
+
+        let inputs_and_captures = mem::take(&mut func.regions[body].inputs);
+        if !inputs_and_captures.is_empty() {
+            let mut popper = self.popper(func.reborrow());
+            for v in inputs_and_captures {
+                popper.pop_into(func.reborrow(), v);
+            }
+
+            let pops_nodes = popper.finish(func.reborrow());
+            func.regions[body].children.prepend(pops_nodes, func.nodes);
+        }
     }
 }
 
@@ -2245,7 +2272,7 @@ struct EmuContClosureCollector<'a> {
     /// is why inputs are popped first (`0..cont.input_count`), and pushed last.
     //
     // TODO(eddyb) update the docs, now that the pops are not done on the fly.
-    inputs_and_captures: Vec<Var>,
+    inputs_and_captures: SmallVec<[Var; 2]>,
 
     // HACK(eddyb) efficient tracking to allow determining if a `Value` is part
     // of the continuation itself, or a capture (see `popped_values`).
@@ -2325,31 +2352,16 @@ impl EmuContBody {
 // invoked via `EmuContClosure` (making that the "use-side").
 // TODO(eddyb) document (might be gone after thunkification?)
 struct EmuContDef {
-    inputs_and_captures: Vec<Var>,
+    inputs_and_captures: SmallVec<[Var; 2]>,
     body: EmuContBody,
 }
 
 impl EmuContDef {
-    fn define_into(
-        self,
-        mut func_at_region: FuncAtMut<'_, Region>,
-        global_stack: &EmuGlobalStack<'_>,
-    ) {
-        let EmuContDef { inputs_and_captures, mut body } = self;
-
-        if !inputs_and_captures.is_empty() {
-            let mut func = func_at_region.reborrow().at(());
-
-            let mut popper = global_stack.popper(func.reborrow());
-            for v in inputs_and_captures {
-                popper.pop_into(func.reborrow(), v);
-            }
-
-            let pops_nodes = popper.finish(func.reborrow());
-            body.children.prepend(pops_nodes, func.nodes);
-        }
-
-        *func_at_region.def() = body.into_region_def();
+    fn thunk_define_into(self, func_at_region: FuncAtMut<'_, Region>) {
+        let EmuContDef { inputs_and_captures, body } = self;
+        let mut region_def = body.into_region_def();
+        region_def.inputs = inputs_and_captures;
+        *func_at_region.def() = region_def;
     }
 }
 
@@ -2463,8 +2475,7 @@ impl EmuFuncFracker<'_> {
                 assert_eq!(merge_cont.entry_state_idx().ok().unwrap(), node_states.merge);
 
                 let merge_cont_region = func.regions.define(cx, RegionDef::default());
-                merge_cont_def
-                    .define_into(func.reborrow().at(merge_cont_region), self.global_stack);
+                merge_cont_def.thunk_define_into(func.reborrow().at(merge_cont_region));
                 self.state_switch_cases.insert(node_states.merge, merge_cont_region);
 
                 cont_body = self.frack_node(func.reborrow().at(node), merge_cont);
@@ -2537,7 +2548,7 @@ impl EmuFuncFracker<'_> {
             );
             assert_eq!(entry_cont.entry_state_idx().ok().unwrap(), entry_state);
 
-            entry_cont_def.define_into(func.at(region), self.global_stack);
+            entry_cont_def.thunk_define_into(func.at(region));
             self.state_switch_cases.insert(entry_state, region);
 
             Some(entry_cont)
@@ -2697,7 +2708,7 @@ impl EmuFuncFracker<'_> {
                 // fracking its child nodes may split it into separate regions.
                 whole_body_cont_def.body =
                     self.frack_cont_body_nodes_as_needed(func.reborrow(), whole_body_cont_def.body);
-                whole_body_cont_def.define_into(func.reborrow().at(body), self.global_stack);
+                whole_body_cont_def.thunk_define_into(func.reborrow().at(body));
 
                 // HACK(eddyb) this used to be part of `frack_region_as_needed`.
                 {
